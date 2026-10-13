@@ -1,0 +1,18 @@
+# Build-context guard for Dockerfile.runtime. Keeps host secrets, VCS data and
+# test/E2E assets out of the context even if the Dockerfile COPY list changes.
+**/.env
+**/.env.*
+!**/.env.example
+**/.git
+**/node_modules
+**/dist
+**/.next
+**/coverage
+**/.turbo
+**/*.log
+# Stage 2.22: compose secret material must never enter the build context or image.
+secrets/
+apps/api/test
+apps/api/jest-e2e.json
+apps/api/prisma/seed.ts
+apps/api/scripts/debug-featured-attach.ts

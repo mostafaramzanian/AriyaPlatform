@@ -42,6 +42,9 @@ lerna-debug.log*
 
 # Docker
 .dockerignore
+# Release-hardening exception: the Docker build-context guard is required in the
+# published tree (Stage 2.22) — keep it tracked despite the rule above.
+!.dockerignore
 
 # Python
 *.pyc
