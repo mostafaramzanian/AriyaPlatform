@@ -1,0 +1,2182 @@
+// Phase C1: the Commerce datasource's own Prisma project.
+//
+// WHY THIS FILE EXISTS
+// --------------------
+// `runtime-datasources.ts` has declared Commerce as a DATASOURCE OWNER since
+// Phase C1 step A, with `status: 'target'` — a declaration with no artifacts
+// behind it. This step turns that target into the implementation surface the
+// rest of the phase fills in: independent datasource, independent generator,
+// independent schema, independent generated client target
+// (`src/generated/commerce-client`), independent migration history
+// (`prisma/commerce/migrations/`) and, from step K on, the Commerce domain
+// models themselves.
+//
+// THE BOUNDARY THIS FILE DRAWS
+// ---------------------------
+// Commerce owns its database (`commerce_db`, reached through
+// `COMMERCE_DATABASE_URL`) and NOTHING else. In particular:
+//
+//   * There is NO cross-database foreign key. `tenantId`, `userId`,
+//     `employeeId`, `supplierId`, `requesterId` and `approverId` are PLAIN
+//     STRING columns holding opaque values — PostgreSQL cannot express a FK
+//     across databases, and Commerce must not try to: identity is reached
+//     through the platform identity gateway, personnel through the platform
+//     contracts, never through a join.
+//   * Commerce does NOT duplicate authoritative state. No User, no Tenant, no
+//     Role, no Permission, no credential-adjacent columns, no employment
+//     record. A purchase document's requester is an opaque reference, not a
+//     second personnel table.
+//   * Core and HR Prisma clients are NEVER imported here, and this datasource
+//     block points at the Commerce URL only. The isolation regression suite
+//     asserts all of it.
+//   * History is append-only where the specification requires it: payment
+//     rows, receiving events and return documents are records with their own
+//     lifecycle, never a mutable amount or a status overwritten in place, and
+//     there is no delete path for them.
+//
+// WHAT ARRIVES IN THIS FILE, AND WHEN
+// -----------------------------------
+// Step K implements the initial domain persistence per §5 of the authoritative
+// C1 specification — PurchaseDocument, PurchaseLine with the exact line-type
+// vocabulary (STANDARD / NON_STANDARD / SERVICE), workflow-related persistence,
+// tenant-scoped keys and indexes — and generates the first migration.
+// Steps Q/R/S extend it with payment, receiving and return history. This
+// header deliberately lists no speculative tables: a column invented here
+// before its specification is a column no test can falsify.
+
+datasource db {
+  provider = "postgresql"
+  url      = env("COMMERCE_DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+  output   = "../../src/generated/commerce-client"
+}
+
+// ============================================================================
+// STEP K — THE DOMAIN PERSISTENCE OF §5 (implementation order K)
+// ============================================================================
+//
+// Everything below is sourced from §5.1–§5.11 of the authoritative Commerce
+// specification, and from nothing else. §5.12–§5.17 (fulfillment, payment,
+// receipts, returns) belong to steps Q/R/S, and their columns are deliberately
+// absent — the boundary header at the top of this file owns that promise. The
+// models are:
+//
+//   PurchaseDocument          (§5.1)  the aggregate root of a purchase request
+//   PurchaseLine              (§5.2)  first-class lines, mixed types
+//   WorkflowDefinition        (§5.5)  the logical workflow container
+//   WorkflowDefinitionVersion (§5.5)  an immutable version, pinned by runs
+//   WorkflowStep              (§5.6)  one configured step of ONE version
+//   WorkflowInstance          (§5.9)  one execution, pinned to its version
+//   WorkflowStepInstance      (§5.10) runtime step: scope, decision, condition outcome
+//
+// DECISIONS THIS FILE OWNS
+// ------------------------
+// §5.1 requires the document-numbering strategy to be decided ONCE and
+// documented in the schema. It is decided on `PurchaseDocument`, and
+// summarized here so a reader of the whole file sees it without hunting:
+//
+//   * NUMBERING — the repository's existing style, chosen deliberately:
+//     ONE shared counter keyed `(tenantId, kind, jalaliYear)`, allocated by
+//     an atomic `INSERT … ON CONFLICT DO UPDATE … RETURNING` inside the
+//     creating transaction. The counter TABLE is not created in Step K: K
+//     defines storage only, no writer mints a number yet, and a counter with
+//     no caller is a table no test can falsify — the exact reasoning
+//     prisma/hr/schema.prisma records for `HrDocumentCounter`. The first step
+//     that mints numbers brings the counter, its CHECK and its concurrency
+//     spec together. This is also what keeps the style from drifting: this
+//     repository has exactly one numbering shape, and this file adopts it
+//     rather than inventing a second (§5.1's closing sentence).
+//   * OPTIMISTIC CONCURRENCY — NOT WARRANTED, therefore absent. §5.1 asks for
+//     a "version if optimistic concurrency is warranted"; no C1 API contract
+//     states a conflict response, no repository precedent stores an optimistic
+//     version column, and a column no writer reads is a column no test can
+//     falsify. A later step that needs one adds it as a migration.
+//   * ATTACHMENTS (§5.4) — no table here: §5.4 forbids upload infrastructure
+//     in C1, and the metadata table is assigned to the first step that stores
+//     a real reference through the existing storage contract
+//     (src/storage/i-storage.provider.ts).
+//   * OPAQUE REFERENCES — `requesterId`, `supplierId`, `resolvedApproverId`,
+//     `subjectId`, `scopeId`, `itemReference` and `externalRef` are PLAIN
+//     STRING columns (the boundary header above). No cross-database foreign
+//     key exists or is expressible; identity and personnel are reached
+//     through the platform contracts, never through a join.
+//   * MONEY — the first decimal columns in this repository (no prior
+//     precedent existed, so the choice is stated once): every quantity,
+//     price, tax and total is `Decimal(18, 4)` — fourteen integral digits,
+//     four fractional digits, applied uniformly. `currency` is the
+//     three-letter ISO 4217 alphabetic code; no default currency exists.
+//
+// WHAT THIS SECTION DELIBERATELY DOES NOT CONTAIN
+// ------------------------------------------------
+//   * NO payment, receiving, return or attachment tables (§5.12–§5.17, steps
+//     Q/R/S and the §5.4 rule above) — "a column invented here before its
+//     specification is a column no test can falsify".
+//   * NO audit TRAIL table (§12: the platform AUDIT_PORT behind one gateway
+//     is the only trail; a second trail makes "who did what, when"
+//     unanswerable). `AuditOutbox` is NOT a trail — it is a transactional
+//     delivery mechanism that ensures durable-required events reach the
+//     platform trail even when the relay or network fails after commit.
+//   * NO User/Tenant/Role/Permission model, no credential-adjacent column and
+//     no duplicate RBAC/entitlement/rule tables (§7, §10, §31).
+//   * NO stored payment/receiving state columns on `PurchaseDocument`
+//     (§5.11/§5.12/§5.13: those lifecycles are separate, and payment state —
+//     when it arrives — is a PROJECTION of append-only history, not a field
+//     of this aggregate).
+
+// ============================================================================
+// ENUMS — §16: enums for vocabularies the specification actually closes.
+// ============================================================================
+
+/// The line types of §5.2 — EXACTLY three members, closed by the specification.
+///
+///   STANDARD     — a BOM/catalogue-referenced item; its item reference stays
+///                   opaque (§5.2) because no Commerce-owned catalogue exists.
+///   NON_STANDARD — an item outside the BOM; the requester states it exactly.
+///   SERVICE      — work rather than goods.
+///
+/// A single request may carry ALL THREE at once (§5.2's Line 1…Line 4
+/// example), which is why line type is a column per line and never a flag or
+/// a property of the document.
+///
+/// THERE IS DELIBERATELY NO `EXPENSE`. §5.2 refuses the member in as many
+/// words — current requirements do not establish Expense as an independent
+/// Commerce line type, and "a future addition is a migration, which is the
+/// correct architectural cost". The Step K guard spec reads this block AND the
+/// migration's CREATE TYPE, so slipping the member in later fails the suite
+/// instead of quietly widening a vocabulary no test defined.
+enum PurchaseLineType {
+  STANDARD
+  NON_STANDARD
+  SERVICE
+}
+
+// ============================================================================
+// §5.1 / §5.11 — THE PURCHASE DOCUMENT: one aggregate root, one commercial
+// lifecycle, one closed kind vocabulary.
+// ============================================================================
+
+/// WHICH purchase document a row is (§5.1's `kind`).
+///
+/// EXACTLY ONE member, and that is the specification's own state, not an
+/// omission: nowhere in the C1 specification does a second purchase-document
+/// kind appear. The phase raises purchase REQUESTS, routes them, decides them
+/// and (step P/§29) completes them — and §5.1 makes `kind` part of the
+/// numbering key `(tenantId, kind, jalaliYear)`, which the header of this file
+/// records. A one-member enum writes that fact down: the vocabulary is CLOSED
+/// at one member, so a future kind is a migration that adds the member — the
+/// same "a future addition is a migration, which is the correct architectural
+/// cost" §5.2 states for line types — instead of an unreviewed string the
+/// allocation key silently accepts.
+///
+/// WHY AN ENUM AND NOT A STRING: `kind` is part of the numbering key and of
+/// every document read. Free text is how `purchase-request`, `PURCHASE-REQUEST`
+/// and `PurchaseRequest` become three kinds of document in one database, each
+/// with its own counter series. §16: enums for closed vocabularies.
+enum PurchaseDocumentKind {
+  PURCHASE_REQUEST
+}
+
+/// The commercial lifecycle of a purchase DOCUMENT (§5.11).
+///
+///   DRAFT     — authored, still editable, not yet routed.
+///   SUBMITTED — routed for decision; the document is in the workflow's hands.
+///   APPROVED  — the document's decision was positive.
+///   REJECTED  — the document's decision was negative.
+///   CANCELLED — withdrawn before completion.
+///   CLOSED    — the purchase has run its course.
+///
+/// THIS IS NOT WORKFLOW STATE, NOT PAYMENT STATE, NOT RECEIVING STATE —
+/// §5.11's three prohibitions, stated where a reader will look for the column.
+/// `WorkflowInstance.status` is its own lifecycle (§5.9); payment state is a
+/// projection of append-only history (step Q); receiving progress is per-line
+/// (step R). None of them is representable here, and this column must never
+/// grow to carry one.
+///
+/// The vocabulary is closed for C1: it is the section's own list, and a member
+/// added without the transition that reaches it would be a state no writer
+/// writes and no test can falsify — the rule the HR schema records for
+/// `LeaveRequestStatus`. §29's purchase completion arrives with the step that
+/// implements it and extends this list by migration.
+enum PurchaseDocumentStatus {
+  DRAFT
+  SUBMITTED
+  APPROVED
+  REJECTED
+  CANCELLED
+  CLOSED
+}
+
+// ============================================================================
+// §5.1 / §5.2 — THE AGGREGATE ROOT AND ITS FIRST-CLASS LINES
+// ============================================================================
+
+/// The aggregate root of ONE purchase request (§5.1): the document a requester
+/// raises, the lines it carries, and the commercial lifecycle it walks.
+///
+/// OWNERSHIP. Commerce owns this row in `commerce_db`, and NOTHING on it is
+/// another owner's state copied in. `requesterId` and `supplierId` are OPAQUE
+/// references (the boundary header at the top of this file): no foreign key
+/// exists or is expressible across databases, identity is reached through the
+/// platform identity gateway and supplier data through the platform contracts,
+/// never through a join. There is no requester NAME, no tenant record, no
+/// approval flag — those are other owners' facts.
+///
+/// LIFECYCLE. `status` walks §5.11's vocabulary (DRAFT → SUBMITTED → …). The
+/// workflow that moves it is a SEPARATE lifecycle pinned to a
+/// `WorkflowDefinitionVersion` (§5.5/§5.9) and recorded in `WorkflowInstance`
+/// rows; payment, receiving and return history (steps Q/R/S) is append-only and
+/// lives in its own tables. §5.3 requires that the document level never erase
+/// or overwrite LINE-level history, so nothing here is a per-line decision.
+///
+/// NUMBERING — the decision §5.1 demands be made once lives in the header of
+/// this file: ONE shared counter keyed `(tenantId, kind, jalaliYear)`,
+/// allocated atomically INSIDE the creating transaction, so a rolled-back
+/// create never burns a number. `documentNumber` is what that allocation
+/// produced; it is the tenant's handle on the document and is UNIQUE inside the
+/// tenant, which is what the tenant-first unique below states structurally.
+/// The counter table itself arrives with the first step that MINTS numbers
+/// (the header records why it is absent here). Never client-generated.
+///
+/// MONEY — `currency` is the ISO 4217 alphabetic code and has NO DEFAULT:
+/// there is no tenant-wide currency to assume, so a document states its own or
+/// has stated none yet (NULL). The totals aggregate the lines
+/// (`subtotalAmount` = Σ `lineTotal`, `taxAmount` = Σ `tax`, `totalAmount` =
+/// subtotal + tax) and are NULL until lines are priced. NULL is "not stated
+/// yet", NEVER zero — zero says "free", which is a different statement.
+///
+/// WHAT THIS MODEL MUST NOT BECOME: not a workflow state carrier (§5.11), not
+/// a payments/receipts ledger or a projection storage (§5.12/§5.13 and the
+/// header), not a duplicate of Core identity, not an attachment table (§5.4
+/// forbids upload infrastructure in C1, and the metadata table arrives with the
+/// first step that stores a real reference), and not a configuration record —
+/// steps, conditions, thresholds and routing live on the version/step tables
+/// below. There is no optimistic-version column: the header records why (no C1
+/// contract states a conflict response, so the column would have no reader).
+model PurchaseDocument {
+  id             String                 @id @default(uuid()) @db.Uuid
+  /// TEXT, like every `tenantId` in this database.
+  tenantId       String                 @map("tenant_id") @db.Text
+  /// The number this document was issued as — unique inside the tenant, minted
+  /// by the numbering strategy documented above, never client-supplied and
+  /// never random.
+  documentNumber String                 @map("document_number") @db.VarChar(64)
+  /// The kind of document (§5.1) and part of the numbering key. Closed at
+  /// PURCHASE_REQUEST for C1 — see the enum note for the full reasoning.
+  kind           PurchaseDocumentKind   @default(PURCHASE_REQUEST)
+  /// The commercial lifecycle of THIS document (§5.11) — never workflow,
+  /// payment or receiving state. See the enum note.
+  status         PurchaseDocumentStatus @default(DRAFT)
+  /// WHO asked for the purchase: an OPAQUE Core identity id (the platform
+  /// identity gateway is the only way to resolve it). Required — a purchase
+  /// request with no requester is not a request.
+  requesterId    String                 @map("requester_id") @db.Text
+  /// The supplier the request is addressed to: an OPAQUE reference. C1 owns no
+  /// supplier directory, and none may be invented here. NULL = none stated
+  /// yet, which is a different statement from an empty string.
+  supplierId     String?                @map("supplier_id") @db.Text
+  /// ISO 4217 alphabetic code. NULL = no currency stated yet; deliberately no
+  /// default (see MONEY above).
+  currency       String?                @db.VarChar(3)
+  /// Σ of the lines' `lineTotal`, `Decimal(18, 4)` like every money column in
+  /// this file. NULL until the lines are priced.
+  subtotalAmount Decimal?               @map("subtotal_amount") @db.Decimal(18, 4)
+  /// Σ of the lines' `tax`. NULL under the same rule as `subtotalAmount`.
+  taxAmount      Decimal?               @map("tax_amount") @db.Decimal(18, 4)
+  /// `subtotalAmount` + `taxAmount`. A STORED total, not a per-read sum: the
+  /// number a document was submitted under is a historical fact, and §16 keeps
+  /// invariants in the database rather than in application arithmetic.
+  totalAmount    Decimal?               @map("total_amount") @db.Decimal(18, 4)
+  /// STEP P (§3-B): the PINNED commercial configuration version — the single
+  /// conditional `null → versionId` write the first commercial operation on
+  /// this document performs. Every later commercial operation reads ONLY the
+  /// pinned version, so a configuration published afterwards never changes
+  /// this document's commercial meaning. NULL = no commercial operation has
+  /// pinned one yet, which is not an error (§3-A: absent configuration is no
+  /// automatic commercial effect).
+  commercialConfigurationVersionId String? @map("commercial_configuration_version_id") @db.Uuid
+  /// STEP O4: the PINNED line-routing aggregation configuration version. RESTRICT:
+  /// running line workflows are explained by the exact routing version they ran under.
+  lineRoutingVersionId String? @map("line_routing_version_id") @db.Uuid
+  /// PHASE C4-R (C1 §29): the COMPLETION ACTOR — the opaque Core identity of the user who
+  /// completed this purchase, server-resolved from the session (`resolveCommerceActor`)
+  /// and never accepted from a request. NULL until the document is completed; §29
+  /// requires it to be recorded WHEN completion happens, so a completed document has it
+  /// (a machine caller legitimately resolves to NULL userId — the same convention every
+  /// other `*ByUserId`/`actorUserId` column here follows).
+  completedByUserId    String?                @map("completed_by_user_id") @db.Text
+  /// PHASE C4-R (C1 §29): the COMPLETION TIMESTAMP — written by the clock the completion
+  /// act reads, once, inside the same conditional write that moves the status. NULL until
+  /// completed, and never rewritten: it is a historical fact, not a value to refresh.
+  completedAt          DateTime?              @map("completed_at") @db.Timestamptz(6)
+  /// PHASE C4-R: the PINNED completion policy version — the row whose
+  /// `allowedFromStatuses` authorised this completion, recorded at close time because
+  /// that is when the policy is evaluated (model A: evaluate-at-close, remember-what-was-
+  /// used). The same null → id conditional pin the commercial and line-routing versions
+  /// use, so a later publication never re-explains a completion that already happened.
+  completionPolicyVersionId String?            @map("completion_policy_version_id") @db.Uuid
+  createdAt      DateTime               @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt      DateTime               @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  /// The document's first-class lines (§5.2). RESTRICT: evidence of what was
+  /// asked for is not deleted, and no lifecycle deletion path exists anywhere
+  /// in this database.
+  lines PurchaseLine[] @relation("PurchaseLineDocument")
+
+  /// STEP Q (§5.14): the document's append-only payment history — rows, never
+  /// columns of this table. The document deliberately holds NO payment status
+  /// and NO paid-total column (Q2): UNPAID / PARTIAL / PAID / OVERPAID is a
+  /// read-time projection of these rows against `totalAmount`, so payment
+  /// state stays an INDEPENDENT dimension (§5.11's prohibition) and this
+  /// table never becomes "a payments ledger or a projection storage".
+  payments PaymentRecord[] @relation("PaymentRecordDocument")
+
+  /// STEP R (§5.16): the document's append-only receiving history — receipt
+  /// events, never columns of this table. The document deliberately holds NO
+  /// receiving status and NO received-quantity column (R5): NOT_RECEIVED /
+  /// PARTIALLY_RECEIVED / FULLY_RECEIVED is a READ-TIME projection of these
+  /// events against each line's ordered quantity, so receiving state stays an
+  /// INDEPENDENT lifecycle (R6) and this table never becomes a receiving
+  /// ledger or a projection storage.
+  receipts Receipt[] @relation("ReceiptDocument")
+
+  /// STEP S (§5.17): the document's child RETURN lifecycle — `ReturnDocument`
+  /// rows, never columns of this table. The document deliberately holds NO
+  /// return status (S-D2): REQUESTED / APPROVED / RECEIVED_BACK / REFUNDED /
+  /// REJECTED is a READ-TIME projection of each return's OWN append-only
+  /// transition history, so return state stays an INDEPENDENT lifecycle and
+  /// this table never becomes a return ledger. Nothing here is written when a
+  /// return transitions — least of all `status` (§12: a return NEVER changes
+  /// `PurchaseDocument.status`, and a REJECTED return never rejects the
+  /// purchase).
+  returns ReturnDocument[] @relation("ReturnDocumentPurchaseDocument")
+
+  /// STEP P (§3-B): the pinned commercial configuration version. RESTRICT:
+  /// running history never loses the configuration it ran under.
+  commercialConfigurationVersion CommercialConfigurationVersion? @relation("PurchaseDocumentCommercialConfigurationVersion", fields: [tenantId, commercialConfigurationVersionId], references: [tenantId, id], onDelete: Restrict, onUpdate: Cascade)
+
+  /// STEP O4: the pinned line-routing configuration version. RESTRICT:
+  /// the aggregation semantics under which this document's lines were routed.
+  lineRoutingVersion WorkflowLineRoutingVersion? @relation("PurchaseDocumentLineRoutingVersion", fields: [tenantId, lineRoutingVersionId], references: [tenantId, id], onDelete: Restrict, onUpdate: Cascade)
+
+  /// PHASE C4-R: the pinned completion policy version. RESTRICT: a completed purchase
+  /// never loses the policy whose evaluation authorised its completion (§10 explainability).
+  completionPolicyVersion PurchaseCompletionPolicyVersion? @relation("PurchaseDocumentCompletionPolicyVersion", fields: [tenantId, completionPolicyVersionId], references: [tenantId, id], onDelete: Restrict, onUpdate: Cascade)
+
+  /// Composite-key target for the same-tenant line foreign key below.
+  @@unique([tenantId, id], map: "PurchaseDocument_tenantId_id_key")
+  /// The tenant's handle on a document — the read every lookup performs.
+  @@unique([tenantId, documentNumber], map: "PurchaseDocument_tenantId_documentNumber_key")
+  /// The tenant's request list, newest first: list reads lead with tenantId.
+  @@index([tenantId, status, createdAt], map: "PurchaseDocument_tenantId_status_createdAt_idx")
+  /// The requester's own view — tenant-first like every read in this database.
+  @@index([tenantId, requesterId, status], map: "PurchaseDocument_tenantId_requesterId_status_idx")
+  @@map("PurchaseDocument")
+}
+
+/// ONE line of a purchase document (§5.2) — FIRST-CLASS. The workflow routes
+/// LINES: §5.3 requires that a single document may carry lines assigned to
+/// different commercial actors, that a line completes independently, and that
+/// the document level never erases line-level history. So a line is a row with
+/// its own identity, its own position and its own routing history — never a
+/// value in a JSON blob on the document, and never a free-text description of
+/// something the type system should have stated.
+///
+/// `lineType` is the specification's CLOSED vocabulary (`PurchaseLineType`):
+/// STANDARD / NON_STANDARD / SERVICE, all three of which may appear in one
+/// document (§5.2's Line 1…Line 4 example) — which is exactly why the type is a
+/// column per line and never a flag on the document. `EXPENSE` is deliberately
+/// NOT a member: §5.2 refuses it explicitly, and the guard spec reads both this
+/// schema and the migration's CREATE TYPE so the refusal is executable.
+///
+/// OPAQUE REFERENCES. `itemReference` stays opaque: STANDARD/BOM references are
+/// opaque identifiers "unless a Commerce-owned catalogue is actually
+/// established" (§5.2), and C1 establishes none — so no product table is
+/// invented here. `externalRef` is the tenant's own handle from whatever
+/// system the line was copied out of, likewise opaque.
+///
+/// MONEY, uniformly `Decimal(18, 4)`: `quantity`, `unitPrice`, `tax`,
+/// `lineTotal`. NULL on `unitPrice` / `tax` / `lineTotal` means "not priced
+/// yet", never zero — zero says "free". `quantity` is REQUIRED: a line without
+/// a quantity is not a line (a SERVICE line states its quantity too — 1
+/// session, 3 days). `unit` is a free label ("PCS", "KG", "DAY"), NOT a
+/// catalogue reference: C1 establishes no unit table, and a lookup against one
+/// would be an invented entity.
+///
+/// WHAT THIS MODEL MUST NOT BECOME: not a second copy of workflow state (the
+/// line's routing lives in `WorkflowStepInstance` rows whose `scopeId` names
+/// this line and whose `scopeType` is LINE), not a receiving/payment ledger
+/// (steps R/Q — those are append-only records of their own), not a catalogue,
+/// and not deletable: §5.3's "return for correction" is a routing outcome, not
+/// a DELETE, and every relation in this schema is RESTRICT.
+model PurchaseLine {
+  id                   String           @id @default(uuid()) @db.Uuid
+  /// TEXT, like every `tenantId` in this database.
+  tenantId             String           @map("tenant_id") @db.Text
+  /// The document this line belongs to. Composite-FK target with the tenant —
+  /// a line never crosses a tenant boundary even by accident.
+  purchaseDocumentId   String           @map("purchase_document_id") @db.Uuid
+  /// The line's position in the document — stated, never inferred from
+  /// insertion order (`createdAt` is a clock, not an author's intent).
+  /// UNIQUE inside the document, which is what the unique below states.
+  lineNumber           Int              @map("line_number")
+  /// The line's type — the closed three-member vocabulary. See the model note
+  /// and the `PurchaseLineType` enum.
+  lineType             PurchaseLineType @map("line_type")
+  /// How much of the thing is asked for. Required (see the model note).
+  quantity             Decimal          @db.Decimal(18, 4)
+  /// The unit label the quantity is expressed in — free text, not a
+  /// catalogue reference. NULL = none stated yet.
+  unit                 String?          @db.VarChar(32)
+  /// Price per unit. NULL = not priced yet, never zero.
+  unitPrice            Decimal?         @map("unit_price") @db.Decimal(18, 4)
+  /// The line's tax AMOUNT (this file stores amounts, not rates — no rate
+  /// catalogue exists and §5.2 lists "tax" beside "lineTotal", as an amount).
+  /// NULL = not computed yet, never zero.
+  tax                  Decimal?         @db.Decimal(18, 4)
+  /// The line's total as STATED by the document, not recomputed per read:
+  /// what the line was submitted with is a historical fact.
+  lineTotal            Decimal?         @map("line_total") @db.Decimal(18, 4)
+  /// The tenant's own reference for this line in whatever system it came from
+  /// — OPAQUE, like every external identifier in this schema.
+  externalRef          String?          @map("external_ref") @db.VarChar(128)
+  /// The BOM/catalogue item reference — OPAQUE (§5.2). See the model note.
+  itemReference        String?          @map("item_reference") @db.Text
+  /// What the requester says the item must be, exactly (§5.4's reason for
+  /// being: precision reduces wrong purchases). Free text; attachments are
+  /// §5.4's subject and are deliberately not a table here.
+  technicalDescription String?          @map("technical_description") @db.Text
+  createdAt            DateTime         @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt            DateTime         @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  /// The document this line belongs to. RESTRICT: neither the line nor its
+  /// document is deletable (see the model note).
+  purchaseDocument PurchaseDocument @relation("PurchaseLineDocument", fields: [tenantId, purchaseDocumentId], references: [tenantId, id], onDelete: Restrict, onUpdate: Cascade)
+
+  /// STEP R (§5.16): the line's append-only receiving events — ONE line,
+  /// MANY receipt events (§3 of the R contract), never a mutable
+  /// received-quantity column on this row: what arrived is a fact recorded
+  /// event by event, and the line's received total is a read-time projection
+  /// of them (R5).
+  receiptLines ReceiptLine[] @relation("ReceiptLinePurchaseLine")
+
+  /// STEP S (S-D5): the return lines that name this purchase line — one
+  /// `ReturnLine` → ONE `PurchaseLine`, tracked line by line. Virtual: no
+  /// column lands on this row, and nothing about the line's own quantity,
+  /// workflow or commercial state changes because a return exists.
+  returnLines ReturnLine[] @relation("ReturnLinePurchaseLine")
+
+  /// Composite-key target, and the tenant-first read of one line.
+  @@unique([tenantId, id], map: "PurchaseLine_tenantId_id_key")
+  /// The author's positioning of the lines, stated once per document.
+  @@unique([tenantId, purchaseDocumentId, lineNumber], map: "PurchaseLine_tenantId_documentId_lineNumber_key")
+  /// "lines of this type in this tenant" — the read line-type routing answers.
+  @@index([tenantId, lineType], map: "PurchaseLine_tenantId_lineType_idx")
+  @@map("PurchaseLine")
+}
+
+/// The tenant's document-number counter (§5.1) — ONE row per
+/// `(tenantId, kind, jalaliYear)`, from which every `PurchaseDocument.documentNumber`
+/// is allocated.
+///
+/// WHY THIS TABLE ARRIVES WITH STEP L AND NOT WITH STEP K
+/// ------------------------------------------------------
+/// Step K owns storage and recorded the numbering DECISION in this file's header,
+/// deliberately deferring the table: "the counter TABLE is not created in Step K: K
+/// defines storage only, no writer mints a number yet, and a counter with no caller is
+/// a table no test can falsify ... The first step that MINTS numbers brings the
+/// counter, its CHECK and its concurrency spec together." Step L is that step: it is
+/// the first Commerce writer that inserts a `PurchaseDocument`, and
+/// `documentNumber` is NOT NULL, so no create is expressible without minting one.
+/// The arrival is a plain additive migration
+/// (`20260926130000_purchase_document_counter`), which is exactly the shape the
+/// header promised and the shape this repository uses for every later schema fact.
+///
+/// THE KEY IS THE NUMBERING KEY, AND THE UNIQUE BELOW *IS* IT
+/// ----------------------------------------------------------
+/// `(tenantId, kind, jalaliYear)` — three columns, one unique index, no surrogate
+/// key standing in for any of them. `kind` is in the key even though C1 has exactly
+/// one kind, and the reason is concrete: two kinds sharing one series would mint the
+/// same `documentNumber` twice, and the tenant-first unique on `PurchaseDocument`
+/// would turn a legitimate second series into a failed insert (or, worse, force the
+/// format to carry a discriminator nothing else knows about). The formatter therefore
+/// maps EVERY kind to its own prefix, and the mapping is total — a new kind is a
+/// migration that adds a prefix, not a silent second series.
+///
+/// `jalaliYear` is the Jalali year of the CREATE INSTANT, computed server-side (the
+/// calendar module is the repository's one Jalali boundary, and a client-supplied year
+/// would let a caller choose which series its document lands in). The same number in a
+/// new year is a new series — the shape `LetterNumberCounter` and
+/// `Employee.personnelCode` already use, adopted rather than reinvented (§5.1's closing
+/// sentence, and the header's "exactly one numbering shape").
+///
+/// CONCURRENCY, STATED HERE BECAUSE IT IS THE TABLE'S WHOLE PURPOSE
+/// ---------------------------------------------------------------
+/// `counter` is the LAST sequence number handed out for this key and is never
+/// decremented. Allocation is ONE statement —
+/// `INSERT … ON CONFLICT ("tenant_id","kind","jalali_year") DO UPDATE SET "counter" =
+/// "counter" + 1 RETURNING "counter"` — run INSIDE the transaction that inserts the
+/// document, so two concurrent creates cannot receive the same number and a create
+/// that rolls back never burns one. Nothing reads `counter` to build a number
+/// outside that statement: a `SELECT … then UPDATE` pair would reintroduce exactly the
+/// race the single statement removes. The migration adds the CHECK
+/// (`counter >= 0`) §16 asks for: an invariant stated in the database rather than
+/// trusted to application arithmetic.
+///
+/// WHAT THIS MODEL MUST NOT BECOME: not a numbering POLICY (a prefix, a per-unit or
+/// per-category series and a format are the formatter's business; adding a policy
+/// discriminator is a new column and a migration, the deliberate cost §5.1 states),
+/// not an audit trail (the mint record is the number ON the document, and §12's
+/// platform trail is the only trail — a second one makes "who did what" ambiguous),
+/// and not a place to store ANY other owner's counter: HR's numbering lives in
+/// `hr_db`, is not readable from here, and is not Commerce's to hold.
+model PurchaseDocumentCounter {
+  id         String               @id @default(uuid()) @db.Uuid
+  /// TEXT, like every `tenantId` in this database.
+  tenantId   String               @map("tenant_id") @db.Text
+  /// Part of the numbering key — see the model note for why a one-member
+  /// vocabulary still belongs in the key.
+  kind       PurchaseDocumentKind
+  /// Jalali year of the create instant, computed SERVER-side. Never client-supplied.
+  jalaliYear Int                  @map("jalali_year")
+  /// The last sequence number handed out for this key. Never decremented; never a
+  /// value a document was not created under.
+  counter    Int                  @default(0)
+
+  /// The numbering key — what the allocation statement conflicts on, and the whole
+  /// reason this table exists. No other index: the unique below is every read this
+  /// table has.
+  @@unique([tenantId, kind, jalaliYear], map: "PurchaseDocumentCounter_tenantId_kind_jalaliYear_key")
+  @@map("PurchaseDocumentCounter")
+}
+
+// ============================================================================
+// §5.5 / §5.6 — THE WORKFLOW DEFINITION SIDE: what a tenant configured, once,
+// immutably, and what every run PINS.
+// ============================================================================
+
+/// The lifecycle of ONE `WorkflowDefinitionVersion` (§5.5).
+///
+/// DRAFT → VALIDATED → PUBLISHED, with ARCHIVED the one-way end of a version
+/// that is no longer selectable. This is the exact vocabulary preflight found
+/// in this repository — `LeavePolicyVersionStatus` and
+/// `MissionPolicyVersionStatus` are both four-member and in this same order —
+/// which §5.5 explicitly adopts ("or the exact existing vocabulary if preflight
+/// confirms a different repository standard").
+///
+/// Published versions are IMMUTABLE (§5.5): validation and publication are
+/// steps a version walks through, and changing a published version is a NEW
+/// version, never an UPDATE of the content rows below. Running purchases pin
+/// the version they started on, so an explanation rendered later is rendered
+/// against the configuration that actually ran.
+///
+/// WHY NOT a two-member "may it be used" enum: §5.5's discipline distinguishes
+/// "checked" from "in force" from "withdrawn", and collapsing them would lose
+/// whichever fact the other member carried — the reasoning the HR schema's enum
+/// note states for the same four members.
+enum WorkflowDefinitionVersionStatus {
+  DRAFT
+  VALIDATED
+  PUBLISHED
+  ARCHIVED
+}
+
+/// HOW one step of a version executes (§5.6): `SEQUENTIAL`, `PARALLEL` or
+/// `CONDITIONAL` — the specification's exact three members.
+///
+/// The member is CONFIGURATION, not code: §5.6 keeps order, name, actor,
+/// conditions and thresholds as configuration, and this column is how a tenant
+/// states which of the three execution shapes a step has. There is no fourth
+/// member and no default beyond SEQUENTIAL: a step that says nothing takes the
+/// ordinary ordered path, which is the only assumption the specification
+/// permits.
+enum WorkflowStepExecutionMode {
+  SEQUENTIAL
+  PARALLEL
+  CONDITIONAL
+}
+
+/// WHERE a step's approver comes from (§5.8) — the configurable sources, each
+/// named exactly as the specification names it.
+///
+/// REQUESTER_MANAGER    — the requester's manager, resolved through the
+///                        platform contracts at decision time.
+/// GROUP_MANAGER        — the manager of the requester's group/unit.
+/// COMMERCIAL_LIAISON   — the tenant's commercial liaison for the group; §5.8
+///                        requires this to be CONFIGURATION-driven, never a
+///                        hard-coded person.
+/// CONFIGURED_USER      — one identity the step names (`actorUserId`).
+/// CONFIGURED_ROLE      — a role the step names (`actorRoleCode`); who holds it
+///                        is Core's entitlement fact, never a table here.
+/// RULE_RESOLVER        — resolved by the pure Rule Engine (`actorRule`), so
+///                        "who approves" can be tenant policy rather than a
+///                        person.
+///
+/// CLOSED AT SIX MEMBERS: these are the sources C1 states. §5.8's closing line
+/// ("OTHER EXPLICITLY SUPPORTED SOURCES") makes any further source an EXPLICIT
+/// addition — a migration that widens this enum together with the runtime that
+/// resolves the new source, which is exactly the cost §5.2's "a future addition
+/// is a migration" records. A free-text source would let a typo become a
+/// source no resolver knows, and the step would fail only at decision time.
+enum WorkflowActorSource {
+  REQUESTER_MANAGER
+  GROUP_MANAGER
+  COMMERCIAL_LIAISON
+  CONFIGURED_USER
+  CONFIGURED_ROLE
+  RULE_RESOLVER
+}
+
+/// WHICH EVENT STARTS A RUN OF A VERSION (step N, ruling B1) — the event side
+/// of selection. A submitted purchase fires exactly one trigger, and only
+/// versions whose `trigger_event` names it are candidates.
+///
+/// CLOSED AT ONE MEMBER. `PURCHASE_SUBMITTED` is the only trigger step N can
+/// fire — the purchase document's own submission. A second member arrives as a
+/// migration together with the surface that fires it, never as an enum value no
+/// transition produces.
+enum WorkflowTriggerEvent {
+  PURCHASE_SUBMITTED
+  AFTER_DOCUMENT_WORKFLOW_APPROVED
+}
+
+/// HOW A PARALLEL GROUP OF A VERSION COMPLETES (step N, ruling B2) —
+/// version-level configuration, so "every branch must approve" and "any one
+/// approval suffices" are the tenant's stated choice rather than a constant in
+/// the runtime.
+///
+/// ALL — every branch of the group must approve; the first refusal makes the
+///       run REJECTED and the group's remaining PENDING branches become
+///       SKIPPED in the same transaction.
+/// ANY — the first approval completes the group and its remaining PENDING
+///       branches become SKIPPED; the run is REJECTED only when every branch
+///       ends refused (or skipped by its own condition).
+///
+/// CLOSED AT TWO MEMBERS. QUORUM/MAJORITY/WEIGHTED are NOT modelled: each would
+/// need a join rule the runtime can state and a test that falsifies it, and step
+/// N approves neither. A future policy is an additive migration plus the runtime
+/// that honours it — never an untyped number a reader would have to interpret.
+enum WorkflowParallelJoinPolicy {
+  ALL
+  ANY
+}
+
+/// WHAT A FALSE CONDITION DOES (step N, ruling B3) — `WorkflowStep`'s
+/// `onConditionFalse`, per-step configuration: the step's `condition` decides
+/// WHETHER the step matters, and this decides WHAT HAPPENS when it does not.
+///
+/// SKIPPED    — the step instance is persisted SKIPPED with its false condition
+///              result, and the run advances under the ordinary rules.
+/// TERMINATED — as SKIPPED, and the RUN becomes REJECTED in the same
+///              transaction: a false condition is a refusal by configuration,
+///              attributable to no human decision, so no REJECTED step instance
+///              is written for it.
+/// BLOCKED    — MODELLED AND REFUSED AT PUBLISH in step N
+///              (`WORKFLOW_BLOCKED_BEHAVIOR_UNSUPPORTED`): the contract defines
+///              neither WHO resumes a blocked run nor FROM WHICH state, so N
+///              invents no resume path, no resume permission and no timeout. A
+///              DRAFT may carry the value — an administrator sees the modelled
+///              concept — while no PUBLISHED version may, which makes execution
+///              of it unreachable in a valid published workflow.
+enum WorkflowConditionFalseBehavior {
+  SKIPPED
+  BLOCKED
+  TERMINATED
+}
+
+/// The logical workflow container of §5.5 — the tenant's answer to "which
+/// purchase workflow is this?" and NOTHING else.
+///
+/// IDENTITY ONLY. This row carries no status, no dates of force and no steps:
+/// effectiveness, lifecycle and content are facts about VERSIONS (below), and a
+/// status here would be a second answer to "which version is in force" — the
+/// same two-answers problem the HR schema's `LeavePolicy` note records.
+///
+/// LIFECYCLE. Definitions are not deleted: they accumulate versions, and the
+/// version lifecycle decides which one is usable. Nothing is seeded — a tenant
+/// with no configured workflow has no row here, and the surface renders that
+/// absence rather than inventing a default nobody authored (§6: configuration
+/// is a product capability).
+///
+/// WHAT THIS MODEL MUST NOT BECOME: not a rule table (the rule engine is the
+/// platform's and is never reimplemented, §9/§31), not a holder of steps or
+/// thresholds (those belong to a version), and not a place a hard-coded
+/// approver identity can live (§5.8).
+model WorkflowDefinition {
+  id        String   @id @default(uuid()) @db.Uuid
+  /// TEXT, like every `tenantId` in this database.
+  tenantId  String   @map("tenant_id") @db.Text
+  /// The tenant's own label for the workflow ("standard-purchase"). A LABEL,
+  /// not a sequence this system mints.
+  code      String   @db.VarChar(64)
+  /// What the workflow is called on screen. Free text.
+  name      String   @db.VarChar(200)
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  /// Every version ever authored under this definition. RESTRICT: a version is
+  /// evidence of what was configured, and evidence is not deleted.
+  versions WorkflowDefinitionVersion[] @relation("WorkflowDefinitionVersionDefinition")
+
+  /// Composite-key target for the same-tenant version FK below.
+  @@unique([tenantId, id], map: "WorkflowDefinition_tenantId_id_key")
+  /// The tenant's handle on a workflow — the read every lookup performs.
+  @@unique([tenantId, code], map: "WorkflowDefinition_tenantId_code_key")
+  @@map("WorkflowDefinition")
+}
+
+/// ONE immutable version of a workflow definition (§5.5). This is what runs
+/// PIN: `WorkflowInstance.workflowDefinitionVersionId` is the version pin §5.9
+/// requires, so a purchase that started under one configuration is explained by
+/// it forever, and "what ran" stays separable from "what is configured now".
+///
+/// LIFECYCLE. `status` walks `WorkflowDefinitionVersionStatus` (DRAFT →
+/// VALIDATED → PUBLISHED → ARCHIVED as a one-way door). Once PUBLISHED the
+/// version's content is IMMUTABLE: the steps below are the configuration as
+/// published, and a change is a NEW version. `publishedAt` is NULL until the
+/// publish transition and RETAINED FOREVER AFTER — including once ARCHIVED —
+/// because the instant a configuration entered force is a historical fact
+/// (NULL is exactly "not published yet", never "unknown").
+///
+/// `versionLabel` is the TENANT's own label ("1404-01", "v3"), a label and not
+/// a sequence this system mints — taken from the HR precedent deliberately:
+/// two owners must not drift on what a version is.
+///
+/// WHAT THIS MODEL MUST NOT BECOME: not one JSON document pretending to be
+/// normalized (§16: no giant JSON), not a mutable "current configuration" row,
+/// and not a rule-set store — conditions and resolver rules are the rule
+/// engine's own typed payloads (below), never a second evaluator's tables
+/// (§9, §31).
+model WorkflowDefinitionVersion {
+  id                   String                          @id @default(uuid()) @db.Uuid
+  /// TEXT, like every `tenantId` in this database.
+  tenantId             String                          @map("tenant_id") @db.Text
+  /// The definition this version belongs to. Composite-FK target with the
+  /// tenant — a version never crosses a tenant boundary.
+  workflowDefinitionId String                          @map("workflow_definition_id") @db.Uuid
+  /// The tenant's own version label — a LABEL, never parsed or renumbered.
+  versionLabel         String                          @map("version_label") @db.VarChar(64)
+  /// Where the version stands in its one-way lifecycle. See the enum note.
+  status               WorkflowDefinitionVersionStatus @default(DRAFT)
+  /// WHICH TRIGGER EVENT starts a run of this version (ruling B1). NULL while a
+  /// DRAFT is being authored; REQUIRED by publication
+  /// (`WORKFLOW_TRIGGER_MISSING`) — a version naming no trigger never
+  /// participates in selection.
+  triggerEvent         WorkflowTriggerEvent?           @map("trigger_event")
+  /// The version's STATED rank among the candidates for one trigger (B1).
+  /// Higher wins. NULL reads as 0 — the neutral rank — which is why two
+  /// unconditional equal-rank candidates are the ambiguity selection REFUSES
+  /// (`WORKFLOW_SELECTION_AMBIGUOUS`) rather than a precedence the runtime
+  /// would have to invent.
+  selectionPriority    Int?                            @map("selection_priority")
+  /// The version's SELECTION CONDITION tree (§5.7's declarative form). NULL =
+  /// unconditional: the candidate participates without a gate. Validated
+  /// against the Commerce fact catalogue at publish, evaluated only by the
+  /// platform's pure Rule Engine.
+  selectionCondition   Json?                           @map("selection_condition")
+  /// HOW a PARALLEL group of this version completes (B2). NULL is admissible
+  /// only for a version with no PARALLEL step; a version carrying one is
+  /// refused at publication without it (`WORKFLOW_JOIN_POLICY_MISSING`).
+  parallelJoinPolicy   WorkflowParallelJoinPolicy?     @map("parallel_join_policy")
+  /// When this version was published. NULL until publication; retained after.
+  publishedAt          DateTime?                       @map("published_at") @db.Timestamptz(6)
+  createdAt            DateTime                        @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt            DateTime                        @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  /// The definition this version belongs to. RESTRICT: evidence of what was in
+  /// force is not deleted.
+  definition WorkflowDefinition @relation("WorkflowDefinitionVersionDefinition", fields: [tenantId, workflowDefinitionId], references: [tenantId, id], onDelete: Restrict, onUpdate: Cascade)
+  /// The version's steps — the configuration a run executes.
+  steps      WorkflowStep[]     @relation("WorkflowStepVersion")
+  /// The runs pinned to this version. RESTRICT: history is never orphaned by
+  /// deleting the configuration it cites.
+  instances  WorkflowInstance[] @relation("WorkflowInstanceVersion")
+
+  /// Composite-key target for the same-tenant step/instance foreign keys.
+  @@unique([tenantId, id], map: "WorkflowDefinitionVersion_tenantId_id_key")
+  /// One version per label inside a definition — the tenant's own numbering,
+  /// stated and enforced.
+  @@unique([tenantId, workflowDefinitionId, versionLabel], map: "WorkflowDefinitionVersion_tenantId_definitionId_version_key")
+  /// "the published version(s) of this tenant" — the read selection performs.
+  @@index([tenantId, status], map: "WorkflowDefinitionVersion_tenantId_status_idx")
+  @@map("WorkflowDefinitionVersion")
+}
+
+/// ONE configured step of ONE version (§5.6) — the unit a run activates.
+///
+/// EVERYTHING HERE IS CONFIGURATION, per §5.6's own rule: the step's name, its
+/// position, whether it is mandatory, how it executes, who it resolves to, its
+/// conditions and its thresholds are tenant configuration — which is why they
+/// are COLUMNS and typed payloads on this row and never constants in TypeScript
+/// (§6: configuration is a product capability; §5.6: "STEP ORDER IS
+/// CONFIGURATION … ACTOR IS CONFIGURATION").
+///
+/// ORDER IS STATED, NEVER INFERRED. `ordering` is the routing order and is
+/// UNIQUE inside its version (below): insertion order is a clock, and a route
+/// that depended on it would change when rows are re-inserted. `parallelGroup`
+/// is the label a PARALLEL step's branch carries; steps sharing it are the
+/// branches whose join the runtime answers.
+///
+/// ACTOR RESOLUTION (§5.8) is COLUMNS, not a string: `actorSource` names HOW
+/// the approver is resolved, and that source's parameter lives beside it —
+/// `actorUserId` for CONFIGURED_USER, `actorRoleCode` for CONFIGURED_ROLE,
+/// `actorRule` for RULE_RESOLVER (a rule engine condition tree, validated on
+/// write and evaluated only by the platform's pure engine). `actorSource` is
+/// NULLABLE because a DRAFT version may be incomplete; a PUBLISHED version
+/// with an unresolved actor is refused at publish time (validated on write),
+/// never at decision time.
+///
+/// THE PAYLOADS, each a DIFFERENT structure — §16 forbids one blob holding the
+/// domain, so each concern gets its own named column and its own write-time
+/// validation:
+///   * `condition`     — the activation condition, §5.7's typed declarative
+///                       tree (`src/rules/rule-condition.interface`). NULL = an
+///                       unconditional step. Evaluated only by the pure Rule
+///                       Engine, never re-implemented locally (§5.7 §9).
+///   * `thresholds`    — the limits the step compares against (§5.6
+///                       "thresholds are configuration", never code).
+///   * `lineFilters`   — which LINES the step applies to (§5.3).
+///   * `configuration` — the remaining stated configuration §5.6 names as
+///                       "relevant config metadata" (e.g. visible form fields).
+///
+/// WHAT THIS MODEL MUST NOT BECOME: not a rule-set version (the rule engine's
+/// registry owns those), not a store of resolved approver IDENTITIES (only the
+/// resolution MECHANISM is configuration — the resolved person is runtime
+/// history on `WorkflowStepInstance`), and not mutable after publication: a
+/// published version's steps are immutable with their version.
+model WorkflowStep {
+  id                          String                          @id @default(uuid()) @db.Uuid
+  /// TEXT, like every `tenantId` in this database.
+  tenantId                    String                          @map("tenant_id") @db.Text
+  /// The version this step belongs to. Composite-FK target with the tenant.
+  workflowDefinitionVersionId String                          @map("workflow_definition_version_id") @db.Uuid
+  /// The tenant's own key for this step inside the version ("check-budget").
+  /// A LABEL: a runtime step instance cites the step ROW, never this string.
+  stepKey                     String                          @map("step_key") @db.VarChar(64)
+  /// What the step is called on screen.
+  displayName                 String                          @map("display_name") @db.VarChar(200)
+  /// Whether the step must be decided for the flow to complete.
+  /// MANDATORY/OPTIONAL is configuration (§5.6), so it is a column.
+  mandatory                   Boolean                         @default(true)
+  /// How the step executes — SEQUENTIAL / PARALLEL / CONDITIONAL (§5.6).
+  executionMode               WorkflowStepExecutionMode       @default(SEQUENTIAL) @map("execution_mode")
+  /// The step's position in the version's stated order. UNIQUE per version;
+  /// see the model note for why insertion order is never the order.
+  ordering                    Int
+  /// The parallel branch this step belongs to — shared by a PARALLEL step's
+  /// branches, NULL for steps outside a parallel group.
+  parallelGroup               String?                         @map("parallel_group") @db.VarChar(64)
+  /// §5.7's activation condition tree. NULL = unconditional. Validated on
+  /// write; evaluated only by the platform's pure Rule Engine.
+  condition                   Json?
+  /// WHAT A FALSE `condition` DOES (ruling B3) — see
+  /// `WorkflowConditionFalseBehavior`. NULL = not stated: a step with no
+  /// condition never evaluates to false and needs none, while a step that DOES
+  /// state a condition must state this too by publication
+  /// (`WORKFLOW_CONDITION_FALSE_BEHAVIOR_MISSING`) — the runtime never guesses
+  /// what a false condition means. `BLOCKED` is refused at publish
+  /// (`WORKFLOW_BLOCKED_BEHAVIOR_UNSUPPORTED`).
+  onConditionFalse            WorkflowConditionFalseBehavior? @map("on_condition_false")
+  /// HOW this step's approver is resolved (§5.8). NULL = not configured yet
+  /// (refused at publish), never "anyone".
+  actorSource                 WorkflowActorSource?            @map("actor_source")
+  /// CONFIGURED_USER's parameter: an OPAQUE Core identity id.
+  actorUserId                 String?                         @map("actor_user_id") @db.Text
+  /// CONFIGURED_ROLE's parameter: a role CODE. Who holds the role is Core's
+  /// entitlement fact (§7/§10) — never a role table here.
+  actorRoleCode               String?                         @map("actor_role_code") @db.VarChar(128)
+  /// RULE_RESOLVER's parameter: the condition tree that names the approver.
+  actorRule                   Json?                           @map("actor_rule")
+  /// The amounts/limits this step compares against — configuration (§5.6).
+  thresholds                  Json?
+  /// Which lines the step applies to (§5.3 line-level routing).
+  lineFilters                 Json?                           @map("line_filters")
+  /// The remaining stated configuration ("relevant config metadata", §5.6).
+  configuration               Json?
+  createdAt                   DateTime                        @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt                   DateTime                        @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  /// The version this step belongs to. RESTRICT: a step is part of the evidence
+  /// of what was configured; evidence is not deleted.
+  version   WorkflowDefinitionVersion @relation("WorkflowStepVersion", fields: [tenantId, workflowDefinitionVersionId], references: [tenantId, id], onDelete: Restrict, onUpdate: Cascade)
+  /// The runtime steps that cite this configured step. RESTRICT (see above).
+  instances WorkflowStepInstance[]    @relation("WorkflowStepInstanceStep")
+
+  /// Composite-key target for the same-tenant step-instance foreign key.
+  @@unique([tenantId, id], map: "WorkflowStep_tenantId_id_key")
+  /// One step key per version — the author's handle, stated and enforced.
+  @@unique([tenantId, workflowDefinitionVersionId, stepKey], map: "WorkflowStep_tenantId_versionId_stepKey_key")
+  /// One step per position in the version — order is a stated fact.
+  @@unique([tenantId, workflowDefinitionVersionId, ordering], map: "WorkflowStep_tenantId_versionId_ordering_key")
+  @@map("WorkflowStep")
+}
+
+// ============================================================================
+// §5.15 — LINE ROUTING CONFIGURATION: versioned routing that selects the exact
+// WorkflowDefinitionVersion a PurchaseLine runs under. (Step O)
+// ============================================================================
+
+/// What happens when no configured route matches a PurchaseLine.
+enum WorkflowLineRoutingNoRouteBehavior {
+  REJECT_OPERATION
+  LEAVE_UNROUTED
+}
+
+/// How to resolve a PurchaseLine that matches more than one route.
+enum WorkflowLineRoutingMatchBehavior {
+  HIGHEST_PRIORITY
+  AMBIGUOUS_ERROR
+}
+
+/// How line workflow outcomes may influence the PurchaseDocument state.
+enum WorkflowLineRoutingAggregationPolicy {
+  ALL_APPROVED
+  INDEPENDENT
+}
+
+/// One versioned line-routing configuration for a tenant (§5.15).
+///
+/// LIFECYCLE. Reuses the established Aria version lifecycle so that a published
+/// routing version is immutable and running lines pin to it.
+///
+/// TRIGGER. `trigger` names which event causes line routing for a purchase:
+/// `PURCHASE_SUBMITTED` or `AFTER_DOCUMENT_WORKFLOW_APPROVED`.
+///
+/// ROUTES. `routeRules` is the stored JSON array of route candidates, each
+/// carrying `priority`, `condition`, `targetWorkflowDefinitionVersionId` and an
+/// optional `description`. The runtime normalizes this array into a single
+/// `commerce.workflow.line.selection` RuleSetVersion for the pure Rule Engine.
+///
+/// POLICIES. `noRouteBehavior`, `multipleMatchBehavior` and `aggregationPolicy`
+/// are the configurable outcomes for the three routing edge cases.
+model WorkflowLineRoutingVersion {
+  id                      String                              @id @default(uuid()) @db.Uuid
+  /// TEXT, like every `tenantId` in this database.
+  tenantId                String                              @map("tenant_id") @db.Text
+  /// The established Aria version lifecycle (DRAFT → VALIDATED → PUBLISHED → ARCHIVED).
+  status                  WorkflowDefinitionVersionStatus     @default(DRAFT)
+  /// The tenant's own label for this routing version (e.g. "1404-01").
+  versionLabel            String                              @map("version_label") @db.VarChar(64)
+  /// Which event causes line routing for a purchase.
+  trigger                 WorkflowTriggerEvent                @map("trigger")
+  /// What to do when a line matches no route.
+  noRouteBehavior         WorkflowLineRoutingNoRouteBehavior  @map("no_route_behavior")
+  /// How to resolve multiple matching routes.
+  multipleMatchBehavior   WorkflowLineRoutingMatchBehavior    @map("multiple_match_behavior")
+  /// How line results may influence document state.
+  aggregationPolicy       WorkflowLineRoutingAggregationPolicy @map("aggregation_policy")
+  /// The stored route-candidate array (see model note).
+  routeRules              Json                                @map("route_rules")
+  createdAt               DateTime                            @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt               DateTime                            @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  /// One label per tenant — an author cannot have two versions with the same name.
+  @@unique([tenantId, versionLabel], map: "WorkflowLineRoutingVersion_tenantId_versionLabel_key")
+  /// The operational read: the tenant's published routing for a trigger.
+  @@index([tenantId, status, trigger], map: "WorkflowLineRoutingVersion_tenantId_status_trigger_idx")
+
+  /// Purchase documents pinned to this routing version for O4 aggregation semantics.
+  purchaseDocuments PurchaseDocument[] @relation("PurchaseDocumentLineRoutingVersion")
+
+  /// Composite-key target for the same-tenant document pin foreign key.
+  @@unique([tenantId, id], map: "WorkflowLineRoutingVersion_tenantId_id_key")
+  @@map("WorkflowLineRoutingVersion")
+}
+
+// ============================================================================
+// PHASE C4-R — THE PURCHASE COMPLETION POLICY (GAP-3)
+// ============================================================================
+
+/// ONE VERSION of a tenant's Purchase Completion Policy: the authoritative rule that
+/// decides WHEN a `PurchaseDocument` may be completed (C1 §29's completion event, whose
+/// source states no C1 document states — the gap `purchase-status.ts` records as
+/// "`→ CLOSED` IS DELIBERATELY ABSENT").
+///
+/// WHY A VERSIONED ROW AND NOT A COLUMN ON THE DOCUMENT OR A CONSTANT IN CODE. The prior
+/// C4 phase refused to hard-code `APPROVED → CLOSED` because no source chooses a source
+/// status; C4-R makes that choice PRODUCT CONFIGURATION instead. Configuration that can
+/// change must be versioned for the same reason the commercial policy and the line
+/// routing are: a published row is immutable, a change is a NEW row, and the document
+/// records which row governed its completion.
+///
+/// THE LIFECYCLE IS THE ESTABLISHED ONE (DRAFT → VALIDATED → PUBLISHED → ARCHIVED) —
+/// this column's type is the same enum the workflow definition version, the line-routing
+/// version and the commercial configuration version already use, so "what may happen to a
+/// published configuration" has ONE answer in this database.
+///
+/// SINGLE PUBLISHED POLICY PER TENANT: publishing archives the previously published row
+/// in the same unit of work (§3-B's commercial precedent), so `status = PUBLISHED` names
+/// at most one row and the completion act reads exactly one policy. NO POLICY ROW IN
+/// `PUBLISHED` STATE MEANS COMPLETION IS NOT CONFIGURED — and an unconfigured completion
+/// fails CLOSED (no document may be completed), never "latest draft" and never a default.
+///
+/// `allowedFromStatuses` IS THE POLICY ITSELF: a JSON array of `PurchaseDocumentStatus`
+/// members from which a completion is permitted — a SET of the document's OWN lifecycle
+/// vocabulary, never a foreign lifecycle's state and never an expression. It is JSON for
+/// the reason `routeRules`/`assignmentRules` are: the value is a candidate list, and the
+/// DTO, the publish checklist and the completion evaluator all validate it against the
+/// frozen allowlist (`purchase-status.ts`), so an unknown member can be stored by
+/// nothing and evaluated by nobody.
+///
+/// WHAT THIS MODEL MUST NOT BECOME: not a second rule engine (no condition trees, no
+/// scripts, no user-supplied expressions), not a permission store (Core/RBAC owns who may
+/// act; this row owns only the BUSINESS eligibility of a state), and not a record of past
+/// completions — those live on `PurchaseDocument.completionPolicyVersionId`.
+model PurchaseCompletionPolicyVersion {
+  id                  String                          @id @default(uuid()) @db.Uuid
+  /// TEXT, like every `tenantId` in this database.
+  tenantId            String                          @map("tenant_id") @db.Text
+  /// The established Aria version lifecycle (DRAFT → VALIDATED → PUBLISHED → ARCHIVED).
+  status              WorkflowDefinitionVersionStatus @default(DRAFT)
+  /// The tenant's own label for this policy version — unique inside the tenant.
+  versionLabel        String                          @map("version_label") @db.VarChar(64)
+  /// The configured source statuses (see the model note). JSONB, allowlisted on every read.
+  allowedFromStatuses Json                            @map("allowed_from_statuses")
+  createdAt           DateTime                        @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt           DateTime                        @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  /// Documents completed UNDER this version. RESTRICT: a completed purchase never loses
+  /// the policy that authorised its completion.
+  documents PurchaseDocument[] @relation("PurchaseDocumentCompletionPolicyVersion")
+
+  /// Composite-key target for the same-tenant document pin foreign key.
+  @@unique([tenantId, id], map: "PurchaseCompletionPolicyVersion_tenantId_id_key")
+  /// One label per tenant — an author cannot have two versions with the same name.
+  @@unique([tenantId, versionLabel], map: "PurchaseCompletionPolicyVersion_tenantId_versionLabel_key")
+  /// The operational read: the tenant's published completion policy.
+  @@index([tenantId, status], map: "PurchaseCompletionPolicyVersion_tenantId_status_idx")
+  @@map("PurchaseCompletionPolicyVersion")
+}
+
+// ============================================================================
+// §5.9 / §5.10 — THE WORKFLOW EXECUTION SIDE: what actually ran, under which
+// pinned version, with what persisted condition outcome.
+// ============================================================================
+
+/// WHAT a workflow runs over (§5.9's `subjectType`). Exactly two members,
+/// because §5.3 permits execution at exactly two scopes: the DOCUMENT as a
+/// whole, or one LINE (a single document may carry lines routed to different
+/// commercial actors; the mixed case is a document-scope run alongside
+/// line-scope runs, never a third subject type).
+///
+/// The subject itself is an OPAQUE id (`subjectId`): Commerce does not join to
+/// `PurchaseDocument`/`PurchaseLine` from these history rows, because a history
+/// row must stay explainable even when the thing it describes is out of scope
+/// of the caller's read. `scopeType`/`scopeId` on the step instance below are
+/// the finer-grained pair §5.10 requires.
+enum WorkflowSubjectType {
+  PURCHASE_DOCUMENT
+  PURCHASE_LINE
+}
+
+/// Where ONE workflow INSTANCE stands (§5.9) — its OWN lifecycle, with the
+/// specification's exact members.
+///
+/// RUNNING → one of the terminal states: APPROVED, REJECTED, CANCELLED,
+/// EXPIRED. This is NOT `PurchaseDocument.status` (§5.9's prohibition): a
+/// document can be APPROVED commercially while its workflow was cancelled or
+/// expired, and collapsing the two would make "which fact is this?" depend on
+/// which table a reader happened to open.
+///
+/// The vocabulary is closed for C1 — a status no transition reaches is a state
+/// no writer writes and no test can falsify — and extensions are migrations
+/// that arrive together with the transition that produces them.
+enum WorkflowInstanceStatus {
+  RUNNING
+  APPROVED
+  REJECTED
+  CANCELLED
+  EXPIRED
+}
+
+/// WHAT one step instance decided about (§5.10's `scopeType`): the DOCUMENT as
+/// a whole, or one LINE. Exactly two members — §5.10 states the pair and
+/// nothing else — and `scopeId` names the subject in the same opaque way
+/// `WorkflowInstance.subjectId` does: no cross-table join is stored, so the
+/// decision stays readable as history.
+enum WorkflowScopeType {
+  DOCUMENT
+  LINE
+}
+
+/// Where ONE step instance stands (§5.10) — the statuses the specification
+/// names, exactly.
+///
+///   PENDING   — awaiting a decision (or not yet activated).
+///   APPROVED  — decided positively; `decision` records the same fact.
+///   REJECTED  — decided negatively; `decision` records the same fact.
+///   SKIPPED   — the step was not to be decided here (a condition excluded it,
+///               or a sibling branch completed the flow): the recorded
+///               `conditionResult` is the evidence, never re-evaluated on read.
+///   DELEGATED — handed to another actor; `resolvedApproverId` names who the
+///               step now waits on.
+///
+/// NO ACTIVE MEMBER: the specification's own list is the closed vocabulary and
+/// names PENDING only — inventing an ACTIVE state beside it would be a second
+/// spelling of "waiting" for the runtime to keep in sync. Additions arrive as
+/// migrations with the transition that produces them.
+enum WorkflowStepInstanceStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  SKIPPED
+  DELEGATED
+}
+
+/// WHAT a decided step decided (§5.10's `decision`): APPROVED or REJECTED —
+/// the two outcomes a decision can have, mirroring the repository's existing
+/// approval-decision enum (`LeaveApprovalStepDecision`).
+///
+/// §5.3's "return for correction" is deliberately NOT a third member: §5.10's
+/// status vocabulary (above) does not name a correction state either, and a
+/// member no specification transition produces would be exactly the unreachable
+/// state this schema refuses everywhere. Correction is a ROUTING behaviour —
+/// the runtime returns the line by activating work again (step O) — and its
+/// persisted facts are step outcomes plus line history, not a new vocabulary
+/// member.
+enum WorkflowStepDecision {
+  APPROVED
+  REJECTED
+}
+
+/// ONE execution of a workflow over one subject (§5.9), pinned to the exact
+/// configuration version it started under.
+///
+/// VERSION PIN. `workflowDefinitionVersionId` is the pin §5.5/§5.9 require: the
+/// run cites the immutable version, so publishing a new configuration never
+/// changes what this run was or what it will do. The pin is a composite FK with
+/// the tenant, so a run can never cite another tenant's version.
+///
+/// SUBJECT. `subjectType` + `subjectId` say WHAT ran (§5.9): the document or a
+/// single line, by opaque id. The pair is deliberately NOT a foreign key — a
+/// history row must remain readable without joining the aggregate it describes,
+/// and §5.3's line-level routing means several instances (one per scope) can
+/// cite the same document at once. Document-level state is an AGGREGATE of
+/// these rows, never their replacement (§5.3), which is why instances are rows
+/// with their own lifecycle and nothing overwrites them.
+///
+/// LIFECYCLE. `status` is its own lifecycle (`WorkflowInstanceStatus`) and is
+/// NEVER copied into `PurchaseDocument.status` (§5.9's prohibition; the §5.11
+/// enum note states the same rule from the other side).
+///
+/// WHAT THIS MODEL MUST NOT BECOME: not the step-by-step record (that is
+/// `WorkflowStepInstance`), not a configuration store (the pinned version is),
+/// not a queue or worker artifact (the runtime is request-driven; §22 forbids
+/// async workers), and not deletable — history is retained and no DELETE path
+/// exists anywhere in this database.
+model WorkflowInstance {
+  id                          String                 @id @default(uuid()) @db.Uuid
+  /// TEXT, like every `tenantId` in this database.
+  tenantId                    String                 @map("tenant_id") @db.Text
+  /// The immutable version this run is pinned to (see VERSION PIN above).
+  workflowDefinitionVersionId String                 @map("workflow_definition_version_id") @db.Uuid
+  /// Whether this run covers the document or one line (§5.9/§5.3).
+  subjectType                 WorkflowSubjectType    @map("subject_type")
+  /// The subject's id — OPAQUE, like every external reference in this schema.
+  subjectId                   String                 @map("subject_id") @db.Text
+  /// The workflow's own lifecycle. NEVER `PurchaseDocument.status` (§5.9).
+  status                      WorkflowInstanceStatus @default(RUNNING)
+  createdAt                   DateTime               @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt                   DateTime               @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  /// The pinned version. RESTRICT: a run is evidence of what executed, and
+  /// evidence is not deleted.
+  version WorkflowDefinitionVersion @relation("WorkflowInstanceVersion", fields: [tenantId, workflowDefinitionVersionId], references: [tenantId, id], onDelete: Restrict, onUpdate: Cascade)
+  /// The run's step instances — its actual, decided history.
+  steps   WorkflowStepInstance[]    @relation("WorkflowStepInstanceInstance")
+
+  /// Composite-key target for the same-tenant step-instance foreign key.
+  @@unique([tenantId, id], map: "WorkflowInstance_tenantId_id_key")
+  /// "the runs of this subject" — the read an explanation starts from.
+  @@index([tenantId, subjectType, subjectId, status], map: "WorkflowInstance_tenantId_subject_status_idx")
+  /// "this tenant's open work, recently touched" — the operational read.
+  @@index([tenantId, status, updatedAt], map: "WorkflowInstance_tenantId_status_updatedAt_idx")
+  @@map("WorkflowInstance")
+}
+
+/// ONE runtime step of ONE run (§5.10) — the persisted, never-recomputed record
+/// of what a step did.
+///
+/// STEP REFERENCE. `workflowStepId` cites the CONFIGURED step the instance ran
+/// (§5.10's "step reference"): the configuration the run executed is reachable
+/// from here, while the version pin on the instance says which configuration
+/// that was. The FK is composite with the tenant.
+///
+/// SCOPE. `scopeType` + `scopeId` state what this step decided about (§5.10):
+/// the DOCUMENT or a LINE, by opaque id. This is §5.3's line-level routing made
+/// durable — a step that routed a single line records that line, not "the
+/// document", which is what keeps the document level from overwriting line
+/// history.
+///
+/// DECISION. `resolvedApproverId` (opaque) is WHO the step resolved to;
+/// `decision` + `decidedAt` + `decisionComment` are what they decided, when
+/// and why. `decidedAt` is NULL exactly while the step has no decision.
+///
+/// CONDITION, PERSISTED (§5.7/§5.10): `conditionResult`,
+/// `conditionInputSnapshot`, `conditionRuleSetId` and `conditionRuleVersion`
+/// record the outcome the engine produced, the inputs it evaluated against and
+/// the rule/version identity that produced it. They are NEVER recomputed on
+/// read (§5.7: "Never silently re-evaluate historical results") — an
+/// explanation rendered next year must be the one that actually ran. NULL
+/// `conditionResult` means the step had NO condition, which is a different
+/// fact from `false` (a condition that evaluated false and may have skipped the
+/// step).
+///
+/// WHAT THIS MODEL MUST NOT BECOME: not a queue row (no worker columns, no
+/// leases, no retry counters — the runtime is request-driven, §22), not a copy
+/// of the step's configuration (the FK cites it), not the platform audit trail
+/// (§12: the audit port is the trail; this is the workflow's own record), and
+/// not deletable or re-writable history.
+model WorkflowStepInstance {
+  id                     String                     @id @default(uuid()) @db.Uuid
+  /// TEXT, like every `tenantId` in this database.
+  tenantId               String                     @map("tenant_id") @db.Text
+  /// The run this step belongs to. Composite-FK target with the tenant.
+  workflowInstanceId     String                     @map("workflow_instance_id") @db.Uuid
+  /// The CONFIGURED step this instance ran (§5.10's "step reference").
+  workflowStepId         String                     @map("workflow_step_id") @db.Uuid
+  /// Whether this decision covers the document or one line (see SCOPE above).
+  scopeType              WorkflowScopeType          @map("scope_type")
+  /// The scope's id — OPAQUE, like every reference in this schema.
+  scopeId                String                     @map("scope_id") @db.Text
+  /// Where the step stands. See the enum note.
+  status                 WorkflowStepInstanceStatus @default(PENDING)
+  /// WHO this step resolved to — an OPAQUE Core identity id. NULL = not yet
+  /// resolved (or unresolvable), which blocks the step rather than guessing.
+  resolvedApproverId     String?                    @map("resolved_approver_id") @db.Text
+  /// The decision itself, when one was made. NULL until then.
+  decision               WorkflowStepDecision?
+  /// The decision's stated reason (§5.10's `decisionComment`).
+  decisionComment        String?                    @map("decision_comment") @db.VarChar(500)
+  /// When the decision was made. NULL exactly while there is none.
+  decidedAt              DateTime?                  @map("decided_at") @db.Timestamptz(6)
+  /// The persisted condition outcome (see CONDITION above). NULL = the step
+  /// had no condition — never "not evaluated yet".
+  conditionResult        Boolean?                   @map("condition_result")
+  /// The input snapshot the condition was evaluated against (§5.7: "capture
+  /// required input snapshot"), kept so a historical explanation is
+  /// reproducible without re-reading today's data.
+  conditionInputSnapshot Json?                      @map("condition_input_snapshot")
+  /// The rule set identity that produced `conditionResult` (§5.7: "capture
+  /// relevant rule/version identity"). NULL together with the result.
+  conditionRuleSetId     String?                    @map("condition_rule_set_id") @db.VarChar(128)
+  /// The rule VERSION identity that produced `conditionResult`. NULL with it.
+  conditionRuleVersion   String?                    @map("condition_rule_version") @db.VarChar(64)
+  createdAt              DateTime                   @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt              DateTime                   @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  /// The run this step belongs to. RESTRICT: a step is history and is not
+  /// deleted (see the model note).
+  instance       WorkflowInstance @relation("WorkflowStepInstanceInstance", fields: [tenantId, workflowInstanceId], references: [tenantId, id], onDelete: Restrict, onUpdate: Cascade)
+  /// The configured step this instance ran. RESTRICT (see above).
+  stepDefinition WorkflowStep     @relation("WorkflowStepInstanceStep", fields: [tenantId, workflowStepId], references: [tenantId, id], onDelete: Restrict, onUpdate: Cascade)
+
+  /// Composite-key target, and the tenant-first read of one step instance.
+  @@unique([tenantId, id], map: "WorkflowStepInstance_tenantId_id_key")
+  /// One instance per configured step per run — a run never activates the same
+  /// step twice, and another pass is a NEW run, which is what keeps history
+  /// append-only.
+  @@unique([tenantId, workflowInstanceId, workflowStepId], map: "WorkflowStepInstance_tenantId_instanceId_stepId_key")
+  /// "what is waiting on this approver in this tenant" — the decision list.
+  @@index([tenantId, resolvedApproverId, status], map: "WorkflowStepInstance_tenantId_approver_status_idx")
+  /// The run's steps, read together while a decision is recorded.
+  @@index([tenantId, workflowInstanceId, status], map: "WorkflowStepInstance_tenantId_instanceId_status_idx")
+  @@map("WorkflowStepInstance")
+}
+
+// ============================================================================
+// STEP P — THE COMMERCIAL FOUNDATION (§22 of the final P prompt)
+// ============================================================================
+//
+// Commercial groups, configured liaison resolution, line-first assignment with
+// append-only history, the versioned commercial policy, the commercial approval
+// lifecycle and the document's configuration pin. This exact MINIMUM set is
+// recorded in docs/PHASE-C1-P-COMMERCIAL-FOUNDATION-CONTRACT.md §6: "No other
+// model is created."
+//
+// INVARIANTS THIS SECTION OWES THE CONTRACT:
+//   * every relation is ON DELETE RESTRICT; every tenant-scoped unique/index is
+//     tenantId-first; no cross-database foreign key and no identity copy —
+//     `liaisonUserId`, `approverUserId`, `resolvedUserId` and `actorUserId` are
+//     opaque TEXT reached only through CommerceIdentityGateway (P1/P10).
+//   * published configuration is immutable and a document is PINNED to the
+//     version its first commercial operation saw (§3-B).
+//   * assignment is a PERSISTED current row plus APPEND-ONLY history (§3-C) —
+//     never derived, never rewritten.
+
+/// The explicit state of the CURRENT commercial assignment of one line (§3-E).
+///
+/// ASSIGNED   — a group, and the user resolved AT ASSIGNMENT TIME, is in force.
+/// UNASSIGNED — the configured no-assignment behaviour was LEAVE_UNASSIGNED: an
+///               EXPLICIT state row (P6), never a silent null, so the line is
+///               identifiable as unassigned by state.
+enum CommercialAssignmentState {
+  ASSIGNED
+  UNASSIGNED
+}
+
+/// Provenance of the current assignment row (§3-E, P4/P7).
+///
+/// The first two members ARE `WorkflowTriggerEvent` values — the timing comes
+/// from the closed event vocabulary, never an invented one (P4). `MANUAL` names
+/// the explicit API operation (§3-H), not a trigger event, and is deliberately
+/// NOT a member of `WorkflowTriggerEvent`.
+enum CommercialAssignmentSource {
+  PURCHASE_SUBMITTED
+  AFTER_DOCUMENT_WORKFLOW_APPROVED
+  MANUAL
+}
+
+/// The commercial approval lifecycle (§3-E/G, P12) — OWN state, never aliased
+/// to `WorkflowStepInstance.decision`. The decision is terminal in P: a
+/// correction flow that needs a later transition arrives additively (§11).
+enum CommercialApprovalState {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+/// WHEN commercial approval activates for a document (§3-E, P12).
+///
+/// `NOT_REQUIRED` is this step's closed member; the other two are the existing
+/// `WorkflowTriggerEvent` values (P4 — no invented events).
+enum CommercialApprovalActivation {
+  NOT_REQUIRED
+  PURCHASE_SUBMITTED
+  AFTER_DOCUMENT_WORKFLOW_APPROVED
+}
+
+/// HOW the approver of a commercial approval is resolved (§3-E, P10).
+///
+/// Closed at the two executable resolutions: `REQUESTER_MANAGER` and
+/// `GROUP_MANAGER` remain UNSUPPORTED until a real platform contract exists —
+/// publish refuses them with COMMERCIAL_RESOLVER_UNSUPPORTED (§7.7).
+enum CommercialApprovalApprover {
+  LINE_COMMERCIAL_LIAISON
+  CONFIGURED_USER
+}
+
+/// The configured `PurchaseDocument` projection policy (§3-E/F, P11) — the
+/// document-workflow / line-workflow / commercial combinations, closed at four.
+///
+/// The VOCABULARY (`DRAFT…CLOSED`) is architectural and is NOT configurable
+/// (P11): this policy decides when `SUBMITTED → APPROVED` is written, and no
+/// policy writes `CLOSED` (§3-F: APPROVED never becomes CLOSED automatically).
+enum CommercialProjectionPolicy {
+  DOCUMENT_WORKFLOW
+  ALL_LINES
+  DOCUMENT_WORKFLOW_AND_COMMERCIAL
+  ALL_LINES_AND_COMMERCIAL
+}
+
+/// The configured no-assignment behaviour (§3-D, P6) — same vocabulary shape
+/// as O's no-route behaviour: one configured outcome per edge case.
+///
+/// REJECT_OPERATION — a named refusal (COMMERCIAL_NO_ROUTE) rolls the
+///                     transaction back.
+/// LEAVE_UNASSIGNED — writes the current row with explicit `UNASSIGNED`.
+enum CommercialNoAssignmentBehavior {
+  REJECT_OPERATION
+  LEAVE_UNASSIGNED
+}
+
+/// How a line matching more than one assignment rule resolves (§3-D).
+enum CommercialMatchBehavior {
+  HIGHEST_PRIORITY
+  AMBIGUOUS_ERROR
+}
+
+/// A tenant-local commercial business grouping (P2): it groups commercial
+/// responsibility and determines liaison ownership. NOT a Core role, NOT an HR
+/// organisational unit, NOT a Core permission group — the row is a fact about
+/// `commerce_db` and nothing else. Minimum fields; no speculative hierarchy
+/// and no generic organisation system (P2).
+///
+/// LIAISON. `liaisonUserId` is an OPAQUE Core identity and is nullable (§3-K:
+/// a group without a configured liaison is a real state — resolution refuses
+/// with COMMERCIAL_LIAISON_NOT_CONFIGURED and never falls back to another
+/// user). Every write validates it as a tenant member through
+/// CommerceIdentityGateway (P1), and it is validated again at use time.
+///
+/// NOT DELETABLE IN P (§3-L): the contract defines no group delete; the FKs
+/// from assignment rows are RESTRICT, so a group with history cannot vanish
+/// under the history that names it.
+model CommercialGroup {
+  id             String    @id @default(uuid()) @db.Uuid
+  /// TEXT, like every `tenantId` in this database.
+  tenantId       String    @map("tenant_id") @db.Text
+  /// The tenant's stable code for the group — unique inside the tenant.
+  code           String    @db.VarChar(64)
+  /// The human name the surface renders.
+  name           String    @db.VarChar(128)
+  /// The configured commercial liaison: an OPAQUE identity (see the model note).
+  liaisonUserId  String?   @map("liaison_user_id") @db.Text
+  createdAt      DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt      DateTime  @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  /// Current assignments in this group. RESTRICT (§3-L).
+  assignments CommercialAssignment[] @relation("CommercialAssignmentGroup")
+  /// Append-only history naming this group. RESTRICT (§3-L).
+  history CommercialAssignmentHistory[] @relation("CommercialAssignmentHistoryGroup")
+
+  /// Composite-key target for the tenant-first FKs above.
+  @@unique([tenantId, id], map: "CommercialGroup_tenantId_id_key")
+  /// The tenant's own code — COMMERCIAL_GROUP_CODE_TAKEN on collision.
+  @@unique([tenantId, code], map: "CommercialGroup_tenantId_code_key")
+  /// The tenant's group list.
+  @@index([tenantId], map: "CommercialGroup_tenantId_idx")
+  @@map("CommercialGroup")
+}
+
+/// ONE versioned commercial policy for a tenant (§6): assignment timing and
+/// rules, no-assignment/match behaviour, commercial approval activation and
+/// approver resolution, applicability condition and the document projection
+/// policy — tenant configuration changeable by an administrator without a
+/// TypeScript change (§0, Maximum Practical Configurability).
+///
+/// LIFECYCLE — the established Aria `DRAFT → VALIDATED → PUBLISHED →
+/// ARCHIVED`, reusing `WorkflowDefinitionVersionStatus`: publishing archives
+/// the previously published version (§7.9), so at most one version is
+/// PUBLISHED per tenant, and an ambiguity at activation refuses with a named
+/// failure rather than choosing one (§3-B).
+///
+/// IMMUTABILITY. Published versions are immutable: edits are refused outside
+/// DRAFT, and a document pins the version its first commercial operation saw
+/// (§3-B) — a configuration published later never changes that document's
+/// commercial meaning.
+///
+/// RULES. `assignmentRules` is the stored candidate list
+/// `{ label, priority, condition, commercialGroupId }` — exactly how O stores
+/// `routeRules` (§3-D); `applicabilityCondition` is the optional bound
+/// condition of §3-G. Both are validated against the allowlisted commercial
+/// fact catalogue at publish (§7.3–§7.4); a fact outside the catalogue is
+/// rejected so no rule can reach a raw Prisma row (§5).
+model CommercialConfigurationVersion {
+  id                       String                          @id @default(uuid()) @db.Uuid
+  /// TEXT, like every `tenantId` in this database.
+  tenantId                 String                          @map("tenant_id") @db.Text
+  /// The established Aria version lifecycle (DRAFT → VALIDATED → PUBLISHED → ARCHIVED).
+  status                   WorkflowDefinitionVersionStatus @default(DRAFT)
+  /// The tenant's own label for this version — unique inside the tenant.
+  versionLabel             String                          @map("version_label") @db.VarChar(64)
+  /// The event that fires assignment for a pinned document (P4): the closed
+  /// `WorkflowTriggerEvent` vocabulary — never a hard-coded timing.
+  assignmentTrigger        WorkflowTriggerEvent            @map("assignment_trigger")
+  /// What a line with no matching rule becomes (§3-D, P6).
+  noAssignmentBehavior     CommercialNoAssignmentBehavior  @map("no_assignment_behavior")
+  /// How multiple matching rules resolve (§3-D).
+  matchBehavior            CommercialMatchBehavior        @map("match_behavior")
+  /// The tenant-authored assignment candidate list (see the model note).
+  assignmentRules          Json                            @map("assignment_rules")
+  /// When the commercial approval lifecycle activates (§3-G).
+  approvalActivation       CommercialApprovalActivation    @map("approval_activation")
+  /// How an approver resolves — NULL while `approvalActivation` is
+  /// NOT_REQUIRED (§7.8: a required activation must state one).
+  approvalApprover         CommercialApprovalApprover?     @map("approval_approver")
+  /// The CONFIGURED_USER identity — validated at publish and again at
+  /// activation through CommerceIdentityGateway (§7.5, §3-G).
+  approverUserId           String?                         @map("approver_user_id") @db.Text
+  /// The optional bound applicability condition (§3-G): `false` → no approval
+  /// record is created for the line.
+  applicabilityCondition   Json?                           @map("applicability_condition")
+  /// The configured `PurchaseDocument` projection policy (§3-F, P11).
+  projectionPolicy         CommercialProjectionPolicy      @map("projection_policy")
+  createdAt                DateTime                        @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt                DateTime                        @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  /// Assignment rows produced under this version. RESTRICT (§3-B).
+  assignments CommercialAssignment[] @relation("CommercialAssignmentConfigurationVersion")
+  /// Assignment history entries produced under this version. RESTRICT (§3-B).
+  assignmentHistory CommercialAssignmentHistory[] @relation("CommercialAssignmentHistoryConfigurationVersion")
+  /// Commercial approvals produced under this version. RESTRICT (§3-B).
+  approvals CommercialApproval[] @relation("CommercialApprovalConfigurationVersion")
+  /// Documents pinned to this version. RESTRICT (§3-B).
+  documents PurchaseDocument[] @relation("PurchaseDocumentCommercialConfigurationVersion")
+
+  /// Composite-key target for the tenant-first FKs above.
+  @@unique([tenantId, id], map: "CommercialConfigurationVersion_tenantId_id_key")
+  /// One label per tenant — an author cannot have two versions with the same name.
+  @@unique([tenantId, versionLabel], map: "CommercialConfigurationVersion_tenantId_versionLabel_key")
+  /// The operational read: the tenant's published policy (§3-B) and its list.
+  @@index([tenantId, status], map: "CommercialConfigurationVersion_tenantId_status_idx")
+  @@map("CommercialConfigurationVersion")
+}
+
+/// The CURRENT commercial assignment of ONE line (P3/P5, §3-C) — persisted,
+/// never derived: exactly one row per `(tenantId, purchaseLineId)`.
+///
+/// LINE-FIRST. The row keys the LINE, not the document: a mixed purchase
+/// (line 1 → group A, line 2 → group B) is the ordinary case (P3), and there
+/// is NO document-level assignment in P (§3-J).
+///
+/// `status = UNASSIGNED` is the explicit LEAVE_UNASSIGNED outcome (P6): a row
+/// that names the line's unassigned state by STATE, never by a missing row or
+/// a silent null — which is why `commercialGroupId` and `resolvedUserId` are
+/// nullable and discriminated by `status`.
+///
+/// RESOLVED VALUES ARE FROZEN AT ASSIGNMENT TIME (§3-C): `resolvedUserId` is
+/// the user resolved when the assignment happened; a later liaison swap on the
+/// group rewrites NOTHING here — it changes configuration for future
+/// assignments, and history keeps January's user discoverable after
+/// February's (§3-C).
+///
+/// `purchaseLineId` / `purchaseDocumentId` are OPAQUE uuid references, like
+/// `WorkflowInstance.subjectId`: §6 lists only the group and version FKs, and
+/// a history-shaped row must stay explainable and tenant-scoped without
+/// joining out of its own read.
+model CommercialAssignment {
+  id                       String                   @id @default(uuid()) @db.Uuid
+  /// TEXT, like every `tenantId` in this database.
+  tenantId                 String                   @map("tenant_id") @db.Text
+  /// The line this assignment is for — OPAQUE (see the model note).
+  purchaseLineId           String                   @map("purchase_line_id") @db.Uuid
+  /// The document the line belongs to — OPAQUE, carried for the tenant-first
+  /// document read of §9 (`?documentId=`), never joined.
+  purchaseDocumentId       String                   @map("purchase_document_id") @db.Uuid
+  /// The group in force — NULL exactly when `status = UNASSIGNED`.
+  commercialGroupId        String?                  @map("commercial_group_id") @db.Uuid
+  /// ASSIGNED / UNASSIGNED — the explicit state of §3-C/P6.
+  status                   CommercialAssignmentState
+  /// Provenance of this row: which event (or the manual operation) produced it.
+  source                   CommercialAssignmentSource
+  /// The user resolved AT ASSIGNMENT TIME — OPAQUE (P1/P10).
+  resolvedUserId           String?                  @map("resolved_user_id") @db.Text
+  /// WHICH assignment rule produced this row (§3-M): the tenant's own rule
+  /// LABEL, so "why was this line assigned?" is answerable from persisted state
+  /// rather than from logs. NULL for a manual assignment and for an explicit
+  /// UNASSIGNED row — the two cases where no rule decided.
+  matchedRuleLabel         String?                  @map("matched_rule_label") @db.VarChar(128)
+  /// The configuration version this row was produced under — NULL until the
+  /// document's first commercial operation pins one (§3-B).
+  configurationVersionId   String?                  @map("configuration_version_id") @db.Uuid
+  createdAt                DateTime                 @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt                DateTime                 @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  /// The group in force. RESTRICT: a group with assignments is not deletable (§3-L).
+  commercialGroup CommercialGroup? @relation("CommercialAssignmentGroup", fields: [tenantId, commercialGroupId], references: [tenantId, id], onDelete: Restrict, onUpdate: Cascade)
+  /// The version this row was produced under. RESTRICT (§3-B).
+  configurationVersion CommercialConfigurationVersion? @relation("CommercialAssignmentConfigurationVersion", fields: [tenantId, configurationVersionId], references: [tenantId, id], onDelete: Restrict, onUpdate: Cascade)
+
+  /// THE CURRENT ROW: one per line per tenant — an automatic trigger skips a
+  /// line that already has one (§3-H), and a manual call REASSIGNS rather than
+  /// inserting a second row (P7).
+  @@unique([tenantId, purchaseLineId], map: "CommercialAssignment_tenantId_purchaseLineId_key")
+  /// The document's current assignments — the §9 read.
+  @@index([tenantId, purchaseDocumentId], map: "CommercialAssignment_tenantId_purchaseDocumentId_idx")
+  @@map("CommercialAssignment")
+}
+
+/// APPEND-ONLY assignment history (P5/P7, §3-C): every creation,
+/// reassignment and change to the current row writes a NEW row here and never
+/// rewrites an old one — the repository exposes no update path for it.
+///
+/// One row describes the assignment state that TOOK EFFECT at `changedAt`,
+/// with its provenance, the actor who caused it and the reason where one is
+/// required: the "old assignment" of a reassignment is the preceding row for
+/// the line, so January's Group A/User X stays discoverable after February's
+/// Group B/User Y (§3-C). `actorUserId` is NULL for a configured trigger (no
+/// human caused it) and set for MANUAL operations (P7).
+///
+/// A configuration change — including a liaison swap (§3-C) — never rewrites
+/// any row here: entries carry the user resolved AT ASSIGNMENT TIME.
+model CommercialAssignmentHistory {
+  id                       String                   @id @default(uuid()) @db.Uuid
+  /// TEXT, like every `tenantId` in this database.
+  tenantId                 String                   @map("tenant_id") @db.Text
+  /// The line this entry describes — OPAQUE (see `CommercialAssignment`).
+  purchaseLineId           String                   @map("purchase_line_id") @db.Uuid
+  /// The group that took effect — NULL for an explicit UNASSIGNED entry.
+  commercialGroupId        String?                  @map("commercial_group_id") @db.Uuid
+  /// The state that took effect: ASSIGNED / UNASSIGNED.
+  status                   CommercialAssignmentState
+  /// Provenance of the assignment that took effect.
+  source                   CommercialAssignmentSource
+  /// The user resolved at assignment time — OPAQUE (P1/P10).
+  resolvedUserId           String?                  @map("resolved_user_id") @db.Text
+  /// WHICH assignment rule produced this state (§3-M), carried into history for
+  /// the same reason the current row carries it: the January entry must answer
+  /// "why" as completely as the February one. NULL for manual/unassigned.
+  matchedRuleLabel         String?                  @map("matched_rule_label") @db.VarChar(128)
+  /// The configuration version in force at this change (§3-B).
+  configurationVersionId   String?                  @map("configuration_version_id") @db.Uuid
+  /// Who caused the change — NULL for a configured trigger, set for MANUAL.
+  actorUserId              String?                  @map("actor_user_id") @db.Text
+  /// The reason captured on a reassignment (P7).
+  reason                   String?                  @db.Text
+  /// When this state took effect — the history clock, stated per row.
+  changedAt                DateTime                 @default(now()) @map("changed_at") @db.Timestamptz(6)
+
+  /// The group that took effect. RESTRICT (§3-L).
+  commercialGroup CommercialGroup? @relation("CommercialAssignmentHistoryGroup", fields: [tenantId, commercialGroupId], references: [tenantId, id], onDelete: Restrict, onUpdate: Cascade)
+  /// The version in force. RESTRICT (§3-B).
+  configurationVersion CommercialConfigurationVersion? @relation("CommercialAssignmentHistoryConfigurationVersion", fields: [tenantId, configurationVersionId], references: [tenantId, id], onDelete: Restrict, onUpdate: Cascade)
+
+  /// THE history read: a line's entries, oldest first.
+  @@index([tenantId, purchaseLineId, changedAt], map: "CommercialAssignmentHistory_tenantId_lineId_changedAt_idx")
+  @@map("CommercialAssignmentHistory")
+}
+
+/// ONE commercial approval per line per document (§3-G) — a DISTINCT
+/// lifecycle from `WorkflowStepInstance.decision` (P12): own state, own
+/// actor, own time, own outcome. Unique `(tenantId, purchaseLineId)` in P; a
+/// correction flow needing a second record arrives additively later (§11).
+///
+/// CREATED when the pinned activation event fires for a document whose line
+/// has a commercial assignment (§3-G); activation `NOT_REQUIRED` → never
+/// created, and a bound applicability condition evaluating `false` → no
+/// record for that line.
+///
+/// `approverUserId` is resolved and STORED at activation: the line's current
+/// assignment user for LINE_COMMERCIAL_LIAISON, the configuration's user for
+/// CONFIGURED_USER, each validated through CommerceIdentityGateway. A
+/// decision requires the acting user to equal the stored approver, in-tenant,
+/// while the record is PENDING; it records the decision user, time and
+/// optional comment, then drives the projection recompute in the same unit of
+/// work (§3-G).
+///
+/// `applicabilityResult` PERSISTS the condition outcome the contract persists
+/// (§5) — `NULL` means no bound condition was configured; nothing is
+/// recomputed at read time.
+model CommercialApproval {
+  id                       String                  @id @default(uuid()) @db.Uuid
+  /// TEXT, like every `tenantId` in this database.
+  tenantId                 String                  @map("tenant_id") @db.Text
+  /// The line this approval decides — OPAQUE, line-scoped like assignment (P3).
+  purchaseLineId           String                  @map("purchase_line_id") @db.Uuid
+  /// The document the line belongs to — OPAQUE, for the §9 document read.
+  purchaseDocumentId       String                  @map("purchase_document_id") @db.Uuid
+  /// PENDING / APPROVED / REJECTED — the own lifecycle of §3-E.
+  status                   CommercialApprovalState @default(PENDING)
+  /// WHICH resolution produced `approverUserId` (§3-E, P10).
+  approver                 CommercialApprovalApprover
+  /// The approver resolved AT ACTIVATION — OPAQUE, stored for the actor check.
+  approverUserId           String                  @map("approver_user_id") @db.Text
+  /// The persisted applicability outcome (§5) — NULL when no condition is bound.
+  applicabilityResult      Boolean?                @map("applicability_result")
+  /// The configuration version this record was activated under (§3-B) — NOT
+  /// NULL: a record cannot exist without the pinned version that ordered it.
+  configurationVersionId   String                  @map("configuration_version_id") @db.Uuid
+  /// Who decided — OPAQUE; must equal `approverUserId` or the decision refuses.
+  decidedByUserId          String?                 @map("decided_by_user_id") @db.Text
+  decidedAt                DateTime?               @map("decided_at") @db.Timestamptz(6)
+  /// The optional decision comment (§9).
+  comment                  String?                 @db.Text
+  createdAt                DateTime                @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt                DateTime                @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  /// The version this record was activated under. RESTRICT (§3-B).
+  configurationVersion CommercialConfigurationVersion @relation("CommercialApprovalConfigurationVersion", fields: [tenantId, configurationVersionId], references: [tenantId, id], onDelete: Restrict, onUpdate: Cascade)
+
+  /// Composite-key target, and the tenant-first read of one record.
+  @@unique([tenantId, id], map: "CommercialApproval_tenantId_id_key")
+  /// ONE approval per line per document (§3-G).
+  @@unique([tenantId, purchaseLineId], map: "CommercialApproval_tenantId_purchaseLineId_key")
+  /// The decision list: what is PENDING in this tenant (§9).
+  @@index([tenantId, status], map: "CommercialApproval_tenantId_status_idx")
+  /// The document's approvals, read together (§9 `?documentId=`).
+  @@index([tenantId, purchaseDocumentId], map: "CommercialApproval_tenantId_purchaseDocumentId_idx")
+  /// [tenantId, approverUserId, status] — PHASE C2 (GAP-1b): the pending-decision inbox's
+  /// actor-scoped read (`WHERE tenant_id = ? AND approver_user_id = ? AND status = 'PENDING'`),
+  /// shaped exactly like step N's `WorkflowStepInstance_tenantId_approver_status_idx`. Additive:
+  /// the §9 decision-list index above stays untouched for the filters that already use it.
+  @@index([tenantId, approverUserId, status], map: "CommercialApproval_tenantId_approverUserId_status_idx")
+  @@map("CommercialApproval")
+}
+
+/// Phase C1 Step Q (§5.14, §I16): the payment METHOD a row records — a closed
+/// vocabulary of three, the step-Q specification's own list (Q3). Stored as an
+/// enum rather than free text so that a fourth member arrives as an ADDITIVE
+/// migration plus its DTO membership, never as a typo in a column. `CHECK` is a
+/// LABEL a tenant states: it creates no cheque, bank, instrument, endorsement
+/// or clearing entity anywhere in Commerce (§13 — no fake Finance module), and
+/// the payment's own opaque reference strings are where a future Finance
+/// contract will find its identifier.
+enum PaymentMethod {
+  CASH
+  PETTY_CASH
+  CHECK
+}
+
+/// Phase C1 Step Q (§5.14, §I16): ONE payment event against a purchase
+/// document — APPEND-ONLY money history (§3-A). A row is written once and is
+/// never updated or deleted; the ONLY correction is a NEW row naming the row it
+/// reverses (`reversesPaymentId`), whose amount is the exact negation, so the
+/// pair sums to zero and the history shows both what was recorded and that it
+/// was withdrawn (Q4).
+///
+/// There is deliberately NO `PaymentStatus` column and no payment total on the
+/// document (Q2): UNPAID / PARTIAL / PAID / OVERPAID is a DETERMINISTIC
+/// READ-TIME PROJECTION of these rows against the document's own `totalAmount`
+/// (§5.13), so a status can never disagree with the rows it summarises. There
+/// is no `updated_at` for the same family of reasons: a column that only ever
+/// changes once is a lie about mutation — the row's own clock is `createdAt`.
+///
+/// `currency` is a per-ROW SNAPSHOT (Q5): mirrored from the document on append
+/// and mirrored from the original row on compensation, because a money history
+/// whose unit could change under it is not evidence. Reference columns are
+/// OPAQUE `VARCHAR(128)` strings (§13) — references, not relationships: C1 owns
+/// no supplier, bank or invoice directory to resolve them against.
+model PaymentRecord {
+  id                 String        @id @default(uuid()) @db.Uuid
+  /// TEXT, like every `tenantId` in this database — and the FIRST argument of
+  /// every repository method and the FIRST column of every index here (§3-F).
+  tenantId           String        @map("tenant_id") @db.Text
+  /// The document this payment settles — OPAQUE, composite-keyed so a payment
+  /// can never name another tenant's document even if its UUID were guessed:
+  /// both the foreign key and the predicate require the tenant (Q1).
+  purchaseDocumentId String        @map("purchase_document_id") @db.Uuid
+  /// `Decimal(18,4)` exact: positive on an append, the EXACT NEGATION of the
+  /// target on a compensation (Q4) — never client-stated there, so a reversal
+  /// is bit-for-bit the original's magnitude.
+  amount             Decimal       @db.Decimal(18, 4)
+  /// The currency THIS row was recorded in — snapshotted from the document at
+  /// append time and mirrored from the original on compensation (Q5).
+  currency           String?       @db.VarChar(3)
+  /// The method the tenant states. Closed at the enum's three members (Q3).
+  method             PaymentMethod
+  /// When the money moved as the CALLER states it — default now.
+  paymentDate        DateTime      @default(now()) @map("payment_date") @db.Timestamptz(6)
+  /// OPAQUE references (§13) — each row states its OWN, and a compensation
+  /// never inherits the original's. NULL means none stated, never empty.
+  payerRef           String?       @map("payer_ref") @db.VarChar(128)
+  payeeRef           String?       @map("payee_ref") @db.VarChar(128)
+  invoiceRef         String?       @map("invoice_ref") @db.VarChar(128)
+  externalReference  String?       @map("external_reference") @db.VarChar(128)
+  /// The row this one reverses — NULL on an ordinary payment. At most ONE
+  /// compensation per row, enforced STRUCTURALLY by the unique index below
+  /// rather than by a read that a race could beat (Q4).
+  reversesPaymentId  String?       @map("reverses_payment_id") @db.Uuid
+  /// Who recorded it — the acting session's user, NULL for a machine context.
+  /// Every Commerce history row carries its actor: an append-only fact that
+  /// cannot say who recorded it is only half an answer.
+  recordedByUserId   String?       @map("recorded_by_user_id") @db.Text
+  /// The row's OWN clock. No `updated_at`: append-only rows never change.
+  createdAt          DateTime      @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  /// The document this payment settles — the OBJECT side of the composite foreign key
+  /// `(tenant_id, purchase_document_id)` to `PurchaseDocument(tenant_id, id)` (Q1):
+  /// RESTRICT, like every relation in this schema, and tenant-bearing so a payment can
+  /// never name another tenant's document even if its UUID were guessed.
+  purchaseDocument PurchaseDocument @relation("PaymentRecordDocument", fields: [tenantId, purchaseDocumentId], references: [tenantId, id], onDelete: Restrict, onUpdate: Cascade)
+  /// The row this one reverses — the OBJECT side of `(tenant_id, reverses_payment_id)`
+  /// to `PaymentRecord(tenant_id, id)` itself (Q4). Nullable, so an ordinary payment's
+  /// link column is simply not matched; the UNIQUE index below makes "at most one
+  /// compensation per row" a structural fact rather than a race-prone read.
+  reverses PaymentRecord? @relation("PaymentRecordReversal", fields: [tenantId, reversesPaymentId], references: [tenantId, id], onDelete: Restrict, onUpdate: Cascade)
+  /// The compensating row itself, seen from the target — the same one-to-one link from
+  /// the other end. Stated so the schema names both directions the way Prisma requires.
+  reversedBy PaymentRecord? @relation("PaymentRecordReversal")
+
+  /// The tenant's handle on a row — the read every lookup performs.
+  @@unique([tenantId, id], map: "PaymentRecord_tenant_id_id_key")
+  /// Q4's one-compensation-per-row rule, enforced STRUCTURALLY rather than by a read a
+  /// race could beat: two concurrent compensations cannot both land.
+  @@unique([tenantId, reversesPaymentId], map: "PaymentRecord_tenant_id_reverses_payment_id_key")
+  /// The history page read — every index leads with `tenant_id` (Q1, §3-F).
+  @@index([tenantId, purchaseDocumentId, createdAt], map: "PaymentRecord_tenant_id_purchase_document_id_created_at_idx")
+  @@map("PaymentRecord")
+}
+
+/// Phase C1 Step R (§5.16, contract R3/R4/§3-A): ONE receiving operation —
+/// APPEND-ONLY receiving history's header row. A receipt is written once and is
+/// never updated or deleted; its `ReceiptLine` children carry the ACTUAL
+/// RECEIVED QUANTITY per purchase line, and the ONLY correction is a NEW
+/// receipt whose line carries a NEGATIVE quantity and names the receipt line it
+/// compensates (`reversesReceiptLineId`), so the original rows remain
+/// byte-for-byte unchanged while the history shows both what arrived and that
+/// part of it was withdrawn (R4).
+///
+/// There is deliberately NO receiving status column here and NONE on
+/// `PurchaseDocument` or `PurchaseLine` (R5): NOT_RECEIVED /
+/// PARTIALLY_RECEIVED / FULLY_RECEIVED is a DETERMINISTIC READ-TIME PROJECTION
+/// of these lines against each `PurchaseLine.quantity` (contract §3-B), so a
+/// status can never disagree with the events it summarises. There is no
+/// `updated_at` for the same family of reasons as `PaymentRecord`: a column
+/// that only ever changes once is a lie about mutation — the row's own clock
+/// is `createdAt`, and the operation's stated instant is `receivedAt`.
+///
+/// RECEIPTS ARE NOT NUMBERED (R3): `id` is the system-generated immutable
+/// identity — no counter, no series, no formatter exists for this table, which
+/// is also what makes the id a STABLE reference for step S's future returns.
+model Receipt {
+  id                 String        @id @default(uuid()) @db.Uuid
+  /// TEXT, like every `tenantId` in this database — and the FIRST argument of
+  /// every repository method and the FIRST column of every index here (§3-F).
+  tenantId           String        @map("tenant_id") @db.Text
+  /// The document this receiving operation belongs to — OPAQUE,
+  /// composite-keyed so a receipt can never name another tenant's document
+  /// even if its UUID were guessed: both the foreign key and the predicate
+  /// require the tenant.
+  purchaseDocumentId String        @map("purchase_document_id") @db.Uuid
+  /// When the goods were received as the CALLER states it (a strict ISO
+  /// instant at the DTO), default now — the operation's own instant, never
+  /// rewritten.
+  receivedAt         DateTime      @default(now()) @map("received_at") @db.Timestamptz(6)
+  /// Who received it — the acting session's user as an OPAQUE id, NULL for a
+  /// machine context. Never resolved against a person table here: the actor
+  /// comes from `resolveCommerceActor`, and §16 permits it only as opaque
+  /// receiving metadata.
+  receiverId         String?       @map("receiver_id") @db.Text
+  /// The row's OWN clock. No `updated_at`: append-only rows never change.
+  createdAt          DateTime      @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  /// The actual quantities this operation received — one line per purchase
+  /// line touched. RESTRICT: receiving evidence is not deleted, and no
+  /// lifecycle deletion path exists anywhere in this database.
+  lines ReceiptLine[] @relation("ReceiptLines")
+  /// The document this receiving operation belongs to — the OBJECT side of the
+  /// composite foreign key `(tenant_id, purchase_document_id)` to
+  /// `PurchaseDocument(tenant_id, id)`. RESTRICT, like every relation in this
+  /// schema, and tenant-bearing so a receipt can never name another tenant's
+  /// document even if its UUID were guessed.
+  purchaseDocument PurchaseDocument @relation("ReceiptDocument", fields: [tenantId, purchaseDocumentId], references: [tenantId, id], onDelete: Restrict, onUpdate: Cascade)
+
+  /// The tenant's handle on a row — the read every lookup performs.
+  @@unique([tenantId, id], map: "Receipt_tenant_id_id_key")
+  /// The document's history read, OLDEST FIRST with a deterministic tie-break
+  /// — every index leads with `tenant_id` (§3-F, §3 of contract R9's ordering).
+  @@index([tenantId, purchaseDocumentId, createdAt], map: "Receipt_tenant_id_purchase_document_id_created_at_idx")
+  @@map("Receipt")
+}
+
+/// Phase C1 Step R (§5.16, contract §4): ONE actual received quantity for ONE
+/// purchase line, inside one receiving operation — the EVENT the whole
+/// receiving projection is summed from.
+///
+/// `quantity` is `Decimal(18,4)` exactly like `PurchaseLine.quantity` (the SAME
+/// precision model, never a second one): POSITIVE on an ordinary receipt,
+/// NEGATIVE only on a compensating line, whose sign the server derives — a
+/// client may never state a negative receiving (contract §4), and never the
+/// `reversesReceiptLineId` link either (contract §3-D: the path names the
+/// target, the server states the fact).
+///
+/// `reversesReceiptLineId` is NULL on an original line. There is NO uniqueness
+/// on it, deliberately: a correction may be PARTIAL and therefore repeated
+/// (contract §3-D's cap — magnitude ≤ target + Σ prior compensations — is what
+/// bounds it, computed from these rows at write time rather than trusted to a
+/// constraint that could not express a SUM anyway). The self-reference is
+/// tenant-bearing for the same reason every foreign key here is: a receipt line
+/// can never point at another tenant's line even if its UUID were guessed.
+model ReceiptLine {
+  id                    String        @id @default(uuid()) @db.Uuid
+  /// TEXT, like every `tenantId` in this database — and the FIRST argument of
+  /// every repository method and the FIRST column of every index here (§3-F).
+  tenantId              String        @map("tenant_id") @db.Text
+  /// The receiving operation this quantity belongs to — composite-keyed with
+  /// the tenant, so a line can never hang under another tenant's receipt.
+  receiptId             String        @map("receipt_id") @db.Uuid
+  /// The purchase line this quantity was received against — composite-keyed
+  /// with the tenant: cross-document and cross-tenant receipt lines are not
+  /// expressible (contract §10).
+  purchaseLineId        String        @map("purchase_line_id") @db.Uuid
+  /// The ACTUAL received quantity: positive on a receipt, the EXACT NEGATION
+  /// of the stated magnitude on a compensation (server-derived sign, contract
+  /// §3-D) — never client-stated as a negative, never rounded, never a float.
+  quantity              Decimal       @db.Decimal(18, 4)
+  /// The receipt line this one compensates — NULL on an ordinary receipt. The
+  /// link is a FACT THE SERVER STATES from the route's path, never a payload
+  /// field, so self-compensation is structurally impossible (contract §3-E).
+  reversesReceiptLineId String?       @map("reverses_receipt_line_id") @db.Uuid
+  /// The row's OWN clock. No `updated_at`: append-only rows never change.
+  createdAt             DateTime      @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  /// The receiving operation this quantity belongs to — the OBJECT side of
+  /// `(tenant_id, receipt_id)` to `Receipt(tenant_id, id)`. RESTRICT, like
+  /// every relation in this schema, and tenant-bearing so a line can never
+  /// hang under another tenant's receipt.
+  receipt Receipt @relation("ReceiptLines", fields: [tenantId, receiptId], references: [tenantId, id], onDelete: Restrict, onUpdate: Cascade)
+  /// The purchase line this quantity was received against — the OBJECT side of
+  /// `(tenant_id, purchase_line_id)` to `PurchaseLine(tenant_id, id)`.
+  /// RESTRICT: receiving evidence is not deleted when a line is not either.
+  purchaseLine PurchaseLine @relation("ReceiptLinePurchaseLine", fields: [tenantId, purchaseLineId], references: [tenantId, id], onDelete: Restrict, onUpdate: Cascade)
+  /// The receipt line this one compensates — the OBJECT side of
+  /// `(tenant_id, reverses_receipt_line_id)` to `ReceiptLine(tenant_id, id)`
+  /// itself. Nullable, so an ordinary receipt's link column is simply not
+  /// matched; the CAP on repeat compensation is enforced at write time inside
+  /// the locked unit of work (contract §3-D/§3-H), because no unique index can
+  /// express a SUM.
+  reverses ReceiptLine? @relation("ReceiptLineReversal", fields: [tenantId, reversesReceiptLineId], references: [tenantId, id], onDelete: Restrict, onUpdate: Cascade)
+  /// The compensating lines themselves, seen from the target — the same
+  /// self-link from the other end. Stated so the schema names both directions
+  /// the way Prisma requires.
+  reversedBy ReceiptLine[] @relation("ReceiptLineReversal")
+
+  /// STEP S (S-D5): the return lines that name this receipt line — one
+  /// `ReturnLine` → ONE `ReceiptLine`, the opaque origin reference §5.17
+  /// demands. VIRTUAL: no column and no DDL lands on `ReceiptLine`, and R's
+  /// rows are neither appended, updated nor deleted because a return exists
+  /// (S reads receiving READ-ONLY; this reverse end is Prisma's required
+  /// statement of the same relation, nothing more).
+  returnLines ReturnLine[] @relation("ReturnLineReceiptLine")
+
+  /// The tenant's handle on a row — the read every lookup performs.
+  @@unique([tenantId, id], map: "ReceiptLine_tenant_id_id_key")
+  /// The history read of one receipt — every index leads with `tenant_id`.
+  @@index([tenantId, receiptId], map: "ReceiptLine_tenant_id_receipt_id_idx")
+  /// The received-per-line projection read — tenant-first like every read
+  /// here.
+  @@index([tenantId, purchaseLineId], map: "ReceiptLine_tenant_id_purchase_line_id_idx")
+  /// The compensation-cap read: Σ of the lines that already compensate a
+  /// target — tenant-first, and deliberately NOT unique (partial
+  /// compensations may repeat, contract §3-D).
+  @@index([tenantId, reversesReceiptLineId], map: "ReceiptLine_tenant_id_reverses_receipt_line_id_idx")
+  @@map("ReceiptLine")
+}
+
+// ============================================================================
+// §5.17 / C1-S contract §6 — THE RETURN CHILD LIFECYCLE (step S)
+// ============================================================================
+
+/// The authoritative return state vocabulary (§5.17 / contract S-D2) — exactly
+/// five members, in the specification's order. Stored ON the append-only
+/// `ReturnLifecycleTransition` row, NEVER as a `status`/`state` column on
+/// `ReturnDocument`: current state is the deterministic read-time projection
+/// of the immutable transition history (`return-lifecycle.ts`), so a state can
+/// never disagree with the rows that produced it, and a `REJECTED` or
+/// `REFUNDED` history can never be edited into something else (S-D4: there is
+/// no correction model for returns in C1-S).
+enum ReturnState {
+  REQUESTED
+  APPROVED
+  RECEIVED_BACK
+  REFUNDED
+  REJECTED
+}
+
+/// Phase C1 Step S (§5.17, contract §6/S-D5): ONE return request against the
+/// purchase document it originated from — the CHILD lifecycle that §I17
+/// demands ("a return is not merely `PurchaseDocument.status = REJECTED`").
+///
+/// WHAT IS DELIBERATELY ABSENT, and why:
+///
+///  * NO `status`/`state` column (S-D2): the return's state lives once, as
+///    rows in the append-only transition history below; a mutable column
+///    overwritten in place would be a second source of truth that a race or a
+///    bug could desynchronise from the rows it summarises.
+///  * NO `updatedAt`: nothing in this slice can change a settled row (S-D4 —
+///    no DELETE, no PATCH, no PUT, no reverse-return, no compensating line),
+///    so a column that only ever changes once would be a lie about mutation.
+///  * NO number/series/counter/RMA (R3's reasoning applied to S): numbering
+///    is the tenant's `PurchaseDocumentCounter` mechanism, and C1-S refuses
+///    an RMA series outright (contract §15).
+///  * NO warehouse/restocking/stock/SKU/shipping/financial columns: Warehouse
+///    and Finance are out of scope (contract §5); the only money effect of a
+///    refund is the delegated Q compensation, which S never stores.
+///
+/// ORIGIN TRACEABILITY (S-D5): `purchaseDocumentId` is the opaque origin of
+/// §5.17, composite-keyed `(tenant_id, purchase_document_id)` so a return can
+/// never name another tenant's document even if its UUID were guessed — both
+/// the foreign key and every predicate require the tenant. RESTRICT: lifecycle
+/// rows are never cascade-deleted; no Commerce lifecycle deletion path exists.
+///
+/// PRESERVED FACTS (§15/§4-B): `reason` is bounded FREE TEXT (1..500 after
+/// trim, validated at the DTO — this column is NOT an enum), `requester` is
+/// `requestedByUserId` — an OPAQUE copy of the authenticated actor's user id,
+/// server-derived and never accepted from a payload — and the
+/// replacement/repurchase REQUIREMENT is the `replacementRequired` flag the
+/// caller must state explicitly. Decision and resolution are NOT columns: they
+/// are the transition history itself (§4-B), because a mutable
+/// `decision`/`resolution` column would be a second truth over the same rows.
+model ReturnDocument {
+  id                  String   @id @default(uuid()) @db.Uuid
+  /// TEXT, like every `tenantId` in this database — and the FIRST argument of
+  /// every repository method and the FIRST column of every index here.
+  tenantId            String   @map("tenant_id") @db.Text
+  /// The originating purchase document — composite-keyed with the tenant
+  /// (S-D5: `ReturnDocument -> PurchaseDocument`, opaque, in-database only).
+  purchaseDocumentId  String   @map("purchase_document_id") @db.Uuid
+  /// The requester, as an OPAQUE reference copied from
+  /// `resolveCommerceActor(req).userId` at creation (§4-B/§16). NULL for a
+  /// machine context; never resolved against a person table, never a payload
+  /// field (no DTO accepts `requestedByUserId`).
+  requestedByUserId   String?  @map("requested_by_user_id") @db.Text
+  /// WHY the goods go back — bounded free text, required, NOT an enum (§4-B):
+  /// there is no reason catalogue in C1 and inventing one would close a
+  /// vocabulary the specification left open. Length 1..500 is enforced at the
+  /// DTO boundary.
+  reason              String   @db.Text
+  /// Whether §15's replacement/repurchase requirement is stated — a REQUIRED
+  /// caller-stated fact: `false` is a stated decision, never an omission, so
+  /// the column is NOT NULL and has no default (§4-B).
+  replacementRequired Boolean  @map("replacement_required")
+  /// The row's OWN clock. No `updated_at`: append-only rows never change.
+  createdAt           DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  /// The purchase document this return originated from — the OBJECT side of
+  /// `(tenant_id, purchase_document_id)`. RESTRICT, like every relation in
+  /// this schema; `onUpdate: Restrict` too, because an id a lifecycle points
+  /// at is never rewritten (contract §14: RESTRICT-based, both directions).
+  purchaseDocument PurchaseDocument @relation("ReturnDocumentPurchaseDocument", fields: [tenantId, purchaseDocumentId], references: [tenantId, id], onDelete: Restrict, onUpdate: Restrict)
+  /// The returned quantities — one row per (purchase line, receipt line)
+  /// origin, MANY per document (S-D5's multi-line return).
+  lines ReturnLine[] @relation("ReturnLineDocument")
+  /// The append-only lifecycle history whose LAST row (ordered by
+  /// `(createdAt, id)`) IS this return's current state (S-D2/§4-A).
+  transitions ReturnLifecycleTransition[] @relation("ReturnLifecycleTransitionDocument")
+
+  /// The tenant's handle on a row — the read every lookup performs.
+  @@unique([tenantId, id], map: "ReturnDocument_tenant_id_id_key")
+  /// The document's return history read, OLDEST FIRST with a deterministic
+  /// tie-break — tenant-first like every read in this database.
+  @@index([tenantId, purchaseDocumentId, createdAt], map: "ReturnDocument_tenant_id_purchase_document_id_created_at_idx")
+  @@map("ReturnDocument")
+}
+
+/// Phase C1 Step S (S-D1/S-D5): ONE returned quantity for ONE purchase line,
+/// against ONE receipt line, inside one return document — the granularity
+/// §5.17's "purchase line, receipt line/event" origin triple demands. There is
+/// NO many-to-many `ReturnLine` ↔ `ReceiptLine` bridge (contract §6), and each
+/// line carries BOTH composite references so the traceability
+///
+///     ReturnLine -> PurchaseLine -> (this document's) ReceiptLine
+///
+/// is proven at write time against tenant-scoped, document-scoped reads
+/// (line_reference_mismatch / 404), not assumed from a UUID.
+///
+/// `quantity` is `Decimal(18,4)` — the SAME precision model as every quantity
+/// in this database, strictly positive (the migration adds the
+/// `CHECK ("quantity" > 0)` §14 asks for, the strongest construct the engine
+/// offers for a cross-row invariant that itself needs §9's serialization
+/// boundary). It never changes after creation (S-D4: no route exists that
+/// could change it), so the cumulative-return cap moves only by creating a
+/// return or by a return entering `REJECTED` (§4-D).
+model ReturnLine {
+  id               String   @id @default(uuid()) @db.Uuid
+  /// TEXT, like every `tenantId` in this database.
+  tenantId         String   @map("tenant_id") @db.Text
+  /// The return document this line belongs to — composite-keyed with the
+  /// tenant, so a line can never hang under another tenant's return.
+  returnDocumentId String   @map("return_document_id") @db.Uuid
+  /// The origin purchase line (S-D5) — composite-keyed, RESTRICT: return
+  /// evidence is never deleted when a line is not either.
+  purchaseLineId   String   @map("purchase_line_id") @db.Uuid
+  /// The origin receipt line (§5.17's "receipt line/event") — the row whose
+  /// NET RECEIVED quantity caps this line's return (S-D1). Composite-keyed;
+  /// R's append-only id stability (contract R §4) is what makes holding this
+  /// opaque reference safe. S READS `ReceiptLine` and never writes it.
+  receiptLineId    String   @map("receipt_line_id") @db.Uuid
+  /// The returned quantity: positive, exact, four decimals — never a float,
+  /// never client-stated as a negative, never updated after creation.
+  quantity         Decimal  @db.Decimal(18, 4)
+  /// The row's OWN clock. No `updated_at`: append-only rows never change.
+  createdAt        DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  returnDocument ReturnDocument @relation("ReturnLineDocument", fields: [tenantId, returnDocumentId], references: [tenantId, id], onDelete: Restrict, onUpdate: Restrict)
+  purchaseLine PurchaseLine @relation("ReturnLinePurchaseLine", fields: [tenantId, purchaseLineId], references: [tenantId, id], onDelete: Restrict, onUpdate: Restrict)
+  receiptLine ReceiptLine @relation("ReturnLineReceiptLine", fields: [tenantId, receiptLineId], references: [tenantId, id], onDelete: Restrict, onUpdate: Restrict)
+
+  /// The tenant's handle on a row — the read every lookup performs.
+  @@unique([tenantId, id], map: "ReturnLine_tenant_id_id_key")
+  /// The document's lines (also the response projection's order).
+  @@index([tenantId, returnDocumentId], map: "ReturnLine_tenant_id_return_document_id_idx")
+  /// THE CUMULATIVE-QUANTITY READ: Σ of the return lines pointing at one
+  /// receipt line, excluding `REJECTED` returns (§4-C) — evaluated under the
+  /// §9 serialization boundary, tenant-first.
+  @@index([tenantId, receiptLineId], map: "ReturnLine_tenant_id_receipt_line_id_idx")
+  /// The per-purchase-line traceability read — tenant-first.
+  @@index([tenantId, purchaseLineId], map: "ReturnLine_tenant_id_purchase_line_id_idx")
+  @@map("ReturnLine")
+}
+
+/// Phase C1 Step S (S-D2, contract §4-A/§6): ONE immutable lifecycle
+/// transition of one return — the ONLY place return state exists.
+///
+/// APPEND-ONLY HISTORY, PROJECTED AT READ TIME. `state` is stored HERE, on
+/// this row, and never as a `ReturnDocument` column: the current state of a
+/// return is the LAST row of this history ordered by `(createdAt, id)`, and
+/// the matrix (`return-lifecycle.ts`) refuses every path but
+///
+///     REQUESTED -> APPROVED | REJECTED
+///     APPROVED  -> RECEIVED_BACK
+///     RECEIVED_BACK -> REFUNDED
+///
+/// with `REJECTED` and `REFUNDED` terminal (no reverse path, no correction
+/// transition — S-D4). There is deliberately NO command column: each state has
+/// exactly one incoming edge, so the state already names the command that
+/// produced the row, and §15's "actor/source information" is `state` plus
+/// `actorUserId` together (contract §6).
+///
+/// `actorUserId` is the acting session's user as OPAQUE text — server-derived
+/// from `resolveCommerceActor`, NULL for a machine context, never resolved
+/// and never payload-stated. `reason` carries the stated reason of an
+/// approve / reject / refund when given (NULL otherwise — the CREATE
+/// document's why is `ReturnDocument.reason`, one home per fact).
+model ReturnLifecycleTransition {
+  id               String           @id @default(uuid()) @db.Uuid
+  /// TEXT, like every `tenantId` in this database.
+  tenantId         String           @map("tenant_id") @db.Text
+  /// The return this transition belongs to — composite-keyed with the
+  /// tenant; RESTRICT both directions (contract §14).
+  returnDocumentId String           @map("return_document_id") @db.Uuid
+  /// The state this row REACHED — closed vocabulary, stored on the history
+  /// row, NEVER a mutable document column (S-D2).
+  state            ReturnState
+  /// Who made the transition, OPAQUE; NULL for a machine context (§4-G).
+  actorUserId      String?          @map("actor_user_id") @db.Text
+  /// The stated reason of this transition when given, NULL otherwise —
+  /// 1..500 enforced at the DTO, free text (§4-B).
+  reason           String?          @db.Text
+  /// The row's OWN clock — the FIRST ordering key of the projection. No
+  /// `updated_at`: a transition never changes.
+  createdAt        DateTime         @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  returnDocument ReturnDocument @relation("ReturnLifecycleTransitionDocument", fields: [tenantId, returnDocumentId], references: [tenantId, id], onDelete: Restrict, onUpdate: Restrict)
+
+  /// The tenant's handle on a row — the read every lookup performs.
+  @@unique([tenantId, id], map: "ReturnLifecycleTransition_tenant_id_id_key")
+  /// THE PROJECTION READ: a return's whole history in the deterministic
+  /// `(createdAt, id)` order §4-A defines — tenant-first. The NAME's prefix
+  /// is shortened to `ReturnTransition` because PostgreSQL caps identifiers
+  /// at 63 bytes and the full model name overran it; the COLUMNS are exactly
+  /// the three the contract states.
+  @@index([tenantId, returnDocumentId, createdAt], map: "ReturnTransition_tenant_id_return_document_id_created_at_idx")
+  @@map("ReturnLifecycleTransition")
+}
+
+// ============================================================================
+// AUDIT OUTBOX — Phase B2.3: transactional durable audit delivery
+// ============================================================================
+//
+// THE PATTERN IS CONTEXT-LOCAL. Each bounded context that needs durable audit
+// adds its own `AuditOutbox` to its own schema — Financial was the first
+// (Phase B2), Commerce is the second (Phase B2.3). The outbox is NOT a second
+// audit trail: it is a delivery buffer that ensures compliance-critical events
+// reach `core_db."AuditLog"` even when the relay or network fails after commit.
+//
+// LIFECYCLE:
+//   1. Service builds an immutable outbox payload (via gateway.buildOutboxPayload)
+//   2. Repository writes business mutation + AuditOutbox.create in ONE transaction
+//   3. Relay polls due rows, delivers through AUDIT_PORT, deletes on success
+//   4. Failed deliveries are rescheduled with bounded backoff
+//
+// A rolled-back business mutation rolls back its outbox row — no orphan event.
+// A committed business mutation's event survives relay failure and is retried.
+
+/// The transactional outbox for Commerce audit events that require durable
+/// delivery. Written atomically with the business mutation inside the same
+/// Commerce database transaction.
+model AuditOutbox {
+  id        String   @id @default(uuid()) @db.Uuid
+  tenantId  String   @map("tenant_id") @db.Text
+
+  /// The producer-owned event identity, matching `AuditEventInput.auditId`.
+  auditId   String   @map("audit_id") @db.VarChar(64)
+
+  /// The full event payload, serialised as JSON.
+  payload   Json
+
+  /// Relay attempts so far. Incremented on each failed attempt.
+  attempts  Int      @default(0)
+
+  /// When the next relay attempt is allowed. Defaults to now (immediate).
+  nextAt    DateTime @default(now()) @map("next_at") @db.Timestamptz(6)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@unique([tenantId, auditId], map: "AuditOutbox_tenant_auditId_key")
+  @@index([tenantId, nextAt], map: "AuditOutbox_tenant_nextAt_idx")
+  @@index([tenantId, createdAt], map: "AuditOutbox_tenant_createdAt_idx")
+  @@map("AuditOutbox")
+}

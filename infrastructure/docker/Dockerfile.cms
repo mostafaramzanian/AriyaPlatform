@@ -1,0 +1,67 @@
+# Phase 33K: CMS-only image.
+# Runs cms-main.js.
+#
+# NOTE (disclosed, not hidden): this image DOES include the Core generated
+# Prisma client (src/generated/core-client), because CMS's global
+# JwtAuthGuard/RolesGuard (JwtStrategy + PermissionService) require Core's
+# PrismaService to validate tokens/permissions on every protected request.
+# This is a pre-existing Identity/RBAC dependency, not a CMS business-data
+# dependency — CMS's OWN persistence (BlogRepository via CmsPrismaService)
+# uses only the CMS client/database, never the Core client, and this image
+# requires CORE_DATABASE_URL to be reachable at startup.
+FROM node:20-alpine AS base
+
+WORKDIR /app
+
+RUN apk add --no-cache python3 make g++ openssl openssl-dev
+
+FROM base AS builder
+
+COPY package.json pnpm-lock.yaml* package-lock.json* ./
+COPY apps/api/package.json ./apps/api/
+COPY apps/api/tsconfig*.json ./apps/api/
+COPY packages ./packages
+
+RUN npm ci --prefer-offline --no-audit
+
+COPY . .
+
+# Phase ARCH-1.3: `npm run build` generates and copies every client; this image then
+# prunes the ones its runtime must not carry, from the DERIVED list (the clients of
+# the `not-used` datasources — observability, correspondence, HR — plus the
+# disclosed opt-outs in `runtimes.cms.image.prunedArtifacts`, which is empty for CMS).
+# What remains is exactly what `RUNTIME_DATASOURCE_MATRIX.cms` instantiates: Core
+# (required, see the NOTE above) and CMS (required).
+RUN npm run build --workspace=apps/api
+
+RUN for client in $(node apps/api/scripts/runtime-policy.mjs prune-clients-for cms); do \
+      rm -rf "/app/apps/api/src/generated/$client" "/app/apps/api/dist/generated/$client"; \
+    done
+
+FROM base AS runner
+
+ENV NODE_ENV=production
+
+COPY package.json package-lock.json* tsconfig*.json ./
+COPY apps/api/package.json apps/api/tsconfig*.json ./apps/api/
+COPY packages ./packages
+
+RUN npm ci --prefer-offline --no-audit --omit=optional
+
+# CMS Prisma project — its own data.
+COPY --from=builder /app/apps/api/prisma/cms ./apps/api/prisma/cms
+# Core Prisma project is also required here — see NOTE above (Identity/RBAC).
+COPY --from=builder /app/apps/api/prisma/core ./apps/api/prisma/core
+COPY --from=builder /app/apps/api/prisma/migrations ./apps/api/prisma/migrations
+
+COPY --from=builder /app/apps/api/dist ./apps/api/dist
+
+# Phase ARCH-1.3: wholesale copy of the pruned client tree (Core + CMS). The boundary
+# is the derived prune above, not this COPY statement.
+COPY --from=builder /app/apps/api/src/generated ./apps/api/src/generated
+
+WORKDIR /app/apps/api
+
+EXPOSE 3002
+
+CMD ["node", "dist/cms-main.js"]

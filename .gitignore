@@ -1,0 +1,76 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# Testing
+coverage/
+*.lcov
+
+# Production
+build/
+dist/
+out/
+.next/
+.nuxt/
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+*.iml
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+lerna-debug.log*
+
+# Docker
+.dockerignore
+# Release-hardening exception: the Docker build-context guard is required in the
+# published tree (Stage 2.22) — keep it tracked despite the rule above.
+!.dockerignore
+
+# Python
+*.pyc
+__pycache__/
+
+# Turbo
+.turbo/
+
+# Prisma generated clients (Phase 33J: Core/CMS independent Prisma projects;
+# generated into src/generated/* so TypeScript declaration emit stays inside
+# rootDir - these are build artifacts, regenerate via `npm run prisma:generate`)
+apps/api/src/generated/
+
+# Local code & architecture snapshot
+# (generated mirror of source + docs, see aria-code-and-architecture/_SNAPSHOT_README.md).
+# Never commit this folder - regenerate it instead:
+#   powershell -ExecutionPolicy Bypass -File aria-code-and-architecture/_regen/create-snapshot.ps1
+aria-code-and-architecture/
+
+# JWT signing key material mounted by docker compose at /run/secrets/.
+# Generated outside git; must never be committed (docker-compose.yml `secrets:`).
+secrets/
+
+# Misc
+*.bak
+*.tmp
+
+# TypeScript incremental build cache (generated)
+*.tsbuildinfo

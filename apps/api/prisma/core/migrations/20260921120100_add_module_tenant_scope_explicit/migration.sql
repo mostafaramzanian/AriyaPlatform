@@ -1,0 +1,31 @@
+-- Phase 54-C (D16, §45.4 item 1 and §45.6 migration 1): the third tenant scope.
+--
+-- ONE STATEMENT, IN ITS OWN FILE, ON PURPOSE. PostgreSQL permits
+-- `ALTER TYPE ... ADD VALUE` inside a transaction but forbids *using* a freshly
+-- added enum value in the transaction that added it (SQLSTATE 55P04) — the rule
+-- `20260919120000_seed_hr_leave_permission_grants` already records at L57-L58 for
+-- the 'HR' PermissionDomain member. `prisma migrate deploy` runs each migration
+-- file in one transaction, so a file that added the value AND wrote it into a row
+-- or a CHECK would fail at runtime. The next file is where the value is used.
+--
+-- WHY A THIRD MEMBER RATHER THAN A RAISED BOUND
+-- ---------------------------------------------
+-- `RESTRICTED` carries at most 64 tenants in `tenantIds`
+-- ("ModuleRegistration_tenantScope_consistent"), and 162 tenants exist in this
+-- installation today: a `RESTRICTED` row simply cannot express its membership.
+-- Truncating the list would turn "entitled" into "entitled if your id sorted
+-- early", so the membership is enumerated in a child table instead
+-- ("ModuleRegistrationTenant", §45.5) and the array must be EMPTY for this scope —
+-- one membership source per row, never two.
+--
+-- NON-DESTRUCTIVE AND NON-NARROWING: `ADD VALUE IF NOT EXISTS` only appends to the
+-- enum's ordering, changes no existing row's value, and cannot fail a re-run. The
+-- `IF NOT EXISTS` is what makes the file idempotent, which is this repository's
+-- rule for every Core migration.
+--
+-- WHAT THIS FILE DELIBERATELY DOES NOT DO: it does not widen the legacy 64-entry
+-- bound, it does not remove `RESTRICTED`, it does not touch
+-- "ModuleRegistration.tenantScope_consistent" (the next file replaces that
+-- constraint, with both existing branches copied byte-identically), and it writes
+-- no row.
+ALTER TYPE "ModuleTenantScope" ADD VALUE IF NOT EXISTS 'RESTRICTED_MEMBERS';

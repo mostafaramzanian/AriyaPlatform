@@ -1,0 +1,670 @@
+// Phase PRODUCTION-BOM-HEADER step A: the Production datasource's own Prisma project.
+//
+// WHY THIS FILE EXISTS
+// --------------------
+// `Production` owns `production_db`, reached only through `PRODUCTION_DATABASE_URL`.
+// This file is that owner's independent Prisma project: independent datasource,
+// independent generator, independent schema, independent generated client target
+// (`src/generated/production-client`) and independent migration history
+// (`prisma/production/migrations/`).
+//
+// The sequence is the one `prisma/commerce/schema.prisma` records and the one HR and
+// Correspondence went through (ADR-0005 "Persistence source of truth"): the datasource
+// joins `runtime-datasources.ts` as a declared owner, the schema and migrations land,
+// the generated client lands, and the module's own Prisma module/service binds
+// `PRODUCTION_PRISMA_CLIENT` — which is what makes `production_db` reachable at all.
+//
+// THE BOUNDARY THIS FILE DRAWS
+// ---------------------------
+// Production owns its database and NOTHING else. In particular:
+//
+//   * There is NO cross-database foreign key. `tenantId`, `projectRef`,
+//     `productTreeRef`, `requesterUserId`, `approverUserId` and `decidedByUserId` are
+//     PLAIN STRING columns holding OPAQUE values (CF-1) — PostgreSQL cannot express a
+//     FK across databases, and Production must not try to: identity is reached through
+//     the platform user-directory contract, never through a join.
+//   * Production does NOT duplicate authoritative state. No User, no Tenant, no Role,
+//     no Permission, no Project, no Product Tree, no Part, no Supplier. A BOM's project
+//     and product tree are opaque references, not second copies of another module's
+//     tables (docs/PHASE-PRODUCTION-BOM-FINAL-DECISION-CLOSURE.md M-1 / RB-1).
+//   * Core, HR, Commerce and Correspondence Prisma clients are NEVER imported here, and
+//     this datasource block points at the Production URL only. The architecture boundary
+//     spec and this module's own isolation suite assert all of it.
+//
+// WHAT THIS PHASE DELIBERATELY DOES NOT MODEL
+// -------------------------------------------
+//   * NO BOM Item. The header is the aggregate root; items arrive in a later phase, and
+//     a table whose fields nobody has agreed to is a table no test can falsify.
+//   * NO code / `standardPartCode` / counter table. The Product Tree code source is
+//     still BLOCKED (RB-1-P), so the prefix must not be faked and no sequence is minted.
+//   * NO consumption coefficients, NO `Code_Ghatae` domain logic, NO totals, NO formulas
+//     (M-4 / M-7a).
+//   * NO versioning, NO items, NO Purchase coupling, NO Quality, NO search index.
+
+generator client {
+  provider = "prisma-client-js"
+  output   = "../../src/generated/production-client"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("PRODUCTION_DATABASE_URL")
+}
+
+// ============================================================================
+// THE BOM HEADER — the aggregate root (M-1 … M-7 DECISION CLOSURE)
+// ============================================================================
+//
+// WHY THERE IS NO `project_id` / `product_tree_id` FOREIGN KEY
+// ----------------------------------------------------------
+// There is no authoritative Project domain and no authoritative Product Tree domain in
+// this repository (0 models, 0 of 123 tables, 0 routes — three separate sweeps). BOM
+// therefore stores BOTH as opaque strings, exactly as the Commerce schema stores
+// `requesterId` / `approverId`: "PLAIN STRING columns holding opaque values … an
+// opaque reference, not a second personnel table" (CF-1). They are NEVER an input to
+// tenant resolution — the row's OWN `tenantId` is the isolation key.
+//
+// WHY `title` IS STORED AND NOT DERIVED
+// -------------------------------------
+// The legacy SharePoint form CALCULATED its title from the project's NAME
+// (`CalculationFormula="'اقلام پروژه - ' + project"`). Ariya has no project contract to
+// read that name from, so deriving it would make a BOM's own name depend on a module
+// that does not exist. M-1 records the resulting decision: `title` is a STORED value.
+// This is a deliberate divergence from the legacy behaviour.
+//
+// WHY THE STATE MACHINE LIVES HERE AND NOWHERE ELSE
+// ------------------------------------------------
+// Production owns its lifecycle (M-5 Option A): a guarded state machine on the BOM's
+// own row. It is NOT a workflow engine, and it does NOT reach Commerce's
+// `WorkflowInstance` / `WorkflowSubjectType` (a closed enum in `commerce_db`).
+// `status` is the BUSINESS state; `managerOpinion` is the DECISION — two separate
+// facts, for the same reason Commerce keeps `PurchaseDocument.status` separate from
+// `WorkflowInstance.status`: collapsing them makes "which fact is this?" depend on
+// which column a reader happened to open.
+
+/// The BOM document's own business lifecycle (M-5 Option A).
+///
+/// DRAFT      — authored and editable; the requester may change header fields.
+/// SUBMITTED  — routed to the snapshotted approver; ordinary editing is frozen.
+/// APPROVED   — the stored approver's decision was positive.
+/// REJECTED   — the stored approver's decision was negative.
+///
+/// CORRECTION IS NOT A STATE. The legacy approval task's `نیاز به اصلاح` branch wrote
+/// `State = 0` — i.e. it returned the document to the EDITABLE state — so modelling a
+/// fifth state would contradict the only source evidence there is. A correction
+/// REQUEST moves `SUBMITTED → DRAFT` and records `managerOpinion = NEEDS_CORRECTION`,
+/// which is what makes "returned for correction" and "never submitted" distinguishable
+/// without inventing a state the source does not have.
+enum BomStatus {
+  DRAFT
+  SUBMITTED
+  APPROVED
+  REJECTED
+}
+
+/// The approver's decision, in the legacy vocabulary, preserved exactly (M-5b).
+///
+/// `تایید` / `رد` / `نیاز به اصلاح` are the three values the legacy `RadioButtons`
+/// control offered; the ERP keeps those three facts rather than collapsing them into
+/// a free-text column.
+enum ManagerOpinion {
+  APPROVED
+  REJECTED
+  NEEDS_CORRECTION
+}
+
+/// Phase PRODUCTION-BOM-ITEM: the source's `Noe_Ghatae` («نوع قطعه در پروژه») control
+/// offered exactly two static values — `ساختی;استاندارد` — and the item-save action
+/// refused an empty one (`نوع قطعه در پروژه نمی تواند خالی باشد!`). The two code points
+/// below are those two facts; the Persian labels are what a screen renders, and they live
+/// in `src/modules/production/bom/bom-item.ts` beside the vocabulary, never in the schema.
+///
+/// WHY AN ENUM AND NOT A FREE STRING: the legacy column was a `Lookup_StaticValues`
+/// projection — a CLOSED set — so a free string would let a value the source could never
+/// produce be stored, and a later reader could not tell a typo from a new part type. The
+/// set is closed here for the same reason `BomStatus` is.
+enum BomPartType {
+  STRUCTURAL
+  STANDARD
+}
+
+/// Phase PRODUCTION-BOM-ITEM: the source's `CP_Ghatae` («طرح کنترل دارد؟») control, whose
+/// two static values were `دارد;ندارد`. OPTIONAL on the item — the source never validated
+/// it and the field has no writer in the supplied forms beyond a plain list-item set.
+///
+/// The source itself is a two-value indicator only; §16 of the preflight records that a
+/// future Quality context must be able to attach without changing the BOM's identity, so
+/// this column stays a nullable flag rather than a control-plan model.
+enum BomControlPlan {
+  PRESENT
+  ABSENT
+}
+
+/// Phase PRODUCTION-BOM-CHANGE: the source's `c_NoeaTaghir` radio, whose
+/// `Lookup_StaticValues` was exactly `تغییر موجودی;غیر فعال سازی` — a CLOSED set of two.
+///
+/// WHY AN ENUM AND NOT A FREE STRING, AND WHY THIS IS NOT `type`: the control was a
+/// static radio, so a value the source could never produce must not be storable, and a
+/// later reader must be able to tell a typo from a new change kind. A free string would
+/// also make the one validation the source DOES perform for `تغییر موجودی` (S2: at least
+/// one delta) impossible to express, because the rule is keyed on the type.
+///
+/// WHAT THE TWO MEMBERS MEAN, AND WHAT THEY DO **NOT** MEAN
+/// -------------------------------------------------------
+///   QUANTITY_CHANGE — `تغییر موجودی`. The only member with a source-confirmed rule and
+///                     a source-confirmed payload: the two DELTAS below.
+///   DEACTIVATE      — `غیر فعال سازی`. The source PROVES THE VALUE EXISTS and says
+///                     nothing else: no form action, no approval-task branch and no list
+///                     writer performs any mutation for it. The member is therefore a
+///                     recorded INTENT — nameable, displayable and approvable — and
+///                     **nothing in Production acts on it**. See the phase report's
+///                     `DEFERRED / CONTRACT NOT ESTABLISHED`.
+enum BomChangeType {
+  QUANTITY_CHANGE
+  DEACTIVATE
+}
+
+/// One BOM header — the aggregate root of the future BOM → BOM Items tree.
+///
+/// EVERY COLUMN HAS AN OWNERSHIP REASON:
+///
+///   id               — the repository's UUID convention (v4), like every owned row.
+///   tenantId         — the isolation key. Populated ONLY from the resolved actor, never
+///                      from a request field, and FIRST on every index below.
+///   title            — the stored title snapshot (M-1; see the header note).
+///   projectRef       — OPAQUE external reference (M-1). Never validated against a
+///                      local table, never used to derive the tenant or the title.
+///   productTreeRef   — OPAQUE external reference (RB-1). Never validated, never read
+///                      for a code prefix (that source is BLOCKED).
+///   requesterUserId  — OPAQUE platform user id (CF-1), validated for tenant membership
+///                      through USER_DIRECTORY before it is stored.
+///   approverUserId   — OPAQUE platform user id, NULL before submit, SNAPSHOTTED at
+///                      submit and immutable afterwards (M-5b). Never re-resolved from
+///                      an organisational hierarchy at decision time.
+///   status           — the business lifecycle (M-5).
+///   managerOpinion   — the approver's decision; NULL until the approver acts.
+///   comments         — the approver's stated reason, or the requester's note.
+///   submittedAt      — when the document entered SUBMITTED: the evidence that a
+///                      decision was made against THIS submission.
+///   decidedAt        — when the approver acted (the legacy `TarikhTaedModir`).
+///   decidedByUserId  — WHO acted. Kept beside `approverUserId` on purpose: the two are
+///                      equal only while the frozen-approver rule holds, so a row where
+///                      they differ is evidence that somebody else decided.
+///   createdAt        — when the row was created.
+///   updatedAt        — the row's own clock.
+model BomHeader {
+  id       String @id @default(uuid()) @db.Uuid
+  /// TEXT, like every `tenantId` in this repository.
+  tenantId String @map("tenant_id") @db.Text
+
+  /// The stored title snapshot (M-1). Bounded, trimmed, non-blank.
+  title String @db.VarChar(200)
+
+  /// Opaque external reference to a Project. NO foreign key, NO local Project table.
+  projectRef String @map("project_ref") @db.VarChar(128)
+
+  /// Opaque external reference to a Product Tree. NO foreign key, NO local tree table,
+  /// and NO code prefix is derived from it (RB-1-P is blocked).
+  productTreeRef String @map("product_tree_ref") @db.VarChar(128)
+
+  /// Opaque platform user id of the requester. A member of THIS tenant.
+  requesterUserId String @map("requester_user_id") @db.Text
+
+  /// The approver, SNAPSHOTTED at submit and immutable after it (M-5b). NULL while the
+  /// document is still a draft — "not yet routed" is a real state, and a placeholder id
+  /// would claim a routing decision nobody made.
+  approverUserId String? @map("approver_user_id") @db.Text
+
+  /// The business lifecycle (M-5). Closes at DRAFT: a new document is always a draft.
+  status BomStatus @default(DRAFT)
+
+  /// The approver's decision (M-5b). NULL until the approver acts — never a default.
+  managerOpinion ManagerOpinion? @map("manager_opinion")
+
+  /// The approver's reason, or the requester's own note.
+  comments String? @db.VarChar(2000)
+
+  /// When the document entered SUBMITTED.
+  submittedAt DateTime? @map("submitted_at") @db.Timestamptz(6)
+
+  /// When the approver acted — the legacy `TarikhTaedModir`.
+  decidedAt DateTime? @map("decided_at") @db.Timestamptz(6)
+
+  /// WHO acted. Equal to `approverUserId` while the frozen-approver rule holds.
+  decidedByUserId String? @map("decided_by_user_id") @db.Text
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  /// Phase PRODUCTION-BOM-ITEM: the child rows. The relation is stated so that
+  /// (a) the composite-key target the header already declares is USED — the same-database
+  /// foreign key below references `(tenant_id, id)` rather than an id alone, which is what
+  /// makes "an item can never point at another tenant's BOM" a database fact; and
+  /// (b) the submit gate can be ONE atomic statement (`items: { some: {} }`), rather than a
+  /// read-then-write pair a concurrent delete could invalidate.
+  items BomItem[]
+
+  /// Phase PRODUCTION-BOM-CHANGE: the change requests raised AGAINST this BOM. The relation
+  /// exists for the same two reasons `items` above does — it makes the composite-key target
+  /// `(tenantId, id)` usable by a same-database foreign key, so "a change request can never
+  /// belong to another tenant's BOM" is a database fact rather than a service-layer promise,
+  /// and it keeps `BomChangeRequest.bomId` a REAL reference to the aggregate root instead of
+  /// an opaque string. It is deliberately NOT cascade: a BOM that holds a reviewed change
+  /// request must not be removable together with the evidence of that review.
+  changeRequests BomChangeRequest[]
+
+  /// The tenant-first key shape every owned table in this repository carries. It is also
+  /// the composite-key target the `BomItem` child references: an item's tenant-scoped
+  /// foreign key can only reference a UNIQUE pair, which is why the pair is `(tenantId, id)`
+  /// rather than `id` alone.
+  @@unique([tenantId, id], map: "BomHeader_tenantId_id_key")
+  /// "this tenant's documents, most recently touched first" — the operational read.
+  @@index([tenantId, status, updatedAt], map: "BomHeader_tenantId_status_updatedAt_idx")
+  /// "what is waiting for THIS approver" — the decision read. Leads with the tenant and
+  /// the approver, never with the status alone, so a cross-tenant scan by approver id is
+  /// not expressible.
+  @@index([tenantId, approverUserId, status], map: "BomHeader_tenantId_approverUserId_status_idx")
+  @@map("BomHeader")
+}
+
+// ============================================================================
+// THE BOM ITEM — the child aggregate (Phase PRODUCTION-BOM-ITEM)
+// ============================================================================
+//
+// WHY A CHILD TABLE AND NOT A DENORMALISED HEADER
+// -----------------------------------------------
+// The source is TWO SharePoint lists: `BomAdd` (the header) and
+// `BOM_فهرست اقلام پروژه` (the items), joined by the lookup `BomAddRelated`. The item
+// grid is populated by `ListQueryBom` with the single criterion `BomAddRelated = {c_ID}`,
+// and the submit action refuses an empty grid (`اقلامی ثبت نشده است!`). Flattening the two
+// levels into "one giant record" would destroy exactly that relationship.
+//
+// WHY THE RELATION IS SAME-DATABASE AND ONLY SAME-DATABASE
+// --------------------------------------------------------
+// `bom` references `BomHeader(tenant_id, id)` INSIDE `production_db`. That is a real,
+// enforced Postgres FK, and it is the DB-level statement of "an item always belongs to a
+// header of the SAME tenant" — which is why the referenced pair is the composite unique
+// key rather than the id alone. There is still NO cross-database reference anywhere:
+// `projectRef`, `productTreeRef` and the supplier suggestion remain opaque STRING columns
+// (CF-1 / RB-1), because PostgreSQL cannot express a FK across databases and the
+// authoritative Project / Product Tree domains do not exist in this repository.
+//
+// WHAT IS DELIBERATELY *NOT* MODELLED
+// -----------------------------------
+//   * NO `CodeStandardDarSanat` generation, NO counter, NO prefix. The Product Tree code
+//     source is BLOCKED (RB-1-P), so `standardPartCode` is a NULLABLE, RESERVED column:
+//     readable on the wire, never written, never validated as required. Product Tree Code
+//     generation remains deferred and is not required for BOM Item CRUD/lifecycle.
+//   * NO total-consumption formula. Only the two coefficients the source WRITES and
+//     VALIDATES are domain columns; the five derived/projection coefficients have NO writer
+//     in the supplied forms, so they are preserved as NULLABLE legacy columns with no rule.
+//   * NO Part / Material / Supplier catalogue: the source keeps all part data on the item
+//     row and references no catalogue list (§9). `suggestedSupplier` stays free text.
+model BomItem {
+  id       String @id @default(uuid()) @db.Uuid
+  /// TEXT, like every `tenantId` in this repository; also the leading FK column below.
+  tenantId String @map("tenant_id") @db.Text
+
+  /// The header this item belongs to. With `tenantId` it references `BomHeader(tenant_id, id)`.
+  bomId String @map("bom_id") @db.Uuid
+
+  /// THE SAME-DATABASE FK. `onDelete: Restrict` deliberately does NOT cascade: the header
+  /// has no delete route, and if one were ever added the database would refuse to orphan
+  /// items rather than silently deleting a reviewed BOM's history.
+  bom BomHeader @relation(fields: [tenantId, bomId], references: [tenantId, id], onDelete: Restrict, onUpdate: Cascade)
+
+  /// DENORMALISED scope snapshot frozen from the header at creation (§6.3). Never edited
+  /// independently — the source never edits it on an item either.
+  projectRef String @map("project_ref") @db.VarChar(128)
+  productTreeRef String @map("product_tree_ref") @db.VarChar(128)
+
+  /// The part name (source item `Title`, «نام قطعه»). REQUIRED, bounded, trimmed, non-blank.
+  partName String @map("part_name") @db.VarChar(200)
+
+  /// The industry-standard part name (`NameGhataeDarSanat`). Optional.
+  industryPartName String? @map("industry_part_name") @db.VarChar(200)
+
+  /// `CodeStandardDarSanat` — NULLABLE and RESERVED. NO generation, NO required-ness and NO
+  /// renumbering: the Product Tree code source that would drive it is BLOCKED (RB-1-P).
+  /// DEFERRED. Read-only on the wire in V1; nothing writes it.
+  standardPartCode String? @map("standard_part_code") @db.VarChar(128)
+
+  /// The part type in the project (`Noe_Ghatae`). REQUIRED.
+  partType BomPartType @map("part_type")
+
+  /// Free-text specifications (`Moshakhasate_Ghatae`). Optional.
+  specifications String? @map("specifications") @db.VarChar(2000)
+
+  /// Free-text manufacturer (`Sazande_Ghatae`). Optional.
+  manufacturer String? @map("manufacturer") @db.VarChar(200)
+
+  /// Free-text material (`Jense_Ghatae`). REQUIRED.
+  material String @map("material") @db.VarChar(200)
+
+  /// Free-text unit of measure (`Vahade_Andazegiri`). REQUIRED.
+  measurementUnit String @map("measurement_unit") @db.VarChar(64)
+
+  /// `ZaribMasraf_DarNaghshe`. REQUIRED integer `>= 0`. No decimal scale, no max, no formula.
+  drawingConsumptionCoefficient Int @map("drawing_consumption_coefficient")
+
+  /// `ZaribMasraf_YadakiDorriz`. REQUIRED integer `>= 0`. No decimal scale, no max, no formula.
+  spareConsumptionCoefficient Int @map("spare_consumption_coefficient")
+
+  /// Free-text suggested supplier (`TaminKonandePishnahadi_BOM`). Optional; a SUGGESTION.
+  suggestedSupplier String? @map("suggested_supplier") @db.VarChar(200)
+
+  /// Suggested supplier's price (`GheimatTaminKonandePishnahadi_BO`). Optional; a
+  /// SUGGESTION, not an authoritative price — no currency contract exists for it.
+  suggestedSupplierPrice Decimal? @map("suggested_supplier_price") @db.Decimal(18, 2)
+
+  /// The two-value control-plan flag (`CP_Ghatae`). Optional.
+  controlPlan BomControlPlan? @map("control_plan")
+
+  /// The item's comment (`Tozihat_Ghatae_DarBOM`). Optional.
+  notes String? @map("notes") @db.VarChar(2000)
+
+  // --------------------------------------------------------------------------
+  // LEGACY / MIGRATION-PRESERVATION COLUMNS — nullable, no business rule, no formula
+  // --------------------------------------------------------------------------
+  /// The source's `Code_Ghatae` («کد قطعه»), DISTINCT from `standardPartCode`. No writer
+  /// was found in the supplied forms, so it is preserved for migration only.
+  legacyPartCode String? @map("legacy_part_code") @db.VarChar(128)
+
+  /// The source's item-level `state` integer. The source defines no semantics for it and
+  /// the item lifecycle is NOT re-derived from it — it is carried for traceability only.
+  legacyItemState Int? @map("legacy_item_state")
+
+  /// The source's item-level `NazarModir` snapshot. Written on the HEADER in the source; the
+  /// item projection carries it. Preserved, never a decision input.
+  legacyManagerOpinion ManagerOpinion? @map("legacy_manager_opinion")
+
+  /// The five derived/projection coefficients. NO writer in the supplied forms, so NO
+  /// formula is invented for them and NO rule reads them (M-4 / M-7a / §14).
+  legacyConsumptionTotalCoefficient   Int? @map("legacy_consumption_total_coefficient")
+  legacyConsumptionInDrawingOnOrder   Int? @map("legacy_consumption_in_drawing_on_order")
+  legacyConsumptionSpareTestOnOrder   Int? @map("legacy_consumption_spare_test_on_order")
+  legacyConsumptionInDrawingPurchased Int? @map("legacy_consumption_in_drawing_purchased")
+  legacyConsumptionSpareTestPurchased Int? @map("legacy_consumption_spare_test_purchased")
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  /// Phase PRODUCTION-BOM-CHANGE: the change-request DETAIL ROWS that name this item. It is
+  /// the back side of `BomChangeRequestItem.bomItem`, and it exists so the same-database
+  /// foreign key can reference this table's `(tenantId, id)` pair — an item named by a
+  /// detail of another tenant's BOM is then refused by the database, not only by a service
+  /// predicate. It is deliberately NOT an ownership claim: the detail row belongs to the
+  /// change request, and this collection is never used to decide whether an item may change.
+  changeRequestItems BomChangeRequestItem[]
+
+  /// The tenant-first unique pair every owned table carries.
+  @@unique([tenantId, id], map: "BomItem_tenantId_id_key")
+  /// "this BOM's items" — the list read, and the scope of the submit gate.
+  @@index([tenantId, bomId], map: "BomItem_tenantId_bomId_idx")
+  /// "this BOM's items, in the order they were added" — the grid read. `createdAt` matches
+  /// the sort below, so the page is fetched in index order rather than re-sorted per request.
+  @@index([tenantId, bomId, createdAt], map: "BomItem_tenantId_bomId_createdAt_idx")
+  @@map("BomItem")
+}
+
+// ============================================================================
+// THE BOM CHANGE REQUEST — a second aggregate, over an EXISTING BOM
+// (Phase PRODUCTION-BOM-CHANGE)
+// ============================================================================
+//
+// WHERE THIS COMES FROM
+// ---------------------
+// The source is a SECOND SharePoint form, «ثبت درخواست تغییر BOM» (`BomEdit.txt`), over
+// its own list (`تغییر Bom`) with a detail list (`جزئیات تغییر Bom`). It is NOT a revision
+// of the BOM and it does NOT touch `BomHeader`/`BomItem` at any point in the supplied
+// material: the form reads an item's current coefficients, records two deltas, and routes
+// the request to a manager. `Apply Change` therefore stays DEFERRED — nothing in the
+// source proves what approval would write back.
+//
+// WHAT IT IS, PRECISELY
+// ---------------------
+// A tenant-scoped document that says "for THIS BOM, change THESE items", with a requester,
+// a snapshotted approver, a request date, a manager opinion and the SAME four-state
+// lifecycle the BOM header already walks (`DRAFT → SUBMITTED → APPROVED / REJECTED`, with
+// «نیاز به اصلاح» returning the document to `DRAFT`). That is a deliberate reuse: the
+// source's own `c_status` integers are `0 / 1 / 50 / 100` plus the correction branch, and
+// they mean exactly the four facts `BomStatus` already names — so a second four-value
+// enum would be the same vocabulary written twice, free to drift.
+//
+// WHY `bomId` IS A REAL FOREIGN KEY AND EVERYTHING ELSE IS OPAQUE
+// --------------------------------------------------------------
+//   * `bomId` names a row in THIS database, so it is a same-database composite foreign key
+//     against `BomHeader(tenant_id, id)`: a change request can never be attached to
+//     another tenant's BOM, and RESTRICT means a BOM holding a reviewed request cannot be
+//     removed out from under it.
+//   * `projectRef` / `productTreeRef` are the OPAQUE copies of the target BOM's own
+//     references (CF-1 / RB-1): frozen at creation, never a lookup into a Project or
+//     Product Tree domain, because neither exists in this repository.
+//   * `requesterUserId` / `approverUserId` / `decidedByUserId` are PLAIN STRING columns
+//     holding opaque platform user ids, validated for tenant membership through
+//     `USER_DIRECTORY` before they are stored — never a cross-database join.
+//
+// COLUMN-LEVEL REASONING, ONE LINE EACH
+// ------------------------------------
+//   title            — «عنوان درخواست». The source CALCULATED it as
+//                      `'تغییر اقلام پروژه - ' + <project name>`; Ariya has no
+//                      project-name contract to read, so — exactly as M-1 decided for the
+//                      BOM header — it is a STORED, required value, never a derived one.
+//   projectRef       — «عنوان پروژه», the opaque project reference copied from the BOM.
+//   productTreeRef   — «درخت محصول مرتبط», the opaque tree reference copied from the BOM.
+//                      Both are display scope in the UI; the ITEM side is scoped by
+//                      `bomId`, so neither is ever a validation input.
+//   requesterUserId  — «درخواست کننده». The source resolved it from the CURRENT user; in
+//                      Ariya it is `actor.userId`, never a body field.
+model BomChangeRequest {
+  id       String @id @default(uuid()) @db.Uuid
+  /// TEXT, like every `tenantId` in this repository.
+  tenantId String @map("tenant_id") @db.Text
+
+  /// The BOM this request changes. With `tenantId` it references `BomHeader(tenant_id, id)`.
+  bomId String @map("bom_id") @db.Uuid
+
+  /// The stored title («عنوان درخواست»). Bounded, trimmed, non-blank.
+  title String @db.VarChar(200)
+
+  /// Opaque external reference to a Project, copied from the BOM. NO foreign key.
+  projectRef String @map("project_ref") @db.VarChar(128)
+
+  /// Opaque external reference to a Product Tree, copied from the BOM. NO foreign key,
+  /// and NO code prefix is derived from it (RB-1-P remains blocked).
+  productTreeRef String @map("product_tree_ref") @db.VarChar(128)
+
+  /// Opaque platform user id of the requester — `actor.userId`, a member of THIS tenant.
+  requesterUserId String @map("requester_user_id") @db.Text
+
+  /// The approver, SNAPSHOTTED at submit and immutable afterwards. NULL while the document
+  /// is still a draft — "not yet routed" is a real state, and a placeholder id would claim
+  /// a routing decision nobody made.
+  approverUserId String? @map("approver_user_id") @db.Text
+
+  /// The business lifecycle. Closes at DRAFT: a new request is always a draft.
+  status BomStatus @default(DRAFT)
+
+  /// The approver's decision. NULL until the approver acts — never a default.
+  managerOpinion ManagerOpinion? @map("manager_opinion")
+
+  /// The approver's reason, or the requester's own note.
+  notes String? @db.VarChar(2000)
+
+  /// «تاریخ درخواست». Defaulted at creation, exactly as the source's DatePicker was.
+  requestDate DateTime @default(now()) @map("request_date") @db.Timestamptz(6)
+
+  /// When the document entered SUBMITTED.
+  submittedAt DateTime? @map("submitted_at") @db.Timestamptz(6)
+
+  /// When the approver acted.
+  decidedAt DateTime? @map("decided_at") @db.Timestamptz(6)
+
+  /// WHO acted. Equal to `approverUserId` while the frozen-approver rule holds.
+  decidedByUserId String? @map("decided_by_user_id") @db.Text
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  /// THE SAME-DATABASE FK, RESTRICT on delete for the same reason `BomItem.bom` is: the
+  /// header has no delete route, and if one were ever added the database must refuse to
+  /// orphan a reviewed change request rather than silently destroying the evidence.
+  bom BomHeader @relation(fields: [tenantId, bomId], references: [tenantId, id], onDelete: Restrict, onUpdate: Cascade)
+
+  /// The detail rows («جزئیات تغییر Bom»). Deleting the header is not a route, but the
+  /// relation is stated so the child's composite FK has a target and so the detail read is
+  /// expressible as ONE query rather than a two-step lookup.
+  items BomChangeRequestItem[]
+
+  /// The tenant-first unique pair every owned table carries; also the composite-key target
+  /// the detail rows below reference.
+  @@unique([tenantId, id], map: "BomChangeRequest_tenantId_id_key")
+  /// "this BOM's change requests" — the BOM-scoped filter the brief requires, and the scope
+  /// of the duplicate-detail rule.
+  @@index([tenantId, bomId], map: "BomChangeRequest_tenantId_bomId_idx")
+  /// "this tenant's requests in this state" — the register's status filter and the
+  /// "what is waiting for a decision" read. Leads with the tenant, so a cross-tenant scan by
+  /// status alone is not expressible.
+  @@index([tenantId, status], map: "BomChangeRequest_tenantId_status_idx")
+  @@map("BomChangeRequest")
+}
+
+//   approverUserId   — «مدیر تایید کننده», chosen explicitly, a member of THIS tenant,
+//                      required to differ from the requester, FROZEN once submitted.
+//   managerOpinion   — «نظر مدیر». NULL until the approver acts, never a default.
+//   notes            — «توضیحات»: the requester's note, or the approver's stated reason.
+//   requestDate      — «تاریخ درخواست». Defaulted at creation, as the source's picker was.
+//   submittedAt      — when the document entered SUBMITTED: the evidence a decision was
+//                      made against THIS submission.
+//   decidedAt        — when the approver acted.
+//   decidedByUserId  — WHO acted, kept beside `approverUserId` exactly as the header does.
+
+/// One change-request DETAIL row — «جزئیات تغییر Bom» in the source.
+///
+/// WHAT THE SOURCE STORES, AND WHAT IS DELIBERATELY NOT REPEATED HERE
+/// -----------------------------------------------------------------
+/// The source's detail item is written by the `c_add` action with exactly these fields:
+/// `IdBomFehresteAghlameProje` (the BOM item), `IdBomChangeStack` and `idBomChange` (BOTH
+/// set to the same request id — a legacy duplicate), `NoeaTaghir`, the two
+/// `MizanAfzayesh…` deltas and the two `MizanAvaliye…` originals. Every one of those is
+/// modelled below, ONCE: the duplicated request-id column is not repeated, because the
+/// source proves the two were always written with the same value, and a second column that
+/// can disagree is a second source of truth.
+///
+/// It also stores `Title`, which the source set to the CHANGE REQUEST's title rather than
+/// the part's — a SharePoint mandatory-title artefact, not a business fact, so it is not
+/// modelled. The part's own name is read from the referenced item at display time.
+///
+/// WHY THE ORIGINALS ARE STORED AND NOT RE-READ
+/// -------------------------------------------
+/// The source reads the selected item's current coefficients into `c_Control13` /
+/// `c_Control14` and writes them onto the detail row as `MizanAvaliyeZaribMasrafInMap` /
+/// `MizanAvaliyeZaribMasrafYadaki`. That snapshot is what makes a historical request
+/// readable after the item has moved on, so it is stored here and NEVER re-derived. The
+/// UI's "total" (`original + delta`) is a display-only derivation (S8), NOT a column.
+model BomChangeRequestItem {
+  id       String @id @default(uuid()) @db.Uuid
+  /// TEXT, like every `tenantId` in this repository; also the leading FK column below.
+  tenantId String @map("tenant_id") @db.Text
+
+  /// The request this detail belongs to (`IdBomChangeStack` / `idBomChange`).
+  changeRequestId String @map("change_request_id") @db.Uuid
+
+  /// The BOM item being changed (`IdBomFehresteAghlameProje`).
+  bomItemId String @map("bom_item_id") @db.Uuid
+
+  /// `NoeaTaghir` — «نوع تغییر». A closed two-value set; see `BomChangeType`.
+  changeType BomChangeType @map("change_type")
+
+  /// `MizanAvaliyeZaribMasrafInMap` — «میزان اولیه ضریب مصرف (در نقشه)», snapshotted from
+  /// the item at the moment the detail was created.
+  originalDrawingCoefficient Int @map("original_drawing_coefficient")
+
+  /// `MizanAvaliyeZaribMasrafYadaki` — «میزان اولیه ضریب مصرف (یدکی/تست)», same snapshot.
+  originalSpareCoefficient Int @map("original_spare_coefficient")
+
+  /// `MizanAfzayeshZaribMasrafInMap` — «افزایش/کاهش ضریب مصرف (در نقشه)». SIGNED and
+  /// NULLABLE: the source's control is a `NumberTextBox` (`Decimals=0`) whose value is
+  /// `parseInt`-ed, the source's own range checks are COMMENTED OUT (S7), and a decrease is
+  /// the point of the field's name. NULL therefore means "not stated", which is a different
+  /// fact from `0` ("stated as no change") — and for `QUANTITY_CHANGE` at least one of the
+  /// two must be stated (S2). NO maximum, NO minimum and NO precision rule is invented.
+  drawingCoefficientDelta Int? @map("drawing_coefficient_delta")
+
+  /// `MizanAfzayeshZaribMasrafYadaki` — «افزایش/کاهش ضریب مصرف (یدکی/تست)». Same rules.
+  spareCoefficientDelta Int? @map("spare_coefficient_delta")
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  /// The parent request. With `tenantId` it references `BomChangeRequest(tenant_id, id)`,
+  /// so a detail can never be attached to another tenant's request. RESTRICT: a reviewed
+  /// request's detail rows are evidence and are not removable by deleting the parent.
+  changeRequest BomChangeRequest @relation(fields: [tenantId, changeRequestId], references: [tenantId, id], onDelete: Restrict, onUpdate: Cascade)
+
+  /// The changed item. With `tenantId` it references `BomItem(tenant_id, id)`, so an item of
+  /// another tenant's BOM is refused by the database and not only by a service predicate.
+  /// RESTRICT: an item named by a change request can no longer be hard-deleted while the
+  /// request exists, which is exactly right — the request's evidence must not vanish.
+  bomItem BomItem @relation(fields: [tenantId, bomItemId], references: [tenantId, id], onDelete: Restrict, onUpdate: Cascade)
+
+  /// The tenant-first unique pair every owned table carries.
+  @@unique([tenantId, id], map: "BomChangeRequestItem_tenantId_id_key")
+  /// THE DUPLICATE RULE, ENFORCED BY THE DATABASE (S3). The source refused a second detail
+  /// for the same item in the same request («شما قبلا جزئیات این قطعه را تغییر و ثبت نموده
+  /// اید») with a read-then-write search; a UNIQUE index is the same rule stated where two
+  /// concurrent writers cannot both satisfy it.
+  @@unique([tenantId, changeRequestId, bomItemId], map: "BomChangeRequestItem_tenantId_changeRequestId_bomItemId_key")
+  /// "this request's detail rows, in the order they were added" — the grid read and the
+  /// submit gate's scope.
+  @@index([tenantId, changeRequestId], map: "BomChangeRequestItem_tenantId_changeRequestId_idx")
+  @@map("BomChangeRequestItem")
+}
+
+// ============================================================================
+// AUDIT OUTBOX — Phase B2.4: transactional durable audit delivery
+// ============================================================================
+//
+// THE PATTERN IS CONTEXT-LOCAL. Each bounded context that needs durable audit
+// adds its own `AuditOutbox` to its own schema — Financial was the first
+// (Phase B2), Commerce was the second (Phase B2.3), Production is the third
+// (Phase B2.4). The outbox is NOT a second audit trail: it is a delivery buffer
+// that ensures compliance-critical events reach `core_db."AuditLog"` even when
+// the relay or network fails after commit.
+//
+// LIFECYCLE:
+//   1. Service builds an immutable outbox payload (via gateway.buildOutboxPayload)
+//   2. Repository writes business mutation + AuditOutbox.create in ONE transaction
+//   3. Relay polls due rows, delivers through AUDIT_PORT, deletes on success
+//   4. Failed deliveries are rescheduled with bounded backoff
+//
+// A rolled-back business mutation rolls back its outbox row — no orphan event.
+// A committed business mutation's event survives relay failure and is retried.
+
+/// The transactional outbox for Production audit events that require durable
+/// delivery. Written atomically with the business mutation inside the same
+/// Production database transaction.
+model AuditOutbox {
+  id        String   @id @default(uuid()) @db.Uuid
+  tenantId  String   @map("tenant_id") @db.Text
+
+  /// The producer-owned event identity, matching `AuditEventInput.auditId`.
+  auditId   String   @map("audit_id") @db.VarChar(64)
+
+  /// The full event payload, serialised as JSON.
+  payload   Json
+
+  /// Relay attempts so far. Incremented on each failed attempt.
+  attempts  Int      @default(0)
+
+  /// When the next relay attempt is allowed. Defaults to now (immediate).
+  nextAt    DateTime @default(now()) @map("next_at") @db.Timestamptz(6)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@unique([tenantId, auditId], map: "AuditOutbox_tenant_auditId_key")
+  @@index([tenantId, nextAt], map: "AuditOutbox_tenant_nextAt_idx")
+  @@index([tenantId, createdAt], map: "AuditOutbox_tenant_createdAt_idx")
+  @@map("AuditOutbox")
+}
+

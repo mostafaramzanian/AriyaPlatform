@@ -1,0 +1,48 @@
+# Multi-stage build for Next.js frontend
+FROM node:20-alpine AS base
+
+WORKDIR /app
+
+# Install dependencies
+FROM base AS deps
+COPY package.json pnpm-lock.yaml* package-lock.json* ./
+COPY apps/web/package.json ./apps/web/
+COPY packages ./packages
+
+ENV PUPPETEER_SKIP_DOWNLOAD=true
+RUN npm ci
+
+# Build application
+FROM deps AS builder
+
+# GAP-ENV-1: NEXT_PUBLIC_* values are inlined into the browser bundle at build
+# time. They are declared as ARGs so docker compose (or `docker build
+# --build-arg`) supplies them explicitly; setting them as container environment
+# on the runtime image would silently do nothing.
+#
+# NEXT_PUBLIC_API_URL must be `<origin>/api` — apps/web/src/lib/constants.ts
+# appends `/v1` itself. The default matches the local compose deployment.
+ARG NEXT_PUBLIC_API_URL=http://localhost:3001/api
+ARG NEXT_PUBLIC_APP_URL=http://localhost:3000
+ENV NEXT_PUBLIC_API_URL=$NEXT_PUBLIC_API_URL
+ENV NEXT_PUBLIC_APP_URL=$NEXT_PUBLIC_APP_URL
+
+COPY . .
+RUN npm run build --workspace=apps/web
+
+# Production image
+FROM base AS runner
+
+ENV NODE_ENV=production
+ENV NEXT_TELEMETRY_DISABLED=1
+
+COPY --from=deps /app/node_modules ./node_modules
+COPY --from=builder /app/apps/web/.next ./apps/web/.next
+COPY --from=builder /app/apps/web/package.json ./apps/web/
+COPY --from=builder /app/apps/web/public ./apps/web/public
+
+WORKDIR /app/apps/web
+
+EXPOSE 3000
+
+CMD ["npm", "start"]

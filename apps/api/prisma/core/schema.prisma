@@ -1,0 +1,3249 @@
+// Core Prisma schema (Phase 33J)
+// Owns Identity/Auth/RBAC/Audit/Marketing-lead data. This project is
+// physically and logically independent from the CMS Prisma project
+// (apps/api/prisma/cms/schema.prisma). Core and CMS must never share a
+// Prisma client, a migration history, or a physical foreign key.
+datasource db {
+  provider = "postgresql"
+  url      = env("CORE_DATABASE_URL")
+}
+
+generator client {
+  provider      = "prisma-client-js"
+  output        = "../../src/generated/core-client"
+  binaryTargets = ["native", "linux-musl-openssl-3.0.x"]
+}
+
+enum UserStatus {
+  VISITOR
+  LEAD
+  CUSTOMER
+  PARTNER
+  EMPLOYEE
+  ADMIN
+  SUPER_ADMIN
+}
+
+enum RoleName {
+  SUPER_ADMIN
+  ADMIN
+  SECURITY_ADMIN
+  OPERATIONS_ADMIN
+  PARTNER
+  CUSTOMER
+  EMPLOYEE
+  VISITOR
+}
+
+enum PermissionDomain {
+  USERS
+  LEADS
+  MEETINGS
+  BLOG
+  ADMIN
+  PARTNER
+  CUSTOMER
+  SUPPORT
+  CORRESPONDENCE
+  HR
+  COMMERCE
+  PRODUCTION
+  FINANCIAL
+}
+
+// Phase 49E: bounded notification categories.
+//
+// Derived from the event families that already exist in this repository and are
+// published through NotificationPublisher — auth.* / rbac.* (SECURITY),
+// blog.* (ANNOUNCEMENT), operational/system events (SYSTEM) — plus a neutral
+// default (INFORMATION). No speculative taxonomy for future business domains
+// (no TASK/REQUEST/TICKET/CALENDAR) is declared here.
+enum NotificationType {
+  SYSTEM
+  SECURITY
+  ANNOUNCEMENT
+  INFORMATION
+}
+
+// Phase 49F: conversation shape.
+//
+// DIRECT is a 1:1 conversation between exactly two users, deduplicated by
+// `Conversation.directKey`. GROUP is a named conversation with an explicit
+// member list. Deliberately absent: CHANNEL/BROADCAST/DEPARTMENT — Core has no
+// department or group membership model (User.department is a free-text label,
+// not a membership edge), so organization-wide messaging is DEFERRED rather than
+// modelled speculatively here.
+enum ConversationType {
+  DIRECT
+  GROUP
+}
+
+// Phase 49G: bounded support/ticketing taxonomy.
+//
+// Derived from what the approved 49G contract asks the requester to be able to
+// file. Deliberately absent: INCIDENT/CHANGE/PROBLEM/SERVICE_REQUEST (ITIL
+// process types this repository has no process for), and any severity/impact
+// matrix — priority alone is modelled.
+enum TicketType {
+  BUG
+  SUPPORT
+  SUGGESTION
+  CRITICISM
+  COMPLAINT
+  FEATURE_REQUEST
+}
+
+enum TicketPriority {
+  LOW
+  NORMAL
+  HIGH
+  URGENT
+}
+
+// Phase 49G: lifecycle.
+//
+// Forward-only: NEW → TRIAGED → ASSIGNED → IN_PROGRESS → WAITING_FOR_REQUESTER
+// → RESOLVED → CLOSED. CLOSED is terminal and there is NO reopen transition —
+// a closed ticket's successor is a new ticket, so no column models a reopen
+// count or a previous-status pointer.
+//
+// Deliberately absent: DELETED/ARCHIVED (a ticket is never destroyed) and
+// MERGED/DUPLICATE (no ticket-to-ticket linking exists in v1).
+enum TicketStatus {
+  NEW
+  TRIAGED
+  ASSIGNED
+  IN_PROGRESS
+  WAITING_FOR_REQUESTER
+  RESOLVED
+  CLOSED
+}
+
+// Phase 49H: bounded survey lifecycle.
+//
+// DRAFT → PUBLISHED → CLOSED, forward-only. CLOSED is terminal: there is no
+// reopen transition, so no column models a reopen count or a previous-status
+// pointer. A closed survey's successor is a new survey.
+//
+// Deliberately absent: SCHEDULED (availability is expressed by startsAt/endsAt on
+// a PUBLISHED survey, not by a fourth state), ARCHIVED/DELETED (a survey is never
+// destroyed), and any generic workflow/approval state — Core has no workflow
+// engine and this enum must not pretend otherwise.
+enum SurveyStatus {
+  DRAFT
+  PUBLISHED
+  CLOSED
+}
+
+// Phase 49H: bounded question set.
+//
+// Exactly the four shapes the approved scope names. Deliberately absent: MATRIX,
+// RANKING, DATE, FILE_UPLOAD, and anything implying conditional logic or
+// branching — none is required by the approved scope, and each would need
+// validation rules this phase does not define.
+enum SurveyQuestionType {
+  SINGLE_CHOICE
+  MULTIPLE_CHOICE
+  TEXT
+  RATING
+}
+
+// Tenant model — canonical owner of TenantId (CORE-002, ADR-301)
+model Tenant {
+  id        String   @id @default(uuid())
+  code      String   @unique
+  status    String? // Values are not yet defined by product; nullable until decided
+  region    String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  users User[]
+  leads Lead[]
+
+  /// Phase 54-C (D14/D16) back-relations. NO DDL AGAINST THIS TABLE: the foreign keys
+  /// live on the child tables, exactly as `users` and `leads` above carry no column
+  /// here. A grant and a membership are both facts ABOUT a tenant, so deleting the
+  /// tenant removes them (CASCADE) — a statement about a tenant that no longer exists
+  /// must not outlive it. One consequence is accepted and stated: a tenant re-created
+  /// under a new id starts UNENTITLED, which is the same fail-closed direction as
+  /// everything else in this layer.
+  featureGrants      ModuleFeatureGrant[]
+  moduleMemberships  ModuleRegistrationTenant[]
+
+  @@index([status])
+}
+
+// User model
+model User {
+  id            String     @id @default(uuid())
+  email         String     @unique
+  passwordHash  String
+  firstName     String?
+  lastName      String?
+  phone         String?
+  avatarUrl     String?
+  status        UserStatus @default(VISITOR)
+  emailVerified Boolean    @default(false)
+  tokenVersion  Int        @default(1) // Phase B.2.1: Incremented on permission changes, invalidates old JWTs
+  createdAt     DateTime   @default(now())
+  updatedAt     DateTime   @updatedAt
+
+  // Phase 49D-1 (Option A): bounded organization/contact attributes required by
+  // the Organization Directory. Directory is CORE; HR remains a future business
+  // domain. Deliberately excluded here: employeeCode (personnel identifier),
+  // and every employment/payroll/attendance/leave/performance attribute.
+  // These fields are organization-controlled — PATCH /users/me must never write
+  // them (see users.service.ts#updateSelfProfile and UpdateUserProfileDto).
+  department String?
+  jobTitle   String?
+  extension  String?
+
+  tenantId String?
+  tenant   Tenant? @relation(fields: [tenantId], references: [id], onDelete: SetNull)
+
+  // Nullable self-reference. onDelete: SetNull so removing a manager never
+  // cascades into deleting their reports. A user cannot be their own manager —
+  // enforced by the User_manager_not_self CHECK constraint in the migration,
+  // because Prisma cannot express that invariant. Cross-tenant manager pointers
+  // are never resolved: directory reads scope the manager lookup to the caller's
+  // tenant, and no write path for managerId exists in v1.
+  managerId String?
+  manager   User?   @relation("UserManager", fields: [managerId], references: [id], onDelete: SetNull)
+  reports   User[]  @relation("UserManager")
+
+  refreshTokens           RefreshToken[]
+  emailVerifications      EmailVerification[]
+  passwordResets          PasswordReset[]
+  leads                   Lead[]
+  auditLogs               AuditLog[]
+  notifications           Notification[]
+  userRoles               UserRole[]
+  rolesAssigned           UserRole[]            @relation("RoleAssignedBy")
+  // Phase 49F: internal messaging.
+  conversationMemberships ConversationMember[]
+  conversationsCreated    Conversation[]        @relation("ConversationCreatedBy")
+  messagesSent            Message[]
+  messageAttachments      MessageAttachment[]   @relation("MessageAttachmentUploadedBy")
+  // Phase 49G: support/ticketing.
+  ticketsRequested        Ticket[]              @relation("TicketRequester")
+  ticketsAssigned         Ticket[]              @relation("TicketAssignee")
+  ticketComments          TicketComment[]
+  ticketAttachments       TicketAttachment[]    @relation("TicketAttachmentUploadedBy")
+  ticketStatusChanges     TicketStatusHistory[] @relation("TicketStatusChangedBy")
+  ticketSatisfactions     TicketSatisfaction[]  @relation("TicketSatisfactionSubmittedBy")
+  // Phase 49H: surveys / participation.
+  surveysCreated          Survey[]              @relation("SurveyCreatedBy")
+  surveyResponses         SurveyResponse[]      @relation("SurveyResponseUser")
+  // Phase 49I: personal reminders.
+  reminders               Reminder[]
+  // Phase 50: official correspondence / مکاتبات اداری.
+  lettersSent             Letter[]              @relation("LetterSender")
+  letterRecipients        LetterRecipient[]
+  referralsCreated        LetterReferral[]      @relation("ReferralFrom")
+  referralsReceived       LetterReferral[]      @relation("ReferralTo")
+  letterAttachments       LetterAttachment[]    @relation("LetterAttachmentUploadedBy")
+  letterSignatures        LetterSignature[]     @relation("LetterSignatureUploadedBy")
+  letterTempAttachments   LetterTempAttachment[] @relation("LetterTempAttachmentUploadedBy")
+  letterTrackingEvents    LetterTrackingEvent[] @relation("LetterTrackingActor")
+  archiveFolders          ArchiveFolder[]       @relation("ArchiveFolderOwner")
+  letterArchiveEntries    LetterArchive[]       @relation("LetterArchiveOwner")
+  // Phase 49K: Core Experience Platform. Optional 1:1 — a user who has never
+  // changed a setting has no row and is served the code-level defaults.
+  preference              UserPreference?
+  // NOTE (DC-CMS-01): CMS models (BlogPost.authorId/editorId, Media.uploadedBy,
+  // CmsUserPermission.userId) reference User.id as a plain identifier only.
+  // No physical FK/relation exists here by design, to allow CMS to be extracted
+  // into an independently owned database without a cross-database foreign key.
+
+  @@index([email])
+  @@index([status])
+  @@index([tenantId])
+  // Directory filters are always tenant-scoped, so the composite indexes lead
+  // with tenantId. managerId is indexed for the "direct reports" filter.
+  @@index([tenantId, department])
+  @@index([tenantId, jobTitle])
+  @@index([managerId])
+}
+
+// Role model
+model Role {
+  id          String   @id @default(uuid())
+  name        RoleName @unique
+  displayName String
+  description String?
+  hierarchy   Int      @unique // Lower number = higher privilege (0=SUPER_ADMIN)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  permissions RolePermission[]
+  users       UserRole[]
+
+  @@index([hierarchy])
+}
+
+// Permission model
+model Permission {
+  id          String           @id @default(uuid())
+  name        String           @unique // e.g., "users.read"
+  displayName String
+  description String?
+  domain      PermissionDomain
+  createdAt   DateTime         @default(now())
+
+  roles RolePermission[]
+
+  @@index([domain])
+}
+
+// Role-Permission mapping (many-to-many)
+model RolePermission {
+  id           String   @id @default(uuid())
+  roleId       String
+  permissionId String
+  createdAt    DateTime @default(now())
+
+  role       Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permission Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@unique([roleId, permissionId])
+  @@index([roleId])
+  @@index([permissionId])
+}
+
+// User-Role mapping (many-to-many)
+model UserRole {
+  id         String   @id @default(uuid())
+  userId     String
+  roleId     String
+  assignedBy String? // User ID who assigned this role (nullable for audit trail)
+  assignedAt DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  user     User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role     Role  @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  assignor User? @relation("RoleAssignedBy", fields: [assignedBy], references: [id], onDelete: SetNull)
+
+  @@unique([userId, roleId])
+  @@index([userId])
+  @@index([roleId])
+  @@index([assignedBy])
+}
+
+// Refresh tokens stored for revocation and rotation
+model RefreshToken {
+  id        String   @id @default(uuid())
+  token     String   @unique
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId    String
+  expiresAt DateTime
+  revoked   Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+// Email verification tokens
+model EmailVerification {
+  id        String   @id @default(uuid())
+  token     String   @unique
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId    String
+  expiresAt DateTime
+  used      Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+}
+
+// Password reset tokens
+model PasswordReset {
+  id        String   @id @default(uuid())
+  token     String   @unique
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId    String
+  expiresAt DateTime
+  used      Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+}
+
+// Lead model (marketing/lead-gen; retained in Core per Phase 33 assessment —
+// not CMS-owned, and FK's directly to Core's User; unclassified beyond that,
+// out of scope for this phase)
+model Lead {
+  id                String   @id @default(uuid())
+  email             String
+  name              String
+  company           String?
+  phone             String?
+  industry          String?
+  companySize       String?
+  modulesInterested String?
+  leadSource        String
+  status            String   @default("new")
+  tenantId          String
+  userId            String?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  tenant   Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  user     User?     @relation(fields: [userId], references: [id], onDelete: SetNull)
+  meetings Meeting[]
+
+  @@index([email])
+  @@index([status])
+  @@index([tenantId])
+  @@index([createdAt])
+}
+
+// Meeting model
+model Meeting {
+  id          String   @id @default(uuid())
+  leadId      String
+  scheduledAt DateTime
+  duration    Int
+  status      String   @default("scheduled")
+  meetingLink String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  lead Lead @relation(fields: [leadId], references: [id], onDelete: Cascade)
+
+  @@index([leadId])
+  @@index([scheduledAt])
+}
+
+// Audit log model
+/// ONE AUDIT EVENT (Phase ARCH-3B / Decision A).
+///
+/// WHY `auditId` EXISTS BESIDE `id`. `id` is a DATABASE-GENERATED row identity: it is
+/// assigned by the database at insert time, so a producer that fails after writing cannot
+/// re-send the SAME event — a retry produces a second row with a second `id`. An audit
+/// event needs an identity the PRODUCER owns and can repeat, because idempotency is a
+/// comparison between two arrivals of one logical event. `auditId` is that identity: it is
+/// caller-generated (UUIDv4), UNIQUE, and it is what the `platform.audit@v1` ingest path
+/// de-duplicates on.
+///
+/// WHY `requestId` IS NO LONGER UNIQUE. It used to be `@unique`, which meant one HTTP
+/// request could produce exactly ONE audit row — the second logical mutation inside the
+/// same request failed on a unique violation (silently, because audit persistence never
+/// throws). `requestId` is a CORRELATION/CONTEXT field: it groups the events of one
+/// request. Uniqueness is exactly the wrong property for it, and the historical rows
+/// satisfy it only because the constraint forced it.
+///
+/// WHY `tenantId` IS NULLABLE. 36,489 rows predate this column and there is no
+/// deterministic source for their tenant (`requestId`, `resourceType` and `correlationId`
+/// are not tenant evidence, and inventing a value would be fabricating history). Rows with
+/// `tenantId IS NULL` are LEGACY-HISTORICAL records for this phase, not current platform
+/// audit records. All NEW `platform.audit@v1` events carry a mandatory tenant, enforced in
+/// the consumer rather than by a NOT NULL the historical rows cannot satisfy.
+///
+/// A future migration may add `NOT NULL` plus the tenant index — only after a
+/// deterministic historical mapping exists. `@@index([tenantId])` is deliberately NOT
+/// declared yet: the column is history-free, and an index nobody queries is a write cost
+/// with no reader.
+model AuditLog {
+  id            String   @id @default(uuid())
+
+  /// Producer-owned, globally unique event identity. See the note above.
+  auditId       String   @unique
+
+  /// Correlation/context only — MANY audit events may share one request. Never an identity.
+  requestId     String
+  tenantId      String?
+  correlationId String?
+  userId        String?
+  ipAddress     String?
+  userAgent     String?
+  sessionId     String?
+  action        String
+  resourceType  String
+  resourceId    String
+  oldValue      Json?
+  newValue      Json?
+  changedFields String[] @default([])
+  success       Boolean  @default(true)
+  reason        String?
+  durationMs    Int?
+  changes       Json?
+  createdAt     DateTime @default(now())
+
+  user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([userId])
+  @@index([createdAt])
+  @@index([resourceType, resourceId])
+  /// The replacement for the DROPPED unique constraint, deliberately NON-unique: the one
+  /// read that used to be served by `requestId`'s uniqueness — "every event of this
+  /// request" — is now a multi-row read, and it must stay an index scan rather than become
+  /// a sequential scan of the trail.
+  @@index([requestId])
+}
+
+/// LEGACY-COMPATIBILITY TABLE (Phase ARCH-3B §5). Deliberately UNCHANGED.
+///
+/// `AuditDispatch.auditId` historically means `AuditLog.id` — the row identity of an event
+/// whose RabbitMQ publish failed — and it is NOT reinterpreted as the new producer-owned
+/// `auditId`. Folding it into `platform.audit@v1` would silently change the meaning of every
+/// existing retry row, so the new ingest path does not read it, does not write it, and does
+/// not require it; it remains the legacy retry ledger it has always been.
+model AuditDispatch {
+  id        String   @id @default(uuid())
+  auditId   String
+  attempts  Int      @default(0)
+  nextAt    DateTime @default(now())
+  createdAt DateTime @default(now())
+
+  @@index([auditId])
+  @@index([nextAt])
+}
+
+// Phase 49E: persistent in-app Notification Center (COL-008, COL-009, COL-016).
+//
+// Scope: USER-SCOPED + TENANT CONTEXT. One notification belongs to exactly one
+// recipient; `tenantId` is a snapshot of the recipient's tenant at creation time
+// and is used only to keep reads tenant-consistent. It is never projected to the
+// client.
+//
+// Deliberately absent: channel/delivery tables (email/SMS/push), campaign or
+// template tables, workflow or scheduler state, and any real-time transport
+// state. Email remains OPTIONAL/FUTURE and SMS/Push remain DEFERRED, so no
+// column here models them.
+//
+// `sourceType`/`sourceId` are plain, unconstrained identifiers — deliberately NOT
+// foreign keys, so a notification survives deletion of its source and no
+// dependency on a future domain (ticketing, calendar, messaging) is created.
+model Notification {
+  id     String @id @default(uuid())
+  userId String
+
+  // Snapshot of the recipient's tenant. Nullable because User.tenantId is
+  // nullable; reads compare it against the caller's own tenant context.
+  tenantId String?
+
+  type  NotificationType @default(INFORMATION)
+  title String
+  body  String
+
+  // Unread state is the absence of a timestamp: readAt = null means unread.
+  readAt DateTime?
+
+  // Optional, non-FK back-reference to whatever produced the notification.
+  sourceType String?
+  sourceId   String?
+
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Indexes mirror the only three queries the service issues:
+  //   list      -> where userId (+tenantId) order by createdAt desc, id desc
+  //   unread    -> where userId (+tenantId) and readAt is null  (count)
+  //   mark-read -> where id and userId (covered by the primary key + userId)
+  @@index([userId, createdAt(sort: Desc), id(sort: Desc)])
+  @@index([userId, readAt])
+}
+
+// ============================================================================
+// Phase 49F: Internal Messaging.
+//
+// Postgres is authoritative. The WebSocket gateway is a delivery optimisation
+// only: every message is persisted here BEFORE it is fanned out, so a client
+// that misses a push recovers it through the same cursor-paginated HTTP reads.
+//
+// Deliberately absent: any transport/queue state table (no Kafka offset, no
+// Redis channel, no Bull job), message edit/delete history, per-message read
+// receipts (read state is conversation-level, see ConversationMember.lastReadAt),
+// reactions, threads, pinned messages and any external federation.
+// ============================================================================
+
+// A conversation is either 1:1 (DIRECT) or a named group (GROUP).
+//
+// `tenantId` is a snapshot of the creator's tenant and is the isolation key for
+// every read: a conversation is never visible outside the tenant it was created
+// in. It is never projected to the client.
+model Conversation {
+  id       String           @id @default(uuid())
+  type     ConversationType @default(DIRECT)
+  tenantId String?
+
+  /// Group title. Always null for DIRECT — a 1:1 conversation is named after the
+  /// other participant by the UI, never stored.
+  name String?
+
+  createdBy String
+
+  /// Deterministic 1:1 dedupe key: `${tenantId ?? 'null'}:${sorted(userA,userB)}`.
+  /// UNIQUE, so two users can never end up with two parallel direct
+  /// conversations even under a concurrent double create. Null for GROUP.
+  directKey String? @unique
+
+  /// Denormalised activity timestamp so the conversation rail can be ordered
+  /// without aggregating Message. Updated in the same transaction as the insert.
+  lastMessageAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  creator     User                 @relation("ConversationCreatedBy", fields: [createdBy], references: [id], onDelete: Cascade)
+  members     ConversationMember[]
+  messages    Message[]
+  attachments MessageAttachment[]
+
+  // Serves the conversation rail: tenant-scoped, newest activity first.
+  @@index([tenantId, lastMessageAt(sort: Desc), id(sort: Desc)])
+  @@index([createdBy])
+}
+
+// Membership is the ONLY authorization edge for messaging. Every read and write
+// checks for a row here; there is no role or permission that grants access to a
+// conversation the caller does not belong to.
+model ConversationMember {
+  id             String @id @default(uuid())
+  conversationId String
+  userId         String
+
+  /// Conversation-level read state. Unread = messages newer than this timestamp
+  /// that the member did not send. Null means nothing has been read yet.
+  lastReadAt DateTime?
+
+  joinedAt DateTime @default(now())
+
+  conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // One membership row per user per conversation — makes the membership check a
+  // unique lookup and makes re-adding a member a no-op rather than a duplicate.
+  @@unique([conversationId, userId])
+  // Leads with userId: "list my conversations" and "am I a member" are the two
+  // hot queries.
+  @@index([userId, conversationId])
+}
+
+// An immutable message. There is no `editedAt`/`deletedAt`: v1 has no edit or
+// delete capability, so no column pretends to support one.
+model Message {
+  id             String @id @default(uuid())
+  conversationId String
+  senderId       String
+
+  /// Plain text. Never rendered as HTML — the web client uses text nodes only.
+  body String
+
+  /// Client-generated idempotency key. A retried send (WS reconnect, double
+  /// submit) with the same key returns the existing row instead of inserting a
+  /// duplicate. Unique per sender + conversation, not globally, so two users can
+  /// never collide.
+  clientMessageId String?
+
+  createdAt DateTime @default(now())
+
+  conversation Conversation        @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  sender       User                @relation(fields: [senderId], references: [id], onDelete: Cascade)
+  attachments  MessageAttachment[]
+
+  @@unique([conversationId, senderId, clientMessageId])
+  // Serves the message page: WHERE conversationId ORDER BY createdAt DESC, id DESC.
+  @@index([conversationId, createdAt(sort: Desc), id(sort: Desc)])
+  @@index([senderId])
+}
+
+// One stored file. Uploaded FIRST (so the upload can be validated and stored
+// before a message exists), then bound to a message when the send commits —
+// hence `messageId` is nullable. An attachment that is never bound is inert: it
+// is invisible to every read, since every read starts from a message.
+//
+// `uploadedBy` + `conversationId` are the ownership pair: only the uploader can
+// bind it, and only into the conversation it was uploaded for, so an attachment
+// id cannot be replayed into someone else's thread.
+model MessageAttachment {
+  id             String  @id @default(uuid())
+  messageId      String?
+  conversationId String
+  uploadedBy     String
+
+  fileName   String
+  mimeType   String
+  size       Int
+  storageKey String
+
+  createdAt DateTime @default(now())
+
+  message      Message?     @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  uploader     User         @relation("MessageAttachmentUploadedBy", fields: [uploadedBy], references: [id], onDelete: Cascade)
+
+  @@index([messageId])
+  // Serves the claim check: "this pending attachment, mine, in this conversation".
+  @@index([uploadedBy, conversationId])
+  @@index([conversationId])
+}
+
+// ============================================================================
+// Phase 49G: Core Support / Ticketing.
+//
+// A ticket is an owned record with two authorization edges and nothing else:
+//   - the REQUESTER, who may always read and comment on their own ticket; and
+//   - a SUPPORT AGENT, who holds `admin.support.manage` and may read and
+//     administer every ticket inside their tenant.
+// `support.tickets` is the requester-side permission. Both already exist in the
+// RBAC catalogue, so Phase 49G introduces NO new permission.
+//
+// Deliberately absent: SLA timers/breach state, escalation chains, queues,
+// department routing (User.department is a free-text label, not a membership
+// edge — routing is DEFERRED rather than modelled speculatively here),
+// ticket-to-ticket links (merge/duplicate/parent), canned responses, CSAT
+// surveys beyond one rating per ticket, and any external mail-gateway state.
+// ============================================================================
+
+// One support ticket.
+//
+// `tenantId` is a snapshot of the requester's tenant and is the isolation key
+// for every read: a ticket is never visible outside the tenant it was filed in.
+// It is never projected to the client.
+model Ticket {
+  id       String  @id @default(uuid())
+  tenantId String?
+
+  /// Server-generated, non-sequential, human-quotable tracking number
+  /// (`TK-` + 10 base32 chars). UNIQUE, so a concurrent double create cannot
+  /// mint the same number twice — the loser retries with fresh entropy.
+  /// Non-sequential on purpose: a sequential number would leak ticket volume
+  /// and let one tenant enumerate another's tickets by counting.
+  trackingNumber String @unique
+
+  requesterId String
+  /// Nullable until triage assigns an agent. No write path ever clears it back
+  /// to null: assignment only ever moves from one agent to another.
+  assigneeId  String?
+
+  type     TicketType
+  priority TicketPriority @default(NORMAL)
+  status   TicketStatus   @default(NEW)
+
+  /// Plain text, bounded by a DB CHECK as well as by the DTO.
+  subject String
+  body    String
+
+  /// Free-text category, set only by an agent (`admin.support.manage`). Not an
+  /// enum: the taxonomy is operational, not structural, and no code branches on
+  /// it.
+  category String?
+
+  /// Set when status first reaches RESOLVED / CLOSED. Never cleared, because
+  /// neither transition can be undone.
+  resolvedAt DateTime?
+  closedAt   DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  requester User  @relation("TicketRequester", fields: [requesterId], references: [id], onDelete: Cascade)
+  /// SetNull, not Cascade: deleting an agent must never delete the tickets they
+  /// happened to be working on.
+  assignee  User? @relation("TicketAssignee", fields: [assigneeId], references: [id], onDelete: SetNull)
+
+  comments      TicketComment[]
+  attachments   TicketAttachment[]
+  statusHistory TicketStatusHistory[]
+  satisfaction  TicketSatisfaction?
+
+  // Serves the agent queue: tenant-scoped, newest first.
+  @@index([tenantId, createdAt(sort: Desc), id(sort: Desc)])
+  // Serves "my tickets" for a requester, and an agent's own workload.
+  @@index([requesterId, createdAt(sort: Desc), id(sort: Desc)])
+  @@index([assigneeId, createdAt(sort: Desc), id(sort: Desc)])
+  // Serves the status/type facets on the queue.
+  @@index([tenantId, status])
+  @@index([tenantId, type])
+}
+
+// A comment on a ticket. Immutable: no `editedAt`/`deletedAt`, because v1 has
+// no edit or delete capability and no column pretends to support one.
+model TicketComment {
+  id       String @id @default(uuid())
+  ticketId String
+  authorId String
+
+  /// Plain text. Never rendered as HTML — the web client uses text nodes only.
+  body String
+
+  /// True for a note only agents can see. A requester read filters these out,
+  /// so an internal note can never leak through the requester-facing thread.
+  isInternal Boolean @default(false)
+
+  createdAt DateTime @default(now())
+
+  ticket Ticket @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  author User   @relation(fields: [authorId], references: [id], onDelete: Cascade)
+
+  attachments TicketAttachment[]
+
+  // Serves the comment page: WHERE ticketId ORDER BY createdAt DESC, id DESC.
+  @@index([ticketId, createdAt(sort: Desc), id(sort: Desc)])
+  @@index([authorId])
+}
+
+// One stored file, same lifecycle as MessageAttachment (49F): uploaded FIRST so
+// the upload can be validated and stored before it is bound, then bound when the
+// comment that carries it commits — hence a nullable `commentId`. An attachment
+// that is never bound is inert: no read reaches it, because every read of
+// attachments starts from a bound row.
+model TicketAttachment {
+  id         String  @id @default(uuid())
+  ticketId   String
+  commentId  String?
+  uploadedBy String
+
+  fileName   String
+  mimeType   String
+  size       Int
+  storageKey String
+
+  createdAt DateTime @default(now())
+
+  ticket   Ticket         @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  comment  TicketComment? @relation(fields: [commentId], references: [id], onDelete: SetNull)
+  uploader User           @relation("TicketAttachmentUploadedBy", fields: [uploadedBy], references: [id], onDelete: Cascade)
+
+  @@index([ticketId])
+  @@index([commentId])
+  // Serves the claim check: "this pending attachment, mine, on this ticket".
+  @@index([uploadedBy, ticketId])
+}
+
+// Append-only lifecycle trail. Written in the same transaction as the status
+// change, so a ticket's current status can always be reconciled against its
+// history — there is no update or delete path for these rows.
+model TicketStatusHistory {
+  id       String @id @default(uuid())
+  ticketId String
+
+  /// Null only for the synthetic first row that records creation at NEW.
+  fromStatus TicketStatus?
+  toStatus   TicketStatus
+
+  changedById String
+
+  /// Optional agent-supplied justification. Plain text, bounded.
+  note String?
+
+  createdAt DateTime @default(now())
+
+  ticket    Ticket @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  changedBy User   @relation("TicketStatusChangedBy", fields: [changedById], references: [id], onDelete: Cascade)
+
+  @@index([ticketId, createdAt(sort: Desc), id(sort: Desc)])
+  @@index([changedById])
+}
+
+// Requester satisfaction. At most ONE per ticket (`ticketId` is UNIQUE) and
+// submittable only by the requester on a RESOLVED or CLOSED ticket — enforced in
+// the service, since neither rule is expressible here.
+model TicketSatisfaction {
+  id       String @id @default(uuid())
+  ticketId String @unique
+
+  submittedById String
+
+  /// 1..5, bounded by a DB CHECK as well as by the DTO.
+  rating Int
+
+  /// Optional free-text comment. Plain text, bounded.
+  comment String?
+
+  createdAt DateTime @default(now())
+
+  ticket      Ticket @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  submittedBy User   @relation("TicketSatisfactionSubmittedBy", fields: [submittedById], references: [id], onDelete: Cascade)
+
+  @@index([submittedById])
+}
+
+// ============================================================================
+// PHASE 49H — SURVEYS / PARTICIPATION
+//
+// Scope of the model, and why it stops where it does:
+//
+// PARTICIPANT TARGETING = BOUNDED. Eligibility is "every authenticated user in
+// the survey's tenant". Core has NO group, unit or membership model —
+// `User.department` is a free-text label, not a membership edge, and
+// `User.managerId` is a single pointer, not an org tree with closure. Any
+// narrower targeting would require inventing organization infrastructure, which
+// is out of scope, so no participant/assignment table exists here. When targeting
+// is approved later it becomes an additive join table; nothing in this schema
+// pretends to support it today.
+//
+// ANONYMITY (COL-013). `Survey.isAnonymous` changes ONLY what results expose. The
+// respondent is ALWAYS recorded on `SurveyResponse.userId`, because duplicate
+// prevention is a UNIQUE constraint on (surveyId, userId) and that is not
+// expressible without storing identity. So an anonymous survey is
+// "identity-withheld from result viewers", NOT "cryptographically unlinkable",
+// and neither the schema nor the UI may claim otherwise.
+//
+// Deliberately absent: response drafts/partial submissions (a response is
+// created whole, in one transaction, or not at all), post-submit edit metadata
+// (`editedAt`) since responses are immutable, per-question conditional logic,
+// weights/scoring, quotas, reminder schedules, and survey attachments — no
+// approved requirement asks a respondent to upload a file, so SURVEY
+// ATTACHMENTS = NOT REQUIRED and no storage column exists.
+// ============================================================================
+
+// One survey.
+//
+// `tenantId` is a snapshot of the creator's tenant and is the isolation key for
+// every read and write. It is never projected to the client.
+model Survey {
+  id       String  @id @default(uuid())
+  tenantId String?
+
+  /// Plain text, bounded by a DB CHECK as well as by the DTO.
+  title       String
+  description String?
+
+  status SurveyStatus @default(DRAFT)
+
+  /// Results hide respondent identity when true. Immutable after publication:
+  /// flipping it on a survey that already has responses would retroactively
+  /// change the privacy promise participants answered under.
+  isAnonymous Boolean @default(false)
+
+  /// Optional availability window, honoured only while status is PUBLISHED. A
+  /// DB CHECK enforces endsAt > startsAt; the service enforces the window on
+  /// every participation attempt, so a still-PUBLISHED but expired survey
+  /// cannot be answered.
+  startsAt DateTime?
+  endsAt   DateTime?
+
+  /// Set when status first reaches PUBLISHED / CLOSED. Never cleared, because
+  /// neither transition can be undone.
+  publishedAt DateTime?
+  closedAt    DateTime?
+
+  createdById String
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  createdBy User @relation("SurveyCreatedBy", fields: [createdById], references: [id], onDelete: Cascade)
+
+  questions SurveyQuestion[]
+  responses SurveyResponse[]
+
+  // Serves the tenant-scoped list, newest first, and the status facet.
+  @@index([tenantId, createdAt(sort: Desc), id(sort: Desc)])
+  @@index([tenantId, status, createdAt(sort: Desc), id(sort: Desc)])
+  @@index([createdById])
+}
+
+// One question. Ordering is explicit (`order`), never inferred from insertion or
+// from the id, so a reordered questionnaire renders identically everywhere.
+model SurveyQuestion {
+  id       String @id @default(uuid())
+  surveyId String
+
+  type SurveyQuestionType
+
+  /// Plain text, bounded by a DB CHECK as well as by the DTO.
+  text String
+
+  isRequired Boolean @default(true)
+
+  /// 1-based position inside the survey. UNIQUE per survey, so two questions can
+  /// never claim the same slot.
+  order Int
+
+  /// MULTIPLE_CHOICE only: upper bound on how many options may be selected.
+  /// Null means "no explicit maximum" — the option count is then the bound. A
+  /// DB CHECK keeps it null for every other type, so no other question shape can
+  /// carry a meaningless cardinality.
+  maxSelections Int?
+
+  createdAt DateTime @default(now())
+
+  survey  Survey         @relation(fields: [surveyId], references: [id], onDelete: Cascade)
+  options SurveyOption[]
+  answers SurveyAnswer[]
+
+  @@unique([surveyId, order])
+  @@index([surveyId, order])
+}
+
+// One selectable option for a choice question. Belongs to exactly one question,
+// which is what makes "option from another survey" structurally detectable: the
+// service resolves every submitted optionId through its questionId.
+model SurveyOption {
+  id         String @id @default(uuid())
+  questionId String
+
+  /// Plain text, bounded by a DB CHECK as well as by the DTO.
+  label String
+
+  order Int
+
+  createdAt DateTime @default(now())
+
+  question SurveyQuestion @relation(fields: [questionId], references: [id], onDelete: Cascade)
+  answers  SurveyAnswer[]
+
+  @@unique([questionId, order])
+  @@index([questionId, order])
+}
+
+// One participation. At most ONE per (survey, user) — the UNIQUE constraint is
+// the arbiter, so two concurrent submissions cannot both succeed regardless of
+// what the application layer does.
+//
+// `userId` is stored even for an anonymous survey (see the block comment above):
+// it is required for duplicate prevention. Result projections never select it.
+model SurveyResponse {
+  id       String  @id @default(uuid())
+  surveyId String
+  userId   String
+  /// Snapshot of the respondent's tenant at submission time, so a later tenant
+  /// move cannot retroactively relocate a response.
+  tenantId String?
+
+  createdAt DateTime @default(now())
+
+  survey Survey @relation(fields: [surveyId], references: [id], onDelete: Cascade)
+  user   User   @relation("SurveyResponseUser", fields: [userId], references: [id], onDelete: Cascade)
+
+  answers SurveyAnswer[]
+
+  @@unique([surveyId, userId])
+  @@index([surveyId, createdAt(sort: Desc), id(sort: Desc)])
+  @@index([userId])
+}
+
+// One answer to one question inside one response.
+//
+// Exactly one value column is populated, decided by the question type and
+// enforced by the `SurveyAnswer_one_value` CHECK:
+//   SINGLE_CHOICE / MULTIPLE_CHOICE → optionId
+//   TEXT                            → textValue
+//   RATING                          → ratingValue (1..5, CHECKed)
+//
+// A MULTIPLE_CHOICE question produces one row per selected option; every other
+// type produces exactly one row. Both invariants are database-enforced by two
+// partial unique indexes declared in the migration (Prisma cannot express a
+// partial index): one on (responseId, questionId, optionId) for choice answers,
+// and one on (responseId, questionId) WHERE optionId IS NULL for the rest.
+model SurveyAnswer {
+  id         String @id @default(uuid())
+  responseId String
+  questionId String
+
+  optionId    String?
+  /// Plain text, bounded by a DB CHECK as well as by the DTO.
+  textValue   String?
+  ratingValue Int?
+
+  createdAt DateTime @default(now())
+
+  response SurveyResponse @relation(fields: [responseId], references: [id], onDelete: Cascade)
+  question SurveyQuestion @relation(fields: [questionId], references: [id], onDelete: Cascade)
+  /// Restrict, not Cascade: an option that has been answered cannot be deleted
+  /// out from under the aggregate. Editing a published survey's options is
+  /// refused by the service for the same reason.
+  option   SurveyOption?  @relation(fields: [optionId], references: [id], onDelete: Restrict)
+
+  @@index([responseId, questionId])
+  // Serves the aggregate: WHERE questionId GROUP BY optionId.
+  @@index([questionId, optionId])
+}
+
+// ============================================================================
+// Phase 49I: Personal Reminders (Calendar).
+//
+// SCOPE DECISION, stated explicitly because it is the narrowest reading of the
+// approved contract: this phase adds ONE table. `CalendarEvent`,
+// `CalendarParticipant` and `Holiday` are NOT created here.
+//
+//  - A reminder is PERSONAL. It has exactly one owner, no participants and no
+//    invitation flow, so a participant table would have no writer.
+//  - Iranian holiday data has no authoritative source in this repository, and the
+//    contract forbids fabricating one. A `Holiday` table with no rows in it is a
+//    schema commitment bought with nothing, so it is deferred until the source
+//    exists.
+//  - Organization/department events need an organizational membership edge Core
+//    does not have (`User.department` is a free-text label, exactly as 49F noted
+//    when it deferred department messaging). Modelling them now would encode a
+//    boundary that cannot yet be enforced.
+//
+// Deliberately absent from the model below: recurrence (RRULE/interval/count),
+// snooze state, per-channel delivery rows (email/SMS/push), attachments,
+// categories/tags, sharing or delegation, and any worker/queue/lock table. The
+// reminder is claimed with a conditional UPDATE on its own row (see
+// `deliveredAt`), so exactly-once delivery needs no second table.
+// ============================================================================
+
+/// One personal reminder, owned by exactly one user.
+///
+/// `dueAt` is the CANONICAL, timezone-aware instant. The Jalali date and the
+/// wall-clock time the user typed are NEVER stored: they are inputs that
+/// `jalali.util.ts` resolves in `Asia/Tehran` before this row is written, and the
+/// UI re-derives them for display. There is therefore exactly one authoritative
+/// representation of when a reminder fires.
+model Reminder {
+  id     String @id @default(uuid())
+  userId String
+
+  /// Snapshot of the owner's tenant at creation time, matching Notification
+  /// (49E) and Ticket (49G). Used only to keep reads tenant-consistent; never
+  /// projected to the client.
+  tenantId String?
+
+  /// Plain text, bounded by a DB CHECK as well as by the DTO.
+  title String
+  note  String?
+
+  /// The instant the reminder fires. For an all-day reminder this is the
+  /// approved day-level anchor — the start of that Jalali day in Asia/Tehran —
+  /// so a single indexed column serves both modes and no second timezone model
+  /// is introduced.
+  dueAt DateTime
+
+  /// True when the user asked for "تمام روز" and supplied no clock time.
+  allDay Boolean @default(false)
+
+  /// A disabled reminder is skipped by the dispatcher but is NOT deleted, so
+  /// re-enabling it restores the original schedule.
+  enabled Boolean @default(true)
+
+  /// Delivery claim + delivery proof in one column.
+  ///
+  /// The dispatcher claims a due reminder with
+  ///   UPDATE ... SET "deliveredAt" = now() WHERE id = $1 AND "deliveredAt" IS NULL
+  /// and only the transaction whose update reports one affected row goes on to
+  /// create the Notification. A second worker, a restart mid-tick, a retry or a
+  /// duplicate poll all observe a non-null value and do nothing — so delivery is
+  /// idempotent without an advisory lock, a queue or a job table.
+  ///
+  /// Cleared when the owner edits `dueAt` forward, which is the only way a
+  /// delivered reminder can ever fire again.
+  deliveredAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  /// Serves the two owner-facing reads: reminders for a selected day
+  /// (`userId` + half-open dueAt range) and the bounded upcoming list.
+  @@index([userId, dueAt])
+  /// Serves the dispatcher's due scan. Leading with the two boolean-ish
+  /// predicates keeps the scan on the small "pending" side of the table instead
+  /// of walking every reminder ever created. The migration additionally declares
+  /// a PARTIAL index on dueAt WHERE enabled AND deliveredAt IS NULL, which
+  /// Prisma cannot express and which is what the tick actually uses.
+  @@index([enabled, deliveredAt, dueAt])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase 49I-1: Official Iranian occasions & holidays (Calendar reference data).
+//
+// SCOPE: this is the AUTHORITATIVE-DATASET layer promised — but deferred — by the
+// 49I comment above ("no authoritative source … at that time"). It is reference
+// data, not user data: rows are seeded by migration from the published official
+// Iranian calendar, are read by every authenticated user, and are never modified
+// through an HTTP surface. There is deliberately no `userId`, no `tenantId` and
+// no owner: an official occasions row is platform-global state, exactly like the
+// RBAC `Permission` catalogue (which is also seeded by migration and has no
+// service route).
+//
+// WHY A TABLE AND NOT A HARD-CODED MAP: the 49I-1 contract forbids a client-side
+// or component-local list because a new year's dataset would require a code
+// change. A row per (Jalali date, title) means a new Jalali year is a new seed
+// migration and nothing else.
+//
+// WHY THE DATES ARE SPLIT INTO FIELDS: the wire contract is `YYYY/MM/DD`
+// (`jalaliDate`, Latin digits), which also serves as identity. The jy/jm/jd
+// integers exist solely so a month view is ONE indexed range query
+// (`WHERE jy = ? AND jm = ?`) — the "no N+1, one bounded query per calendar
+// month" requirement of 49I-1.
+//
+// FRIDAY IS NOT A HOLIDAY ROW. The weekly Friday closure is derived at render
+// time from the day's weekday (see `isSpecialRedHoliday` in the web client).
+// Seeding `روز جمعه` as an `isHoliday` record would make Friday look like an
+// official holiday — the exact conflation the contract forbids.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Broad category of an occasion, used only for display grouping. A text
+/// column is deliberately NOT used: the catalogue is tiny and closed, and an
+/// enum keeps the vocabulary in one place.
+enum OccasionCategory {
+  NATIONAL
+  RELIGIOUS
+  INTERNATIONAL
+  OTHER
+}
+
+/// One official Iranian occasion, from the published official calendar.
+///
+/// `isHoliday` is the DATA answer to "is this a state holiday". It is never
+/// derived from the weekday: whether Friday also happens to be the weekly
+/// closure is a presentation concern applied at render time (49I-1 §FRIDAY
+/// LOGIC), not a property of this row.
+model CalendarOccasion {
+  /// Database id, never exposed on the wire (the date is the public identity).
+  id String @id @default(uuid())
+
+  /// Canonical Jalali date in the wire form `YYYY/MM/DD`, Latin digits.
+  jalaliDate String @db.VarChar(10)
+  /// Integer components for the single bounded month range scan.
+  jy Int
+  jm Int
+  jd Int
+
+  /// Official title, exactly as published. Bounded by a DB CHECK as well as
+  /// by the seeding tool.
+  title String
+  /// Optional clarification published with the occasion (e.g. the lunar date).
+  description String?
+
+  /// Official non-holiday? `false` means an ordinary commemoration that is not
+  /// a closure (e.g. روز ملی خلیج فارس), `true` means the date is one of the
+  /// country's official closures.
+  isHoliday Boolean @default(false)
+
+  category OccasionCategory @default(OTHER)
+
+  /// Provenance: which published calendar this row comes from, and which Jalali
+  /// year that calendar is for. Both are data, never a comment.
+  source String
+  sourceYear Int
+
+  /// Higher values float to the top of a multi-occasion day.
+  sortOrder Int @default(0)
+
+  /// Seeded rows are always active; the flag exists so a correction can retire
+  /// a row without deleting evidence of the published dataset.
+  isActive Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  /// A date/source/title triple is one fact. Prevents accidentally re-inserting
+  /// a full duplicate of the same published occasion.
+  @@unique([jalaliDate, source, title])
+  /// The month-view range scan (49I-1 "one bounded date-range query per month").
+  @@index([jy, jm])
+  /// Lets a year rollover delete/retire an old dataset by (source, sourceYear).
+  @@index([source, sourceYear])
+  /// Lets a caller ask "was that day working" cheaply when only the flag matters.
+  @@index([jy, jm, isHoliday])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase 49J-0: AI provider configuration.
+//
+// Declared next to its model rather than with the enums at the top of the file,
+// matching how NotificationType / ConversationType / Ticket* / Survey* are each
+// declared adjacent to the feature they belong to.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The providers that ACTUALLY EXIST in src/ai. There are four implementations —
+/// OpenAIProvider, AzureOpenAIProvider, ClaudeProvider, LocalLLMProvider — and
+/// therefore four members. A fifth member (Mistral, Gemini, …) would let an
+/// operator select a provider the registry cannot construct, turning a config
+/// save into a runtime 500 at first use; the enum is deliberately kept in step
+/// with the code instead.
+enum AIProviderKey {
+  OPENAI
+  AZURE_OPENAI
+  ANTHROPIC
+  LOCAL
+}
+
+/// Capabilities are configured INDEPENDENTLY, which is the whole point of this
+/// table. Embeddings and text generation are different models with different
+/// widths, prices and support matrices: OpenAI can embed today while nothing can
+/// generate text yet, and Claude can never embed. A single "active provider"
+/// field cannot express that, so selection is always (capability → provider).
+enum AICapability {
+  TEXT_GENERATION
+  EMBEDDING
+}
+
+/// One configured provider/model pair, PLATFORM-GLOBAL on purpose.
+///
+/// There is no `tenantId`: the credential here is the operator's own API key and
+/// the model choice is an infrastructure decision, not tenant content. A
+/// per-tenant column would imply tenants may supply keys and that a missing
+/// tenant row falls back to the platform's — a billing and isolation model this
+/// phase does not build.
+///
+/// NO ACTOR COLUMN. Who created or changed a row lives in "AuditLog" (actions
+/// AI_PROVIDER_CREATED / UPDATED / ENABLED / DISABLED / SELECTED /
+/// CONNECTION_TESTED). A `createdById` FK would additionally mean deleting an
+/// administrator either cascades away platform configuration or leaves a
+/// dangling column; neither is worth duplicating the audit trail.
+model AIProviderConfig {
+  id String @id @default(uuid())
+
+  provider   AIProviderKey
+  capability AICapability
+
+  /// Provider-side model identifier, e.g. `text-embedding-3-small`. Not an enum:
+  /// vendors add and retire model names continuously, and a schema migration is
+  /// the wrong unit of change for that.
+  modelName String
+
+  /// Optional endpoint override — the Azure resource URL, a self-hosted
+  /// OpenAI-compatible gateway, the local server. Null means the provider's own
+  /// default, read from env as it is today.
+  baseUrl String?
+
+  /// Disabled rows are configuration in waiting: resolvable by the admin UI,
+  /// never selected at runtime. Default false so creating a row cannot silently
+  /// redirect live traffic.
+  enabled Boolean @default(false)
+
+  /// The row runtime resolution picks for this capability. Guarded by a PARTIAL
+  /// unique index declared in the migration (`WHERE "isDefault"`), which Prisma
+  /// cannot express: it permits many non-default rows per capability and exactly
+  /// one default.
+  isDefault Boolean @default(false)
+
+  /// AES-256-GCM envelope for the API key. Three columns because GCM needs all
+  /// three to decrypt AND to authenticate; storing ciphertext alone would make
+  /// tampering undetectable. The plaintext key is never stored, never logged and
+  /// never returned by any endpoint — GET masks it, and an update that omits the
+  /// key leaves these columns untouched.
+  ///
+  /// Nullable as a set: a LOCAL provider on a trusted network legitimately has
+  /// no credential.
+  credentialCiphertext String?
+  credentialIv         String?
+  credentialAuthTag    String?
+
+  /// When the credential was last written. Lets the UI show "a key is stored,
+  /// changed on <date>" without reading, decrypting or transmitting the key.
+  credentialUpdatedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  /// One row per provider/capability pair. Two competing OpenAI embedding
+  /// configurations differing only by model would make "the active one"
+  /// ambiguous; editing the single row is the intended way to change model.
+  @@unique([provider, capability])
+  /// Serves the only hot read: resolve the enabled default for a capability.
+  @@index([capability, enabled])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase 49J: Global Search projection.
+//
+// Declared next to its model, matching how every other feature's enums are
+// declared adjacent to the feature they belong to.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The sources Global Search actually indexes. Exactly the A-class (lexical +
+/// semantic: TICKET, TICKET_COMMENT, SURVEY, MESSAGE) and B-class (lexical-only:
+/// CONVERSATION, NOTIFICATION, REMINDER, USER) sources — no member exists without
+/// a working indexer, because an enum member with no indexer is a promise the code
+/// does not keep.
+///
+/// Deliberately absent: CMS `BlogPost`, `SurveyQuestion.text` and
+/// `SurveyAnswer.textValue` (deferred — the first lives in a different database
+/// with its own Prisma client, the other two are answer content whose exposure
+/// rules are not settled), and `Lead` / `Meeting` (excluded — pre-Core marketing
+/// data with no tenant edge).
+///
+/// `EXTERNAL` (Phase P-SEARCH-SOURCE) is NOT a business source. It is the single
+/// marker for rows contributed by an INDEPENDENT bounded context through the
+/// Platform Search Source contract (`src/platform/search-source/`), whose own
+/// database this process may not read. Such a row carries its contributing
+/// source in `SearchDocument.sourceKey`; its identity is (`sourceKey`,
+/// `sourceId`) — see the model below. One marker rather than one member per
+/// future module, deliberately: the platform must not grow a compile-time
+/// vocabulary (and a per-member ranking weight) for every module that later
+/// participates, and the authorization rule for these rows is not a platform
+/// switch case but the owning bounded context's own adapter.
+enum SearchSourceType {
+  TICKET
+  TICKET_COMMENT
+  SURVEY
+  MESSAGE
+  CONVERSATION
+  NOTIFICATION
+  REMINDER
+  USER
+  EXTERNAL
+}
+
+/// One searchable projection of one business row.
+///
+/// A CACHE, NEVER A SOURCE OF TRUTH. Fully rebuildable from the business tables,
+/// keyed by (`sourceType`, `sourceKey`, `sourceId`), and holding NO relation to
+/// any model — so it can be truncated and rebuilt at will, and deleting a ticket
+/// is never blocked or slowed by a search row.
+///
+/// THE INDEX IS NOT AN AUTHORIZATION BOUNDARY. There is no `ownerId`, `authorId`,
+/// `conversationId` or `isInternal` column here. A candidate found in this table is
+/// re-read from its authoritative row and put through that source's own rule
+/// (conversation membership, ticket participation or `admin.support.manage`, survey
+/// publication window, notification/reminder ownership, the Directory policy)
+/// before it can appear in a response. A denormalised owner column would become a
+/// de-facto ACL that silently goes stale.
+///
+/// NO RAW TEXT. `searchText` is a lossy, normalized derivative used only to build
+/// the tsvector; snippets are cut from the authoritative row AFTER it passes
+/// authorization, so a snippet can never be stale and this table never becomes a
+/// second, less-guarded copy of private content.
+///
+/// NEVER PROJECTED HERE (E-class): `AuditLog`, `AIProviderConfig` and its
+/// credential columns, attachment/storage object keys, refresh-token /
+/// password-reset / email-verification records, `User.passwordHash`,
+/// `User.tokenVersion`, `Tenant` internals.
+model SearchDocument {
+  id String @id @default(uuid())
+
+  sourceType SearchSourceType
+  sourceId   String
+
+  /// Which registered source contributed this row.
+  ///
+  /// EMPTY STRING for the platform's own sources (TICKET, MESSAGE, …): their
+  /// identity is `sourceType` alone, and every write path spells that out rather
+  /// than leaving the column unaddressed, so a platform row can never be mistaken
+  /// for an external one.
+  ///
+  /// NON-EMPTY only for `sourceType = EXTERNAL`: the stable key the contributing
+  /// bounded context registered with the Platform Search Source contract
+  /// (`SearchSourceDescriptor.key`, e.g. `commerce.purchase-document`). It is what
+  /// lets TWO external sources each hold a row for the same `sourceId` without
+  /// colliding, and it is how the query path dispatches authorization to the
+  /// owning source's adapter — the index itself is still not an authorization
+  /// boundary.
+  sourceKey String @default("")
+
+  /// Tenant snapshot copied from whatever the source treats as its isolation key
+  /// (`Ticket.tenantId`, `Conversation.tenantId` for a MESSAGE, …).
+  ///
+  /// EXACT-EQUALITY SEMANTICS: `null` is its own bucket, not a wildcard. Reads use
+  /// `IS NULL` for a null-tenant caller and `= tenant` otherwise, never
+  /// `IS NULL OR = tenant`, which would leak across tenants.
+  tenantId String?
+
+  /// Normalized searchable text from `src/search/persian-normalize.ts`
+  /// (`buildSearchText`): folded, ZWNJ-stripped, clitic-attached, lowercased. A DB
+  /// CHECK (`SearchDocument_searchText_nonblank`) rejects a blank value — such a
+  /// row could never match anything.
+  searchText String
+
+  /// GENERATED ALWAYS AS (to_tsvector('simple'::regconfig, "searchText")) STORED.
+  ///
+  /// `Unsupported` because Prisma has no `tsvector` scalar, and OPTIONAL because
+  /// the database computes it: no write path may ever supply a value. It is never
+  /// read through the client either — the lexical query is raw SQL, the only way to
+  /// use `@@`, `plainto_tsquery` and `ts_rank_cd`.
+  ///
+  /// `simple`, not `arabic`: the Arabic stemmer over-stems Persian
+  /// (`کارکنان` → `کارکن`). The explicit `::regconfig` cast is required for the
+  /// generated expression to be IMMUTABLE.
+  searchVector Unsupported("tsvector")?
+
+  /// pgvector embedding, 1536 dimensions — the contract of the embedding provider
+  /// wired in 49J-A (`text-embedding-3-small`).
+  ///
+  /// `Unsupported` because Prisma has no `vector` scalar; written and read through
+  /// raw SQL only. NULL means "no embedding exists", the honest state whenever no
+  /// provider credential is configured: such a row is lexically searchable and
+  /// semantically invisible. No zero vector and no random vector is ever written —
+  /// a zero vector has a defined cosine distance to everything and would
+  /// manufacture confident nonsense.
+  embedding Unsupported("vector(1536)")?
+
+  /// The model that produced `embedding`, for invalidation: vectors from two
+  /// different models are not comparable. Null exactly when `embedding` is null,
+  /// enforced by the `SearchDocument_embedding_complete` CHECK.
+  embeddingModel String?
+
+  /// When the vector was written. Null exactly when `embedding` is null (same
+  /// CHECK).
+  embeddedAt DateTime?
+
+  /// `updatedAt` of the source row at projection time, so a rebuild can skip
+  /// unchanged rows. Immutable sources (`Message`, `Notification`,
+  /// `TicketComment`) supply their `createdAt`.
+  sourceUpdatedAt DateTime
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  // Three indexes CANNOT be expressed here and live in the migration instead,
+  // documented the same way "Reminder_pending_dueAt_idx" (49I) is:
+  //   SearchDocument_searchVector_idx        GIN  ("searchVector")
+  //   SearchDocument_embedding_idx           HNSW ("embedding" vector_cosine_ops)
+  //   SearchDocument_pending_embedding_idx   partial, WHERE "embedding" IS NULL
+  // Prisma cannot declare an index on an `Unsupported` column, an access method
+  // outside the set it knows, or a partial index.
+
+  /// One projection row per source row — the dedupe key, and what makes the indexer
+  /// an upsert rather than delete-then-insert. `sourceKey` participates because an
+  /// external source's entity ids are its own: two bounded contexts may legitimately
+  /// both project an id `abc`, and (`sourceType`, `sourceId`) alone would collapse
+  /// them into one row. For platform rows `sourceKey` is `''`, so the key degenerates
+  /// to the historical (`sourceType`, `sourceId`) pair.
+  @@unique([sourceType, sourceKey, sourceId])
+  /// Tenant isolation plus the optional `sourceType` facet, in the order the WHERE
+  /// clause applies them.
+  @@index([tenantId, sourceType])
+  /// The indexer's staleness scan and per-source rebuild.
+  @@index([sourceType, sourceUpdatedAt])
+}
+
+// ============================================================================
+// Phase 49K: Core Experience Platform — user-scoped preferences.
+//
+// SCOPE DECISION, stated explicitly because it is the narrowest reading of the
+// approved contract: this phase adds ONE table and three enums.
+// `DashboardWidget`, `UserFavorite` and `UserRecentItem` are NOT created.
+//
+//  - The widget CATALOGUE is code, not data: a widget exists only if a React
+//    component renders it, so a `DashboardWidget` table could never hold a row the
+//    frontend did not already declare. Persisting the catalogue would let a write
+//    save a widget id nothing can render — the same failure mode the
+//    `AIProviderKey` comment rejects for providers. What IS user data is the
+//    LAYOUT (order and visibility) of the widgets that already exist, and that
+//    lives in `dashboardLayout` below.
+//  - Favorites and recent items are BOUNDED, ORDERED lists of navigation hrefs
+//    that already exist in `core-nav.ts`. A row-per-favorite table would buy
+//    referential integrity against a target Core has no table for — an href is not
+//    an entity — while costing a join on every shell render.
+//
+// Deliberately absent: per-widget refresh intervals, dashboard sharing or
+// templates, saved filters, keyboard-shortcut remapping, notification channel
+// preferences (49E has no channel model), and any role- or tenant-level default.
+// Each of those is a product decision this phase has no contract for.
+//
+// NO `locale` COLUMN, and that is the most deliberate omission here.
+// `apps/web/src/lib/i18n.ts` is a `t()` helper consumed by exactly ONE marketing
+// component (`PageSections.tsx`); every Core string is hardcoded Persian in the
+// component that renders it, and there is no locale provider or locale routing. A
+// persisted locale would be a value nothing reads — a switch that changes a column
+// and not the interface. It is added when real localization is, and not before.
+//
+// NO `tenantId` SNAPSHOT, unlike Notification (49E) and Reminder (49I). Those two
+// carry one because they have LIST reads that must stay tenant-consistent. A
+// preference read is a single-row lookup on a UNIQUE `userId` that is always the
+// authenticated caller's own id, so a tenant column would participate in no
+// predicate and no index — and a user who moves between tenants should keep their
+// own theme rather than silently lose it.
+//
+// NO new permission and NO grant, for the same reason 49I introduced none: setting
+// one's own theme is an ordinary authenticated-user capability, enforced by
+// ownership. RBAC still decides which WIDGETS and which NAV ENTRIES a saved layout
+// may resolve to — the preference row is never the authority.
+// ============================================================================
+
+/// Appearance mode. Three members, because "follow the operating system" is a
+/// distinct intent from "light": today's ThemeProvider consults
+/// `prefers-color-scheme` only while nothing is stored, so the first toggle makes
+/// the choice permanently sticky with no way back. SYSTEM is that way back.
+enum ThemePreference {
+  SYSTEM
+  LIGHT
+  DARK
+}
+
+/// Spacing scale. Two members only, matching the two spacing token sets the shell
+/// defines; a third member would name a density no stylesheet implements.
+enum UIDensity {
+  COMFORTABLE
+  COMPACT
+}
+
+/// Animation policy.
+///
+/// SYSTEM defers to `prefers-reduced-motion`, REDUCED forces reduction regardless
+/// of the OS, and FULL forces animation regardless of it. FULL exists because the
+/// OS switch is global: a user who enabled it for one hostile application should
+/// not be unable to opt back in here. The default is SYSTEM, so an untouched
+/// account honours the OS preference — which the Core shell currently fails to do
+/// at all.
+enum MotionPreference {
+  SYSTEM
+  REDUCED
+  FULL
+}
+
+/// One preferences row per user, covering appearance, accessibility, navigation,
+/// dashboard layout and productivity lists.
+///
+/// ONE TABLE, not five. Every column here is read together on exactly one
+/// occasion — the first render of the Core shell — so splitting them across an
+/// `AppearancePreference`, an `AccessibilityPreference` and so on would turn a
+/// single-row lookup into four joins to reconstruct one object, with four rows to
+/// keep consistent and four chances for a partial write. The grouping is expressed
+/// in the column names and in the section comments below instead.
+///
+/// THE ROW IS OPTIONAL. A user who has never changed a setting has NO row, and the
+/// service returns the code-level defaults rather than creating one on read: a GET
+/// must not write. The row appears on the first PATCH (upsert), so the table's size
+/// tracks users who actually personalised something.
+///
+/// EVERY COLUMN IS SELF-DESCRIBING AND NON-AUTHORITATIVE. Nothing here grants
+/// access. `dashboardLayout` and `navFavorites` name widgets and hrefs, and both are
+/// re-filtered against the caller's live permissions on every read — so a layout
+/// saved while a permission was held stops resolving the moment it is revoked,
+/// without an error and without a migration to clean it up.
+model UserPreference {
+  id String @id @default(uuid())
+
+  /// UNIQUE, not just indexed: one row per user is the invariant that makes the
+  /// write an upsert rather than a find-then-branch, and it is what prevents two
+  /// concurrent first-PATCHes from creating two preference rows for one user.
+  userId String @unique
+
+  // ── Appearance ────────────────────────────────────────────────────────────
+  /// Default SYSTEM so an untouched account behaves exactly as the current
+  /// pre-paint script does today: follow the OS.
+  theme   ThemePreference @default(SYSTEM)
+  density UIDensity       @default(COMFORTABLE)
+
+  // ── Accessibility ─────────────────────────────────────────────────────────
+  /// Root font-size percentage. An Int rather than an enum because it is a
+  /// numeric quantity the stylesheet divides by 100, and because widening the
+  /// allowed set later must not require an enum migration. The four supported
+  /// steps (100 / 110 / 125 / 140) are enforced by the DTO and by the
+  /// `UserPreference_textScale_allowed` CHECK; values between them are refused
+  /// rather than rounded, so what is stored is always a step the UI can render.
+  textScale Int @default(100)
+
+  motion MotionPreference @default(SYSTEM)
+
+  // ── Navigation ────────────────────────────────────────────────────────────
+  /// Whether the desktop rail starts collapsed. Today this is React state in
+  /// `CoreShell`, so it resets on every reload; persisting it is the entire fix.
+  /// Irrelevant below the `lg:` breakpoint, where the sidebar is a drawer.
+  sidebarCollapsed Boolean @default(false)
+
+  /// Pinned navigation hrefs, in user-chosen display order — which is why this is
+  /// an ordered `String[]` and not a set. Bounded to 12 entries by the
+  /// `UserPreference_navFavorites_bounded` CHECK, and to hrefs that exist in
+  /// `core-nav.ts` by the service — a CHECK can count the list but cannot know the
+  /// navigation tree. RBAC is re-applied on every read.
+  navFavorites String[] @default([])
+
+  /// Most-recently-visited hrefs, newest first, bounded to 10 by the
+  /// `UserPreference_navRecent_bounded` CHECK and trimmed to that length by the
+  /// service on write, so the column cannot grow without limit.
+  ///
+  /// SECURITY-SENSITIVE ROUTES ARE NEVER RECORDED HERE. Security events and login
+  /// history are audit surfaces, not navigation history: a "recent" entry pointing
+  /// at them would turn a convenience list into a second, unaudited trace of who
+  /// looked at the audit trail. The exclusion is enforced in the service.
+  navRecent String[] @default([])
+
+  // ── Dashboard ─────────────────────────────────────────────────────────────
+  /// Widget order and visibility: `[{ "id": "notifications", "visible": true }, …]`.
+  ///
+  /// JSON, following `AuditLog.oldValue`/`newValue`/`changes` — the existing
+  /// precedent in this schema for a shape the database does not need to query. It
+  /// is only ever read as a whole for one user and never filtered, sorted or joined
+  /// on, so a relational widget-instance table would add a join and a second write
+  /// path for a value that has exactly one consumer.
+  ///
+  /// NULL means "never customised" and resolves to the registry's default order —
+  /// which is NOT the same as an empty array, "every widget hidden". Both are legal
+  /// and they are kept distinguishable on purpose.
+  ///
+  /// UNKNOWN WIDGET IDS ARE IGNORED ON READ, not rejected: a widget removed from
+  /// the registry in a later release must not make a saved layout unloadable. The
+  /// registry is the source of truth; this column only orders what it declares.
+  ///
+  /// The `UserPreference_dashboardLayout_is_array` CHECK guarantees the value is a
+  /// JSON array whenever it is not NULL, so the read path can iterate it without
+  /// first re-checking its shape. Per-entry validation belongs to the DTO.
+  dashboardLayout Json?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  /// Cascade: preferences are personal, so deleting the owner deletes them. Same
+  /// rule as `Notification.userId` (49E) and `Reminder.userId` (49I).
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // No @@index: `userId` is already backed by the unique constraint, and that is
+  // the ONLY predicate any query uses. There is no list read, no tenant filter and
+  // no sort, so a second index would be written on every PATCH and read by nothing.
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase 49L: Core Automation & Integration Platform.
+//
+// TWO TABLES, and deliberately only two: configuration and execution metadata.
+// Absent by decision, not omission: Workflow, WorkflowNode, WorkflowGraph,
+// AutomationEngine and any generic EventStore. The external engine owns the
+// workflow definition; duplicating it here would create two sources of truth for
+// a graph Aria never executes. There is also no queue/offset table — retry state
+// is two columns on the execution row, following "AuditDispatch".
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The integration targets that ACTUALLY EXIST in src/integrations. There is one
+/// adapter — N8nIntegrationProvider — and therefore one member. A speculative
+/// second member (ZAPIER, MAKE, TEMPORAL…) would let an operator save a
+/// configuration the registry cannot resolve, turning a successful save into a
+/// runtime failure on first dispatch. Same rule the `AIProviderKey` enum follows.
+enum IntegrationKey {
+  N8N
+}
+
+/// Delivery lifecycle of ONE outbound automation event.
+///
+/// Six members, and the set is closed on purpose:
+///   PENDING   — row created, no HTTP attempt has completed yet
+///   SENT      — the engine accepted the request (2xx) but reported no outcome
+///   ACCEPTED  — the engine acknowledged with an external execution reference
+///   RETRYING  — an attempt failed and attemptCount is still below maxAttempts
+///   COMPLETED — a signed callback reported success (terminal)
+///   FAILED    — attempts exhausted, or a signed callback reported failure (terminal)
+///
+/// There is no SKIPPED member: when an integration is absent or disabled nothing
+/// was promised, so `AutomationService.trigger` returns a non-persisted outcome
+/// instead of writing a row that no retry pass will ever look at.
+enum AutomationStatus {
+  PENDING
+  SENT
+  ACCEPTED
+  RETRYING
+  COMPLETED
+  FAILED
+}
+
+/// One configured integration target, PLATFORM-GLOBAL on purpose.
+///
+/// There is no `tenantId`, for the same reason "AIProviderConfig" has none: the
+/// endpoint and the shared secret are the operator's own infrastructure, not
+/// tenant content. A per-tenant column would imply tenants may register their own
+/// automation endpoints — an SSRF and billing surface this phase does not build.
+///
+/// NO ACTOR COLUMN. Who created, enabled or rotated a row lives in "AuditLog"
+/// (INTEGRATION_CREATED / UPDATED / ENABLED / DISABLED / SECRET_ROTATED /
+/// CONNECTION_TESTED). A `createdById` FK would mean deleting an administrator
+/// either cascades away platform configuration or leaves a dangling column.
+model IntegrationConfig {
+  id String @id @default(uuid())
+
+  /// UNIQUE: exactly one endpoint per integration. Two competing n8n rows would
+  /// make "the configured target" ambiguous, and every read here resolves by
+  /// integration key rather than by id.
+  integration IntegrationKey @unique
+
+  /// Origin only, e.g. `http://localhost:5678`. Validated against the SSRF guard
+  /// on every write AND again immediately before every dispatch, because the
+  /// allow-private-targets policy can change without the row changing.
+  baseUrl String
+
+  /// Path appended to `baseUrl` to reach the engine's webhook entry point. Stored
+  /// separately so the origin can be re-validated on its own, and so a path can
+  /// never smuggle a scheme or an authority past the guard.
+  webhookPath String
+
+  /// Disabled rows are configuration in waiting: visible to the admin UI, never
+  /// dispatched to. Default false so creating a row cannot silently start sending
+  /// production events to a half-built workflow.
+  enabled Boolean @default(false)
+
+  /// Per-attempt ceiling in milliseconds. Clamped in code to 1000-60000; the
+  /// `IntegrationConfig_timeoutMs_bounded` CHECK restates the same range so a
+  /// direct SQL write cannot install an unbounded timeout.
+  timeoutMs Int @default(10000)
+
+  /// Total delivery attempts for one event, INCLUDING the first. Clamped to 1-5;
+  /// `IntegrationConfig_maxAttempts_bounded` enforces it in SQL. There is no
+  /// "unlimited" encoding — that is the point of the column.
+  maxAttempts Int @default(3)
+
+  /// AES-256-GCM envelope for the HMAC shared secret. Three columns because GCM
+  /// needs all three to decrypt AND to authenticate; ciphertext alone would make
+  /// tampering undetectable. The plaintext is never stored, never logged and never
+  /// returned by any route — the single projection emits `hasSecret` only.
+  ///
+  /// Nullable as a set: a row may be created before its secret is generated, and
+  /// dispatch refuses to sign without one rather than sending unsigned events.
+  secretCiphertext String?
+  secretIv         String?
+  secretAuthTag    String?
+
+  /// When the secret was last written. Lets the UI show "a secret is stored,
+  /// rotated on <date>" without reading, decrypting or transmitting it.
+  secretUpdatedAt DateTime?
+
+  /// Outcome of the most recent connection test. Two values only, enforced by the
+  /// `IntegrationConfig_lastTestStatus_allowed` CHECK; a free-text column here
+  /// would end up holding an upstream error string, which is exactly what must
+  /// not be persisted or shown.
+  lastTestStatus String?
+  lastTestedAt   DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+/// Minimal normalized metadata for ONE outbound automation event.
+///
+/// WHAT IS DELIBERATELY NOT HERE: the event payload, the engine's execution log,
+/// node-level detail, request/response bodies, headers and the signature. Storing
+/// the payload would re-create the very data-minimisation problem the envelope
+/// exists to avoid, and storing the signature would persist a credential-derived
+/// value. `errorCode` is a short internal code, never an upstream message.
+model AutomationExecution {
+  id String @id @default(uuid())
+
+  integration IntegrationKey
+
+  /// The envelope's `eventId`, plus the contract fields a reader needs to make
+  /// sense of a delivery without the payload.
+  eventId      String
+  eventType    String
+  eventVersion Int
+  source       String
+
+  /// `<integration>:<eventId>:v<version>` — the §18 formula, materialised so the
+  /// uniqueness that makes a repeat dispatch a no-op is enforced by the DATABASE
+  /// rather than by a read-then-write race in the service.
+  idempotencyKey String @unique
+
+  /// Snapshot of the triggering context's tenant. NULL is its own bucket and is
+  /// never treated as "any tenant": every execution read applies the caller's
+  /// tenant predicate unconditionally, including when it is null.
+  tenantId String?
+
+  /// Who triggered it, when a human did. Plain column, NOT a foreign key — the
+  /// same rule "Notification.sourceId" follows: deleting a user must not cascade
+  /// away delivery history, and a dangling FK is worse than an opaque id.
+  actorId String?
+
+  /// Carried from `RequestContextService` so one identifier traces Aria request →
+  /// envelope → outbound request → callback → this row.
+  correlationId String?
+
+  status AutomationStatus @default(PENDING)
+
+  /// The engine's own execution id when it reports one. Opaque and display-only:
+  /// nothing in Aria resolves it against the engine's database.
+  externalExecutionId String?
+
+  /// Attempts made so far, bounded by the config's `maxAttempts`. The
+  /// `AutomationExecution_attemptCount_bounded` CHECK refuses a negative value.
+  attemptCount Int @default(0)
+
+  /// When the bounded retry pass may next claim this row. NULL means "not
+  /// retryable" — set for every terminal state, which is what keeps the retry
+  /// index small instead of scanning completed history.
+  nextAttemptAt DateTime?
+
+  /// Short internal code (`TIMEOUT`, `HTTP_502`, `UNREACHABLE`, `CALLBACK_FAILED`).
+  /// Never an upstream body: those can echo request content and occasionally
+  /// credential fragments.
+  errorCode String?
+
+  createdAt   DateTime  @default(now())
+  startedAt   DateTime?
+  completedAt DateTime?
+  updatedAt   DateTime  @updatedAt
+
+  /// Callback resolution looks a row up by (integration, eventId) — the pair the
+  /// external engine echoes back — so it is unique rather than merely indexed.
+  @@unique([integration, eventId])
+  /// The retry pass's only predicate: claimable rows ordered by due time. Partial
+  /// in the migration (`WHERE "nextAttemptAt" IS NOT NULL`), which Prisma cannot
+  /// express, so terminal rows are not in the index at all.
+  @@index([status, nextAttemptAt])
+  /// The admin list read: newest first within the caller's tenant.
+  @@index([tenantId, createdAt(sort: Desc), id(sort: Desc)])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase 49M: Core Distributed Module Platform.
+//
+// TWO TABLES, and the split between them IS the phase's central requirement:
+// "ModuleRegistration" is the LOGICAL module (one row per `moduleId`, owned by an
+// administrator), "ModuleInstance" is ONE DEPLOYED INSTANCE of it (one row per
+// `instanceId`, created by an authenticated self-registration). Conflating them
+// would make "where is finance?" unanswerable the moment a second instance exists,
+// and would put a deployment fact — an endpoint — on the logical identity.
+//
+// NOTHING HERE NAMES A BUSINESS MODULE. There is no HR table, no Finance table, no
+// employee/invoice column, and no enum member for either: a module exists because a
+// row exists, not because this schema was edited. That is what makes the platform
+// deployment-agnostic rather than a hard-coded topology.
+//
+// ABSENT BY DECISION, NOT OMISSION: any table describing a remote module's own
+// business data, a shared/federated entity table, a sync cursor table, a conflict
+// log, a service-mesh route table and a provisioning job table. §3 forbids coupling
+// modules through databases, and §36/§37/§38 ask for EXTENSION POINTS rather than
+// implementations — those live as types in src/module-platform/module-foundations.ts,
+// where they cost nothing until a phase actually needs them.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// What KIND of module this is — never WHERE it runs (that is `deploymentMode`).
+///
+/// Three members, all of which describe something that exists today: CORE is this
+/// process itself, INTEGRATION is an automation/gateway participant like the 49L
+/// engine, and BUSINESS is a domain module. BUSINESS is deliberately a single
+/// member rather than one per domain: an enum with HR/FINANCE members would make
+/// adding a module a schema migration and would invite exactly the
+/// `if (module === HR)` branch this phase exists to prevent.
+enum ModuleType {
+  CORE
+  BUSINESS
+  INTEGRATION
+}
+
+/// WHERE an instance is deployed. A DEPLOYMENT decision, never a domain decision.
+///
+/// The same logical module may hold LOCAL instances today and REMOTE instances
+/// after a migration, with no change to any business contract. Business code must
+/// never branch on this value; only the transport layer reads it, and only to
+/// choose a network policy (REMOTE requires HTTPS and refuses private literals).
+///
+/// CENTRAL is distinct from REMOTE on purpose: both are off-box, but CENTRAL names
+/// a shared multi-tenant deployment several Aria installations point at, which is a
+/// different operational and tenant-scoping situation from a single remote instance.
+/// HYBRID marks an instance whose own topology is mixed (a remote module holding a
+/// local cache/worker) — the platform treats it exactly as REMOTE for transport, and
+/// the member exists so an operator can record the truth instead of rounding it.
+enum ModuleDeploymentMode {
+  LOCAL
+  REMOTE
+  CENTRAL
+  HYBRID
+}
+
+/// Lifecycle of ONE instance. Minimal (§15): seven members, each reachable.
+///
+///   REGISTERED    — authenticated and recorded; not yet serving (module disabled,
+///                   or health never confirmed)
+///   ACTIVE        — registered, compatible, enabled and resolvable
+///   DEGRADED      — reachable and serving, but reporting reduced capability
+///   UNAVAILABLE   — was known, is not answering (heartbeat stale or probe failed)
+///   DISABLED      — an administrator turned it off. No transport is attempted.
+///   DEREGISTERED  — announced its own shutdown, or an admin removed it (terminal)
+///   INCOMPATIBLE  — declared a protocol/contract this Core cannot speak (§18).
+///                   Kept as its own member rather than folded into DISABLED because
+///                   "an operator disabled it" and "we cannot speak to it" demand
+///                   different actions, and §18 forbids partial activation.
+///
+/// DISCOVERED is deliberately NOT here. It is a DERIVED state of the LOGICAL module —
+/// "a registration exists and no instance has ever announced itself" — computed on
+/// read in ModuleRegistryService. A column would be permanently NULL-ish for every
+/// row that has an instance, and would need clearing on first registration.
+enum ModuleLifecycleState {
+  REGISTERED
+  ACTIVE
+  DEGRADED
+  UNAVAILABLE
+  DISABLED
+  DEREGISTERED
+  INCOMPATIBLE
+}
+
+/// Health of one instance, as last OBSERVED — never as claimed by an HTTP status.
+///
+/// A 200 alone does not produce HEALTHY: a reachable instance whose health body does
+/// not declare a state resolves to DEGRADED, because "it answered" and "it is well"
+/// are different facts and §13 forbids equating them. UNKNOWN is the honest value
+/// before anything has been observed, and is never treated as HEALTHY by the resolver.
+enum ModuleHealthState {
+  HEALTHY
+  DEGRADED
+  UNAVAILABLE
+  DISABLED
+  UNKNOWN
+}
+
+/// Which tenants a module may be resolved for.
+///
+/// THREE MEMBERS RATHER THAN "empty list means every tenant", because an empty array
+/// that silently means "all" is the shape in which a botched write turns a restricted
+/// module into a global one. ALL is explicit; RESTRICTED requires `tenantIds`.
+///
+/// ADMIN-OWNED, NEVER SELF-DECLARED. §8 forbids trusting a self-declared tenant
+/// scope, so this pair lives on the registration (which only the admin API writes)
+/// and not on the instance (which the module itself writes).
+///
+/// `RESTRICTED_MEMBERS` (Phase 54-C, D16, §45.4-§45.5) is the third member, and it is
+/// the answer to a bound rather than a new feature: a `RESTRICTED` row can list at most
+/// 64 tenants (`ModuleRegistration_tenantScope_consistent`), and an installation with
+/// more tenants than that cannot express its membership as an array at all —
+/// truncating it would turn "entitled" into "entitled if your id sorted early". For
+/// this member the membership is ENUMERATED IN `ModuleRegistrationTenant`, and the
+/// array must be EMPTY, so the same row can never carry two competing membership
+/// sources. Each scope therefore has exactly one source: ALL has none (the scope is the
+/// answer), RESTRICTED reads the array, RESTRICTED_MEMBERS reads the child table.
+///
+/// DELIBERATELY NOT WRITABLE THROUGH THE ADMIN API: `TENANT_SCOPES` and
+/// `MAX_TENANT_IDS` in the module DTO are not extended for it, so an operator cannot
+/// move a module INTO this scope (a grant decision expressed as a scope edit) or OUT
+/// of it (a silent widening of an enumerated set to every tenant). It is entered by
+/// migration, which is how provisioning stays an auditable act.
+enum ModuleTenantScope {
+  ALL
+  RESTRICTED
+  RESTRICTED_MEMBERS
+}
+
+/// One LOGICAL module, owned by an administrator.
+///
+/// This row is the platform's answer to "does `finance` exist, may it be resolved, and
+/// for which tenants?" — none of which an instance may decide about itself. Everything
+/// a module could lie about to gain trust lives HERE and is written only by the
+/// permission-gated admin API: `enabled`, `tenantScope`, `tenantIds` and the
+/// credential. Everything a module legitimately reports about ITSELF — its version,
+/// its endpoint, its capabilities, its health — lives on "ModuleInstance".
+///
+/// NO `baseUrl` COLUMN, and that is the deployment-agnostic requirement made
+/// structural: an endpoint is a property of a running instance, so a logical module
+/// cannot carry one. Two instances of `finance` in different places are therefore not
+/// a special case, and moving a module from LOCAL to REMOTE never touches this row.
+///
+/// NO ACTOR COLUMN. Who registered, enabled, disabled or rotated is in "AuditLog"
+/// (MODULE_REGISTERED / MODULE_ENABLED / MODULE_DISABLED / MODULE_UPDATED /
+/// MODULE_CREDENTIAL_ROTATED / MODULE_CONNECTION_TESTED), following the same rule
+/// "IntegrationConfig" (49L) follows: deleting an administrator must not cascade away
+/// platform configuration.
+model ModuleRegistration {
+  id String @id @default(uuid())
+
+  /// The STABLE logical identity, e.g. `finance`. UNIQUE, lower-case, slug-shaped
+  /// (`ModuleRegistration_moduleId_format` CHECK), and IMMUTABLE after creation — the
+  /// update DTO cannot express it. Every resolution, every capability lookup and every
+  /// signed request is keyed by this string, so a mutable one would silently reassign
+  /// a credential and a tenant scope to a different module.
+  moduleId String @unique
+
+  /// Operator-facing label. Presentation only; nothing resolves by it.
+  displayName String
+
+  moduleType ModuleType @default(BUSINESS)
+
+  /// Whether the platform may resolve this module at all. Default FALSE so a
+  /// self-registration cannot start receiving traffic before an administrator admits
+  /// it — the §7 rule that an unadmitted module gets no trusted status, expressed as a
+  /// default rather than as a convention.
+  enabled Boolean @default(false)
+
+  tenantScope ModuleTenantScope @default(ALL)
+
+  /// Tenants this module may be resolved for when `tenantScope = RESTRICTED`.
+  /// Enforced as a pair by `ModuleRegistration_tenantScope_consistent`: ALL requires
+  /// an EMPTY list and RESTRICTED requires a non-empty one, so "restricted to nobody"
+  /// and "restricted to everybody" are both unrepresentable.
+  tenantIds String[] @default([])
+
+  /// Protocol version of the PLATFORM contract (registration, discovery, health,
+  /// signing) this module was admitted under. Compared against
+  /// `MODULE_PROTOCOL_VERSION` on every registration; a mismatch produces
+  /// INCOMPATIBLE rather than a partial activation (§18).
+  protocolVersion Int @default(1)
+
+  /// AES-256-GCM envelope for the module's shared HMAC secret, reusing CryptoService
+  /// and AI_CONFIG_ENCRYPTION_KEY — the SAME single secret store 49J-0 established and
+  /// 49L reused. THREE columns because GCM needs all three to decrypt AND
+  /// authenticate. Nullable as a set: a registration may exist before its credential
+  /// is issued, and registration then refuses to authenticate rather than accepting an
+  /// unsigned announcement.
+  secretCiphertext String?
+  secretIv         String?
+  secretAuthTag    String?
+  secretUpdatedAt  DateTime?
+
+  /// When the credential stops being accepted. NULL means "no expiry configured" —
+  /// a real deployment choice, not an oversight — and is never read as "expired".
+  /// §20 asks for provision/rotate/expire/revoke to be SUPPORTED: rotate is the secret
+  /// columns above, expire is this column, and revoke is `enabled = false` plus a
+  /// rotation, which is why no separate revocation table exists.
+  secretExpiresAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  instances ModuleInstance[]
+
+  /// 49M-1 back-relations. NO DDL against this table: the foreign keys live on the child
+  /// tables, exactly as `instances` above carries no column here.
+  releases   ModuleRelease[]
+  executions ModuleProvisioningExecution[]
+
+  /// ADR-0006 A8 back-relation. NO DDL against this table either — the foreign key lives
+  /// on "ModuleCapabilityCredential" below, keyed by the UNIQUE `moduleId` above rather
+  /// than by this row's `id`, because `moduleId` is the identity every resolution uses.
+  capabilityCredentials ModuleCapabilityCredential[]
+
+  /// Phase 54-C (D14/D16) back-relations, on exactly the terms of `instances`/`releases`
+  /// above: relation fields only, so NO column, no index and no data change reaches this
+  /// table. `features` is keyed by `moduleId` (the identity every resolution and every
+  /// feature lookup uses); `tenantMembers` is keyed by this row's `id`, because a
+  /// membership is about one REGISTRATION.
+  features      ModuleFeature[]
+  tenantMembers ModuleRegistrationTenant[]
+
+  /// The admin list read: by type, then name. `moduleId` is already indexed by its
+  /// unique constraint, which is what every resolution uses.
+  @@index([moduleType, displayName])
+}
+
+/// Phase 54-C (D14, §43.2/§43.3): a FEATURE a module declares, and whether the platform
+/// offers it at all.
+///
+/// WHY A FEATURE IS A ROW AND NOT AN ENUM. `featureId` is a validated slug, not a member of
+/// a union Core compiles in — a feature exists when a row exists, exactly as a module does
+/// (`module.dto.ts`: "nothing names a business module"). An enum here would put HR's
+/// vocabulary inside Core's type system, which is the coupling §43.6 forbids in the other
+/// direction.
+///
+/// FAIL-CLOSED IS THE STORAGE DEFAULT, NOT A SERVICE CONVENTION. `enabled` defaults to
+/// FALSE, so a freshly declared feature is declared-and-off until an operator turns it on —
+/// the same shape `ModuleRegistration.enabled` uses, so the flag means the same thing at
+/// both levels and neither level can be switched on by omission.
+///
+/// THE PARENT IS `moduleId`, NOT THE REGISTRATION'S `id`, and the difference is
+/// deliberate: every entitlement question arrives as `(moduleId, featureId)`, so keying the
+/// feature by `moduleId` makes the decision a single index-covered lookup against
+/// `ModuleFeature_moduleId_featureId_key` instead of a join. CASCADE, because a feature of
+/// a module that no longer exists is not a fact about anything.
+model ModuleFeature {
+  id String @id @default(uuid())
+
+  /// The owning logical module. A validated slug, not a business enum, and not
+  /// `ModuleRegistration.id` — see the model comment.
+  moduleId String
+
+  /// The feature's slug inside the module, e.g. `leave`. Same character rule as
+  /// `ModuleRegistration.moduleId` (`ModuleFeature_featureId_format`), and the pair
+  /// `(moduleId, featureId)` is UNIQUE so one feature cannot be declared twice and decide
+  /// differently on two rows.
+  featureId String
+
+  /// Operator-facing label. Presentation only; nothing resolves by it.
+  displayName String
+
+  /// Whether the platform OFFERS this feature. Default FALSE — see the model comment.
+  enabled Boolean @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  registration ModuleRegistration    @relation(fields: [moduleId], references: [moduleId], onDelete: Cascade)
+  grants       ModuleFeatureGrant[]
+
+  @@unique([moduleId, featureId])
+
+  /// Mirrors the frozen §43.3 sketch. Strictly speaking the unique key already covers a
+  /// leading-`moduleId` lookup; it is kept because the amendment names it, and a redundant
+  /// index is a smaller cost than a spec and a schema that disagree.
+  @@index([moduleId])
+}
+
+/// Phase 54-C (D14, §43.3): PRESENCE IS THE GRANT. One row = this tenancy holds this
+/// feature.
+///
+/// WHY "PRESENCE" AND NOT ANOTHER `enabled` COLUMN. A nullable boolean would give the same
+/// fact three representations (absent, present-and-false, present-and-true) and only one of
+/// them a decision. A row is one bit with no third state, so a revocation is a deletion and
+/// there is no way to express "granted, but off" — the state an operator would then have to
+/// reason about twice.
+///
+/// THE TENANT IS A PLAIN `String`, DELIBERATELY. `Tenant.id` is `String @id
+/// @default(uuid())` with no native type, so `@db.Uuid` here would be a foreign key into a
+/// `text` column and would not compile — and no column in this schema carries a `@db.`
+/// native type except `CalendarOccasion.jalaliDate`. §43.3's Prisma sketch types this
+/// `@db.Uuid`; §45.5 records the correction rather than rewriting that amendment's text.
+///
+/// CASCADE ON BOTH PARENTS, the repository's own convention for `Tenant`-referencing rows
+/// and for `ModuleRegistration`'s existing child: a grant is a statement ABOUT a tenant and
+/// about a feature, and a statement about a thing that no longer exists must not outlive
+/// it. A tenant re-created under a new id therefore starts UNENTITLED — the same
+/// fail-closed direction as everything else in this layer.
+model ModuleFeatureGrant {
+  id           String   @id @default(uuid())
+  featureRowId String
+  tenantId     String
+  grantedAt    DateTime @default(now())
+
+  feature ModuleFeature @relation(fields: [featureRowId], references: [id], onDelete: Cascade)
+  tenant  Tenant        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  /// One row per (feature, tenant): this is what makes granting idempotent and what makes
+  /// "the same tenant was granted the same feature twice" a database fact rather than a
+  /// convention.
+  @@unique([featureRowId, tenantId])
+
+  /// The reverse read — "which features does this tenancy hold" — which the unique key
+  /// above cannot serve, since it leads with the feature row.
+  @@index([tenantId])
+}
+
+/// Phase 54-C (D16, §45.4-§45.5): PRESENCE IS MEMBERSHIP. One row = this tenant is
+/// entitled to this module.
+///
+/// WHY THIS TABLE EXISTS AT ALL. `ModuleRegistration.tenantIds` is a bounded array
+/// (`ModuleRegistration_tenantScope_consistent`: 1-64 entries for `RESTRICTED`), and an
+/// installation with more tenants than that cannot express its membership as an array —
+/// truncating it would turn "entitled" into "entitled if your id sorted early", which is
+/// the failure mode the whole layer exists to prevent (D15-G1 failed with 162 tenants
+/// against a 64-entry cap). `RESTRICTED_MEMBERS` is the scope that reads THIS table
+/// instead, and the array must then be EMPTY (the constraint's third branch), so one row
+/// can never carry two competing membership sources.
+///
+/// THE LEGACY ARRAY IS UNCHANGED. It keeps its 64-entry bound and its meaning for every
+/// module that is not `RESTRICTED_MEMBERS`: not raised, not removed, no live row
+/// rewritten. This is a second representation for the modules that need one, not a
+/// migration of the modules that do not.
+///
+/// THE TENANT IS A PLAIN `String` for the reason `ModuleFeatureGrant.tenantId` records:
+/// `Tenant.id` is a `text` uuid with no native type.
+///
+/// NOT WRITABLE THROUGH THE ADMIN API (§45.4 item 5): `TENANT_SCOPES` and
+/// `MAX_TENANT_IDS` in `module.dto.ts` are not extended for it, so a module cannot be
+/// moved into `RESTRICTED_MEMBERS` by a scope edit (a grant decision in disguise) or out
+/// of it (a silent widening of an enumerated set to every tenant). It is provisioned by
+/// migration, which is how entitlement stays an auditable, dateable act.
+model ModuleRegistrationTenant {
+  id             String   @id @default(uuid())
+  registrationId String
+  tenantId       String
+  createdAt      DateTime @default(now())
+
+  registration ModuleRegistration @relation(fields: [registrationId], references: [id], onDelete: Cascade)
+  tenant       Tenant             @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  /// "The same tenant cannot be granted the same module twice", as a database fact rather
+  /// than a convention — and the key the seed migration's `ON CONFLICT … DO NOTHING`
+  /// targets, which is what makes running it twice indistinguishable from running it once.
+  @@unique([registrationId, tenantId])
+
+  /// The reverse read — "which modules may this tenant resolve" — which the unique key
+  /// above cannot serve, since it leads with the registration.
+  @@index([tenantId])
+}
+
+/// ONE CAPABILITY-SCOPED SERVICE CREDENTIAL for one module (ADR-0006 A8).
+///
+/// WHY THIS IS NOT A COLUMN ON "ModuleRegistration" ABOVE. That table is keyed by
+/// `moduleId` ALONE (`@unique`, one row per module) and carries exactly ONE secret
+/// envelope, so it can express one credential per MODULE and never one per
+/// (caller, capability). A7 requires one credential per (caller, capability) and records
+/// "a shared credential across capabilities" as a REJECTED alternative: one secret
+/// accepted by two platform surfaces collapses both blast radii into one leak and makes a
+/// single rotation break both. Capability is not expressible in `moduleSignatureMaterial`
+/// either — it carries `moduleId`, `requestId` and `tenantId` and no capability field — so
+/// capability can only be expressed by WHICH secret verifies, which is what the
+/// uniqueness below encodes. The alternative was worse: a second `ModuleRegistration` row
+/// per capability would manufacture a module principal that never registers, never
+/// heartbeats and has no release, purely to hold a value.
+///
+/// `capability` HOLDS A CONTRACT DESCRIPTOR (`platform.identity@v1`), NOT a
+/// `ModuleCapabilityId`. The descriptor carries the major version, so a `@v2` is a NEW
+/// credential by construction rather than a silently reused one (A2), and it is validated
+/// by the existing `isValidContract`/`parseContract` rather than by a second shape rule.
+///
+/// ENCRYPTION IS THE EXISTING ONE, deliberately: the same AES-256-GCM three-column
+/// envelope encrypted by the same CryptoService under the same `AI_CONFIG_ENCRYPTION_KEY`
+/// that "ModuleRegistration" and "IntegrationConfig" already use. A second crypto system
+/// would be a second thing to get wrong, and a second key would be a second key to rotate.
+///
+/// `moduleId` IS THE FOREIGN KEY and it points at a UNIQUE column, so a credential cannot
+/// outlive its module registration (CASCADE) — a credential for a module that no longer
+/// exists is unresolvable by definition, the same reasoning "ModuleInstance" follows.
+model ModuleCapabilityCredential {
+  id String @id @default(uuid())
+
+  /// The stable logical identity of the module that HOLDS this credential, e.g. `hr`.
+  /// FK target is `ModuleRegistration.moduleId`, not its `id`.
+  moduleId String
+
+  /// Deleting the module registration takes its capability credentials with it.
+  registration ModuleRegistration @relation(fields: [moduleId], references: [moduleId], onDelete: Cascade)
+
+  /// The contract descriptor this credential authenticates, e.g. `platform.identity@v1`
+  /// or `platform.audit@v1`. UNIQUE per module: the uniqueness IS the capability
+  /// boundary, so "one credential for two capabilities" is not a storable state.
+  capability String
+
+  /// AES-256-GCM envelope for THIS capability's secret, following the same rule
+  /// "ModuleRegistration" states: three columns because GCM needs all three both to
+  /// decrypt and to authenticate, and nullable as a SET — a row may exist before its
+  /// credential is issued, and resolution then refuses rather than authenticating nothing.
+  secretCiphertext String?
+  secretIv         String?
+  secretAuthTag    String?
+
+  /// When the envelope above was last replaced. Rotation overwrites these columns; it
+  /// never adds a second slot, and it is CAPABILITY-SPECIFIC — rotating the identity
+  /// credential does not touch the audit credential or the module-hop secret.
+  secretUpdatedAt DateTime?
+
+  /// When THIS credential stops being accepted. NULL means "no expiry configured" — a
+  /// real deployment choice — and is NEVER read as "expired". Enforced where resolution
+  /// happens, exactly as `resolveSecret` already enforces the module credential's expiry.
+  secretExpiresAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  /// THE CAPABILITY BOUNDARY, as a database constraint rather than a convention.
+  @@unique([moduleId, capability])
+}
+
+/// ONE DEPLOYED INSTANCE of a registered module.
+///
+/// This row is what the resolver returns, and it is the ONLY place a network location
+/// exists. A module writes it about itself through the authenticated registration
+/// route; an administrator never types an endpoint here, which is half of the §40 SSRF
+/// answer (the other half is `assertModuleEndpointAllowed`).
+///
+/// SEVERAL ROWS PER `moduleId` ARE LEGAL BY CONSTRUCTION (§12). Nothing here assumes a
+/// single instance: `instanceId` is the unique key, `moduleId` is only indexed, and the
+/// resolver picks among candidates. Load balancing is not implemented in this phase,
+/// but the model does not have to change to allow it.
+///
+/// WHAT IS DELIBERATELY NOT HERE: the module's own business data, its database URL, its
+/// internal file paths, its credentials and any response payload. §10 forbids exposing
+/// schema/secrets/paths through discovery, and the cheapest way to guarantee that is to
+/// have nowhere to put them.
+model ModuleInstance {
+  id String @id @default(uuid())
+
+  /// FK to the logical module. CASCADE: an instance of a module that no longer exists
+  /// is unresolvable by definition, so it goes with its parent rather than remaining as
+  /// an orphan the resolver would have to filter out on every read.
+  registrationId String
+  registration   ModuleRegistration @relation(fields: [registrationId], references: [id], onDelete: Cascade)
+
+  /// Stable identity of THIS deployment, e.g. `finance-prod-01`. UNIQUE GLOBALLY rather
+  /// than per module: an instance id is what a re-announcement upserts on, and a global
+  /// unique makes it impossible for two modules to claim one instance identity. NEVER
+  /// conflated with `moduleId` (§5) — that is the whole reason for two tables.
+  instanceId String @unique
+
+  /// Denormalised copy of the parent's `moduleId`, and the ONLY denormalisation here.
+  /// Resolution reads by logical id and would otherwise need a join on the hot path,
+  /// and it is safe precisely because `moduleId` is immutable. The service always writes
+  /// it from the loaded registration, never from the request.
+  moduleId String
+
+  /// WHERE this instance runs. Metadata (§6): business code never reads it, the
+  /// transport layer reads it to pick a network policy, and the same logical contract
+  /// applies in every mode (§25/§35).
+  deploymentMode ModuleDeploymentMode
+
+  /// Semantic version the instance reports for ITSELF, e.g. `1.2.0`. Format enforced by
+  /// `ModuleInstance_version_format`, so `latest`, `v2` or an empty string cannot be
+  /// stored — a version nothing can compare is worse than no version.
+  version String
+
+  /// Origin only, e.g. `https://finance.internal:8443`. Validated by the SSRF policy on
+  /// every write AND again immediately before every call, because the policy is
+  /// environment configuration and can change without this row changing — the same
+  /// two-point validation 49L applies to `IntegrationConfig.baseUrl`.
+  ///
+  /// NULLABLE for the one honest case: a LOCAL in-process instance has no URL. The
+  /// resolver refuses to return a transport-requiring instance without one rather than
+  /// inventing `http://localhost`.
+  baseUrl String?
+
+  /// Path of the instance's health contract, relative to `baseUrl`. Stored separately so
+  /// the origin can be re-validated on its own and a path can never smuggle a scheme or
+  /// an authority past the guard (the same rule as 49L's `webhookPath`).
+  healthPath String @default("/health")
+
+  /// Capability identifiers the instance declares, e.g. `invoice.read`. STABLE STRINGS,
+  /// NOT AN ENUM: capabilities are owned by whichever module declares them, and an enum
+  /// would mean Core must migrate its schema before a module can gain a capability —
+  /// exactly the coupling §9 forbids. Bounded to 64 entries by
+  /// `ModuleInstance_capabilities_bounded`; each entry's shape is validated by the DTO.
+  /// Nothing in Core interprets these strings; they are matched, never parsed.
+  capabilities String[] @default([])
+
+  /// API contract versions this instance serves, as `<contract>@v<major>`, e.g.
+  /// `module.invoke@v1`. Same reasoning as `capabilities`: declared by the module,
+  /// matched by Core, never parsed for meaning.
+  apiContracts String[] @default([])
+
+  /// Event contract versions this instance can CONSUME, as `<eventType>@v<version>`
+  /// (§17). Purely a declaration: this phase creates no event, and nothing here implies
+  /// that any particular event type exists.
+  eventContracts String[] @default([])
+
+  lifecycle ModuleLifecycleState @default(REGISTERED)
+
+  /// Last OBSERVED health. Default UNKNOWN — never HEALTHY — so an instance that has
+  /// registered and never been probed cannot be resolved as healthy.
+  health ModuleHealthState @default(UNKNOWN)
+
+  /// Short internal code from the last failed probe (`TIMEOUT`, `UNREACHABLE`,
+  /// `HTTP_503`, `SSRF_BLOCKED`, `CONTRACT_MISMATCH`). NEVER an upstream body: those
+  /// echo request content and occasionally credential fragments, and this column is
+  /// rendered in the admin UI.
+  healthErrorCode String?
+
+  /// Last time this instance was HEARD FROM — a heartbeat, a registration or a
+  /// successful probe. The staleness decision (§14) is computed from this against a
+  /// bounded threshold, so an instance that stops talking becomes UNAVAILABLE without
+  /// anything having to poll it.
+  lastSeenAt   DateTime?
+  lastProbedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  /// The resolver's only predicate: candidates for one logical module, most recently
+  /// seen first. `lifecycle` is in the index because the resolver filters on it before
+  /// anything else.
+  @@index([moduleId, lifecycle, lastSeenAt(sort: Desc)])
+  /// The staleness sweep: instances that could go stale, oldest first. Partial in the
+  /// migration (`WHERE lifecycle IN ('ACTIVE','DEGRADED','REGISTERED')`), which Prisma
+  /// cannot express, so terminal rows are not in the index at all.
+  @@index([lastSeenAt])
+
+  /// 49M-1 back-relations. NO DDL against this table: `ModuleOperationalStatus` holds the
+  /// UNIQUE FK and the execution table holds a nullable one, so neither adds a column here.
+  operationalStatus ModuleOperationalStatus?
+  executions        ModuleProvisioningExecution[]
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase 49M-1: module PROVISIONING CONTROL PLANE and OPERATIONAL LIFECYCLE.
+//
+// FOUR TABLES, AND NOT ONE `ALTER` TO 49M's TWO. `ModuleInstance.lifecycle` is
+// written by four independent paths — self-registration, heartbeat, admin probe and
+// the staleness sweep — and asserted by 13 existing spec files. Operational state is
+// written by ONE path (a provisioning execution), so it lives in its own 1:1 row
+// rather than as a column on a table two unattended loops already write.
+//
+// The three relation FIELDS added to `ModuleRegistration`/`ModuleInstance` below are
+// Prisma back-relations. They generate NO DDL against either table: the foreign keys
+// live on the new child tables, exactly as `instances ModuleInstance[]` carries no
+// column on `ModuleRegistration`.
+//
+// STILL ABSENT BY DECISION: any container/VM/pod descriptor, any command or script
+// column, any URL on a provisioning target, any artifact BYTES, any secret VALUE, and
+// any table naming a business domain. The audit found no Docker/Kubernetes/SSH client
+// and no shell call anywhere in `src`, so a schema that described one would be
+// describing a capability this system does not have.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// WHERE the control plane may act. TWO members, both drivable today.
+///
+/// There is no CONTAINER_HOST, no VM and no KUBERNETES member, because zero clients
+/// exist to drive them: `docker`, `dockerode`, `kube`, `k8s`, `ssh`, `terraform`,
+/// `ansible` and `nomad` are all absent from the 65 dependencies. An enum member with
+/// nothing behind it lets an operator save a target the registry cannot resolve —
+/// the same reasoning `IntegrationKey` uses for having exactly one member.
+///
+/// REMOTE_AGENT is declared and DEFERRED: it resolves to no provider, which normalises
+/// to PROVIDER_UNAVAILABLE. Declared rather than omitted so the shape a future agent
+/// must satisfy is fixed now, while nothing pretends it works.
+enum ProvisioningTargetType {
+  LOCAL_SERVER
+  REMOTE_AGENT
+}
+
+/// Whether a release may be deployed.
+///
+/// DRAFT cannot be deployed, PUBLISHED can, DEPRECATED can only be rolled back TO,
+/// and WITHDRAWN can never be deployed again — a release withdrawn for a security
+/// reason must not remain a legal rollback target, which is the whole point of
+/// separating it from DEPRECATED.
+enum ModuleReleaseStatus {
+  DRAFT
+  PUBLISHED
+  DEPRECATED
+  WITHDRAWN
+}
+
+/// The operational state of ONE DEPLOYED INSTANCE. Nine members.
+///
+/// MIRRORS `module-operational-state.ts` EXACTLY, and the transition table lives there
+/// rather than here: Postgres can enforce that a value is one of nine, and cannot
+/// enforce that ACTIVE may only be reached from VERIFYING or DISABLED. Splitting the
+/// rule across both would give two partial answers instead of one whole one.
+///
+/// NO DISCOVERED: 49M derives that for the LOGICAL module, and this is keyed by
+/// instance, where it could never be true. NO DEGRADED/UNAVAILABLE: those are health
+/// observations and already live on `ModuleInstance.health`; a second copy would
+/// disagree with the first the moment a probe lands mid-upgrade.
+enum ModuleOperationalState {
+  REGISTERED
+  PROVISIONING
+  CONFIGURING
+  VERIFYING
+  ACTIVE
+  UPDATING
+  DISABLED
+  FAILED
+  DECOMMISSIONED
+}
+
+/// Lifecycle of one provisioning EXECUTION. Same five-state shape as 49L's
+/// `AutomationStatus`, for the same reason: a request that is accepted, claimed, and
+/// then finishes one of three ways is the honest description of asynchronous work.
+enum ProvisioningExecutionStatus {
+  PENDING
+  RUNNING
+  SUCCEEDED
+  FAILED
+  CANCELLED
+}
+
+/// WHICH operation an execution performs. NINE members, one per provider method that
+/// CHANGES something.
+///
+/// `validateTarget` — the tenth method on `IModuleProvisioningProvider` — has no member
+/// here on purpose: it is a synchronous, read-only pre-flight check that mutates
+/// nothing, so recording an execution row for it would fill the history with entries
+/// that have no effect to audit.
+///
+/// Deliberately NOT reusing 49M's `ModuleProvisioningStep`
+/// (REGISTER/AUTHENTICATE/VERIFY/ACTIVATE): that union describes the four steps 49M
+/// already performs MANUALLY, and conflating it with the control plane's actions would
+/// make `remainingProvisioningSteps` appear to describe an execution it knows nothing
+/// about.
+enum ProvisioningAction {
+  PROVISION
+  CONFIGURE
+  VERIFY
+  ACTIVATE
+  STOP
+  RESTART
+  UPGRADE
+  ROLLBACK
+  DECOMMISSION
+}
+
+/// A DEPLOYABLE RELEASE of a logical module: what would be installed, and how to prove
+/// it arrived intact.
+///
+/// THE ARTIFACT IS A REFERENCE, NEVER BYTES. `artifactKey` is a MinIO object key
+/// resolved through the existing `IStorageProvider`, which already issues short-lived
+/// signed URLs. A `Bytes` column here would put every module build into the WAL, into
+/// every logical backup and into any query that forgot to project columns — and Aria
+/// already has an object store precisely so that binaries do not live in Postgres.
+///
+/// THERE IS NO `artifactUrl`. A stored URL is a stored SSRF target that no policy check
+/// can re-validate at use time; a key is resolved against one configured bucket, so the
+/// destination is a property of configuration rather than of a row an operator typed.
+model ModuleRelease {
+  id String @id @default(uuid())
+
+  /// FK to the LOGICAL module. CASCADE for the reason 49M's one FK cascades: a release
+  /// of a module that no longer exists cannot be deployed, so it is not history worth
+  /// keeping as an orphan.
+  registrationId String
+  registration   ModuleRegistration @relation(fields: [registrationId], references: [id], onDelete: Cascade)
+
+  /// Denormalised copy of the parent's `moduleId`, mirroring the ONE denormalisation
+  /// 49M allows on `ModuleInstance`. Safe for the same reason: `moduleId` is immutable,
+  /// and the service always writes it from the loaded registration, never from a request.
+  moduleId String
+
+  /// The release's own semantic version, same CHECK as `ModuleInstance.version` so the
+  /// two are comparable by `compareModuleVersions`. `latest` cannot be stored — a
+  /// version nothing can order makes upgrade and rollback the same operation.
+  version String
+
+  /// Object-store KEY, e.g. `modules/finance/1.2.0/bundle.tar.gz`. Bounded and
+  /// slash-shaped by CHECK; it can express no scheme and no authority, so it cannot
+  /// smuggle a destination.
+  artifactKey String
+
+  /// Digest algorithm and the digest itself. Both NOT NULL: a checksum with no declared
+  /// algorithm is unverifiable, and an artifact with no checksum cannot be proven to be
+  /// the one that was published. SHA-256 lower-case hex is enforced by CHECK.
+  checksumAlgorithm String @default("SHA-256")
+  checksum          String
+
+  /// Size in bytes, as published. Compared against what is actually fetched, so a
+  /// truncated download fails before the checksum pass rather than during it.
+  artifactBytes Int
+
+  /// The PLATFORM protocol version this release speaks, and the business contracts and
+  /// capabilities it will declare once running. Verified against
+  /// `checkCompatibility`/`hasCapabilities` at the activation gate, so a release that
+  /// could never activate is refused at publish time instead of at 3am.
+  protocolVersion      Int      @default(1)
+  apiContracts         String[] @default([])
+  requiredCapabilities String[] @default([])
+
+  releaseStatus ModuleReleaseStatus @default(DRAFT)
+
+  /// Free-text operator note, e.g. why a release was withdrawn. Bounded by CHECK and
+  /// never parsed by anything.
+  notes String?
+
+  /// Who published it. Plain column, NOT a foreign key — the rule 49L's `actorId` and
+  /// `Notification.sourceId` both follow: deleting a user must not cascade away
+  /// deployment history, and a dangling FK is worse than an opaque id.
+  publishedById String?
+  publishedAt   DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  executions ModuleProvisioningExecution[]
+
+  /// One row per module per version. A second row for the same version would make
+  /// "deploy 1.2.0" ambiguous, and the checksum would be the only thing distinguishing
+  /// them — which is exactly the ambiguity a control plane must not have.
+  @@unique([moduleId, version])
+  /// The admin list read: deployable releases for one module, newest first.
+  @@index([moduleId, releaseStatus, createdAt(sort: Desc)])
+}
+
+/// WHERE the control plane may act. An operator-owned row, never module-reported.
+///
+/// THERE IS NO `url`, NO `host`, NO `port` AND NO `command` COLUMN, and that absence is
+/// the §2.2 design made structural. A LOCAL_SERVER target is the machine this API
+/// process already runs on — it needs no address, because "here" is not a destination.
+/// A REMOTE_AGENT target names a CONFIGURED agent by key; the address behind that key
+/// lives in environment configuration where the existing SSRF policy can validate it,
+/// not in a row an administrator typed. §40's anti-pattern is therefore unexpressible
+/// rather than merely refused.
+///
+/// NO CREDENTIAL VALUE EITHER. `credentialRef` is a NAME, resolved at use time against
+/// the same envelope store 49M/49L/49J-0 share. A control plane that stores its own
+/// copies of secrets becomes the most attractive table in the database.
+model ProvisioningTarget {
+  id String @id @default(uuid())
+
+  /// Stable slug an operator refers to, e.g. `local-primary`. UNIQUE: two targets with
+  /// one name is an ambiguity that surfaces as "which machine did that deploy touch?".
+  targetKey String @unique
+
+  /// Operator-facing label. Presentation only; nothing resolves by it.
+  displayName String
+
+  targetType ProvisioningTargetType
+
+  /// NAME of a credential the provider resolves at use time, e.g. `agent-token-primary`.
+  /// NULL is legal and normal for LOCAL_SERVER, which authenticates nothing because it
+  /// crosses no boundary. Enforced as a pair by
+  /// `ProvisioningTarget_remote_requires_credentialRef`: a REMOTE_AGENT without one
+  /// could only ever fail at connect time.
+  credentialRef String?
+
+  /// Whether the control plane may select this target at all. Default FALSE, matching
+  /// `ModuleRegistration.enabled`: a newly created target does not become a deployment
+  /// destination until an administrator says so.
+  enabled Boolean @default(false)
+
+  /// Bounded concurrent executions against this target. A default of 1 makes the safe
+  /// case the automatic one — two simultaneous deploys to one machine race on the same
+  /// filesystem — and an operator who genuinely has capacity can raise it.
+  maxConcurrentExecutions Int @default(1)
+
+  /// Result of the most recent `validateTarget` pre-flight. Stored so the admin UI can
+  /// show why a target is unusable without re-running a check on every page render, and
+  /// deliberately a short CODE rather than a message.
+  lastValidatedAt    DateTime?
+  lastValidationCode String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  executions ModuleProvisioningExecution[]
+
+  /// The selection read: usable targets of one type.
+  @@index([targetType, enabled])
+}
+
+/// ONE PROVISIONING OPERATION, from request to outcome.
+///
+/// MODELLED ON 49L's `AutomationExecution`, and the reuse is the point: the same UNIQUE
+/// `idempotencyKey`, the same `attemptCount`/`errorCode` pair, the same
+/// `nextAttemptAt`-goes-NULL-when-terminal idiom, and the same claimable partial index.
+/// Retries and concurrency therefore inherit a pattern that already has passing specs
+/// rather than getting a second, subtly different one.
+///
+/// WHY THIS TABLE EXISTS AT ALL: a provisioning action returns `202` with an execution
+/// id, because holding an HTTP request open across a download, a checksum pass and a
+/// health probe converts an operator's browser timeout into an unknown deployment state.
+/// The row IS the answer to "what happened?", which is also why it is never deleted on
+/// success.
+model ModuleProvisioningExecution {
+  id String @id @default(uuid())
+
+  /// WHICH module. FK to the logical registration, CASCADE with it.
+  registrationId String
+  registration   ModuleRegistration @relation(fields: [registrationId], references: [id], onDelete: Cascade)
+
+  /// Denormalised `moduleId`, same immutability argument as everywhere else.
+  moduleId String
+
+  /// WHICH instance, when the action targets an existing one. NULL for a first
+  /// PROVISION, where the instance does not exist yet — the honest case, not an
+  /// oversight. SET NULL rather than CASCADE: the history of how an instance was
+  /// deployed must survive that instance being removed, which is the exact opposite of
+  /// the argument for cascading `ModuleInstance` itself.
+  instanceId String?
+  instance   ModuleInstance? @relation(fields: [instanceId], references: [id], onDelete: SetNull)
+
+  /// SNAPSHOT of the instance's business identity (`ModuleInstance.instanceId`, e.g.
+  /// `finance-prod-01`). A plain column that is NEVER nulled, so history stays readable
+  /// after the FK above is set to NULL: "STOP on finance-prod-01" is still an answer,
+  /// while a bare NULL is not.
+  ///
+  /// IT ALSO CARRIES THE CONSTRAINT the FK cannot. Requiring the FK to be present for
+  /// every non-PROVISION action would make deleting an instance impossible — the
+  /// SET NULL would violate that very CHECK — so the requirement is expressed against
+  /// this column, which nothing ever clears.
+  instanceKey String?
+
+  /// WHICH release. NULL for actions that do not install anything (STOP, RESTART,
+  /// DECOMMISSION). SET NULL so a withdrawn release cannot erase the record of having
+  /// been deployed.
+  releaseId String?
+  release   ModuleRelease? @relation(fields: [releaseId], references: [id], onDelete: SetNull)
+
+  /// WHERE it ran. RESTRICT, unlike everything else here: deleting a target that has
+  /// executions would destroy the only record of which machine was touched, so the
+  /// delete is refused and the operator must disable the target instead.
+  targetId String
+  target   ProvisioningTarget @relation(fields: [targetId], references: [id], onDelete: Restrict)
+
+  action ProvisioningAction
+  status ProvisioningExecutionStatus @default(PENDING)
+
+  /// The operational state this execution is driving TOWARD, validated by
+  /// `canTransition` before the row is created. Stored so a reader can see the intent
+  /// even after the attempt failed, which a state column on the instance alone cannot
+  /// show.
+  targetState ModuleOperationalState
+
+  /// `<moduleId>:<action>:<releaseVersion|->:<requestKey>` — materialised so a repeated
+  /// submit is a no-op enforced by the DATABASE rather than by a read-then-write race in
+  /// the service. This is the single most important constraint in the table: without it,
+  /// a double-clicked "Upgrade" is two concurrent deployments of the same artifact.
+  idempotencyKey String @unique
+
+  /// Snapshot of the requesting context's tenant. NULL is its own bucket and is never
+  /// read as "any tenant".
+  tenantId String?
+
+  /// Who requested it. Plain column, NOT a foreign key, for the reason 49L states.
+  actorId String?
+
+  /// Carried from `RequestContextService`, never regenerated: one id traces admin
+  /// request -> execution -> provider step -> audit row.
+  correlationId String?
+
+  /// Bounded attempts. The CHECK refuses a negative value, and the service refuses to
+  /// exceed `MAX_PROVISIONING_ATTEMPTS`.
+  attemptCount Int @default(0)
+
+  /// When the retry pass may next claim this row. NULL means "not retryable" and is set
+  /// for every terminal status, which is what keeps the claim index small instead of
+  /// scanning completed history.
+  nextAttemptAt DateTime?
+
+  /// Which provider step was in progress when the outcome was recorded, e.g. `VERIFY`.
+  /// The reason `module-foundations.ts` gives for per-step outcomes applies literally
+  /// here: "failed" is useless at 3am, "failed at VERIFY" is not.
+  failedStep String?
+
+  /// Short internal code (`CHECKSUM_MISMATCH`, `PROVIDER_UNAVAILABLE`,
+  /// `STEP_UNSUPPORTED`, `TIMEOUT`, `ILLEGAL_TRANSITION`). NEVER an upstream body or a
+  /// filesystem path: this column is rendered in the admin UI.
+  errorCode String?
+
+  createdAt   DateTime  @default(now())
+  startedAt   DateTime?
+  completedAt DateTime?
+  updatedAt   DateTime  @updatedAt
+
+  /// The claim pass's only predicate. Partial in the migration
+  /// (`WHERE "nextAttemptAt" IS NOT NULL`), which Prisma cannot express, so terminal rows
+  /// are not in the index at all — the same technique as 49L's retry index.
+  @@index([status, nextAttemptAt])
+  /// The concurrency guard: does this instance already have something in flight?
+  @@index([instanceId, status])
+  /// The admin history read: newest first for one module.
+  @@index([moduleId, createdAt(sort: Desc), id(sort: Desc)])
+}
+
+/// THE OPERATIONAL STATE OF ONE INSTANCE. Exactly one row per `ModuleInstance`.
+///
+/// THIS IS THE LOAD-BEARING SCHEMA DECISION OF 49M-1, and it is a separate table rather
+/// than a column on `ModuleInstance` for a reason that is a property of 49M rather than
+/// a preference: `ModuleInstance.lifecycle` is written by FOUR paths — self-registration,
+/// heartbeat, an admin probe, and the unattended staleness sweep — and asserted by 13
+/// existing spec files. Adding a provisioning-owned column to that table would mean two
+/// writers with different clocks and different intents on one row, and the sweep would
+/// eventually demote an instance that was mid-upgrade.
+///
+/// WITH THE SPLIT, BOTH FACTS SURVIVE: the sweep may say UNAVAILABLE (nothing has been
+/// heard from it) while this row says UPDATING (we are replacing it) — which is not a
+/// contradiction, it is the actual situation. And NO EXISTING TEST CHANGES, because no
+/// existing column, index or constraint is touched.
+model ModuleOperationalStatus {
+  id String @id @default(uuid())
+
+  /// 1:1 with the instance. UNIQUE — not merely indexed — so a second operational row
+  /// for one instance is impossible rather than merely unlikely; two rows would make
+  /// "what state is this in?" unanswerable. CASCADE: operational state about an instance
+  /// that no longer exists has no subject.
+  instanceRowId String         @unique
+  instance      ModuleInstance @relation(fields: [instanceRowId], references: [id], onDelete: Cascade)
+
+  /// Denormalised `moduleId` so the admin projection can filter by logical module without
+  /// a join on the list path.
+  moduleId String
+
+  /// Default REGISTERED, never ACTIVE. 49M already refuses to let a self-registration
+  /// serve traffic before an administrator admits it; an operational default of ACTIVE
+  /// would contradict that from the other direction.
+  operationalState ModuleOperationalState @default(REGISTERED)
+
+  /// When the state last CHANGED — not when the row was last touched. Distinct from
+  /// `updatedAt` on purpose: an operator asking "how long has this been FAILED?" is asking
+  /// about the state, and `@updatedAt` moves on every unrelated write.
+  stateChangedAt DateTime @default(now())
+
+  /// The last execution that moved this row, and the release it installed. Plain
+  /// columns, NOT foreign keys: history is pruned on a retention schedule while state
+  /// must outlive it, and a state row that vanished because its execution aged out would
+  /// be a far worse outcome than an opaque id.
+  lastExecutionId  String?
+  currentReleaseId String?
+  /// The version actually running, as last verified. Same semver CHECK, so it is
+  /// comparable by `compareModuleVersions` for the upgrade/rollback ordering gate.
+  currentVersion   String?
+  /// The version this instance would roll BACK to. NULL means no rollback is available —
+  /// the honest answer for a first deployment, and never a silent fallback to "the
+  /// previous row I happened to find".
+  previousVersion  String?
+
+  /// Short code from the last failed execution, mirrored here so the admin list can show
+  /// WHY an instance is FAILED without joining the execution history.
+  lastErrorCode String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  /// The admin list read: everything for one module, and the concurrency guard's lookup
+  /// of instances in an in-flight state.
+  @@index([moduleId, operationalState])
+}
+
+// ============================================================================
+// Phase 50: Official Correspondence / مکاتبات اداری.
+//
+// A REAL BUSINESS DOMAIN module, registered in CoreAppModule (and AppModule) beside
+// the other 49-series capabilities, following the same hardening doctrine:
+//
+//  - Identity, tenant, sender, creator and classification authorization are ALWAYS
+//    server-derived (RequestContextService + PermissionService). No route accepts a
+//    sender, tenant, recipient authorization or workflow status from the browser.
+//  - `tenantId` follows the Survey/Ticket convention: a snapshot column, never
+//    projected to the client, and the isolation key for every read.
+//  - Letter numbering is server-side, deterministic per (tenant, Jalali year),
+//    allocated by an atomic `INSERT … ON CONFLICT DO UPDATE … RETURNING` on
+//    `LetterNumberCounter` — never client-generated, never random.
+//  - RECEIVED / VIEWED / ACTION_REQUIRED / REFERRED are NOT canonical letter states
+//    (a letter viewed by one recipient is not "viewed" for another): they live on
+//    `LetterRecipient` and `LetterReferral`, which is where those transitions are
+//    actually per-subject. The canonical `LetterStatus` is DRAFT / READY_TO_SEND /
+//    SENT / CANCELLED.
+//  - Rich text is stored ONLY after an allowlist sanitizer has run on the server
+//    (see correspondence-sanitize.util.ts). Nothing in the client is trusted.
+//  - BCC privacy is a PROJECTION rule enforced in the service: BCC rows exist for
+//    delivery, but their identities are selected only for the sender and the tenant
+//    correspondence manager.
+//  - CC/Archive/inbox semantics are per-subject rows; "حذف از لیست" never deletes the
+//    canonical letter.
+// ============================================================================
+
+enum LetterStatus {
+  DRAFT
+  READY_TO_SEND
+  SCHEDULED
+  SENT
+  CANCELLED
+}
+
+enum LetterUrgency {
+  NORMAL
+  IMPORTANT
+  URGENT
+  CRITICAL
+}
+
+enum LetterClassification {
+  NORMAL
+  CONFIDENTIAL
+  SECRET
+}
+
+enum LetterRecipientKind {
+  TO
+  CC
+  BCC
+}
+
+/// Per-subject delivery/reading state of one recipient. DELIVERED is set when the
+/// send commits; VIEWED / READ come from explicit server-side marks (never guessed);
+/// ACTION_REQUIRED / REFERRED / ACTED come from the referral workflow.
+enum LetterRecipientState {
+  DELIVERED
+  VIEWED
+  READ
+  ACTION_REQUIRED
+  REFERRED
+  ACTED
+}
+
+enum ReferralLevel {
+  NORMAL
+  INFORM
+  REVIEW
+  DECIDE
+  EXECUTE
+  FINAL_APPROVE
+}
+
+enum ReferralStatus {
+  PENDING
+  VIEWED
+  ACTED
+}
+
+enum LetterTrackingEventType {
+  CREATED
+  SENT
+  VIEWED
+  READ
+  REFERRED
+  REFERRAL_ACTED
+  CLASSIFICATION_CHANGED
+  ARCHIVED
+  UNARCHIVED
+}
+
+/// One official letter — the canonical record. The letter number is minted at send
+/// time (drafts carry none), which is also what makes the numbering race irrelevant:
+/// two concurrent sends of the same draft cannot both pass the conditional update.
+///
+/// `tenantId` is nullable following the Survey/Ticket column convention, but the
+/// service REQUIRES a tenant context to create or send: a letter without an
+/// organization has no directory to address and no archive to live in.
+model Letter {
+  id String @id @default(uuid())
+  tenantId String?
+
+  /// `AR-{JalaliYear}-{5-digit seq}` e.g. `AR-1405-00042`, allocated server-side at
+  /// send. UNIQUE per tenant; NULL while the letter is a draft or cancelled draft.
+  letterNumber String?
+
+  /// Bounded by a DB CHECK as well as by the DTO.
+  subject String
+
+  /// SERVER-SANITIZED allowlisted rich text. Stored only after
+  /// `sanitizeLetterBody` has run; never stored raw from a client.
+  bodyHtml String
+
+  /// Free-text category (مکاتبات اداری، درخواست مرخصی، …). Not an enum: the taxonomy
+  /// is operational, and no code branches on it.
+  category String?
+
+  urgency        LetterUrgency        @default(NORMAL)
+  classification LetterClassification @default(NORMAL)
+  status         LetterStatus         @default(DRAFT)
+
+  /// تاریخ نامه — the official letter date, canonically stored as an instant at
+  /// 00:00 Asia/Tehran converted server-side from the Jalali date key.
+  letterDate DateTime?
+
+  /// Send at a future time. If set and in the future, the letter is stored as
+  /// SCHEDULED and a background job sends it when due.
+  scheduledAt DateTime?
+
+  /// The sender IS the creator. Resolved from RequestContextService; never a body field.
+  senderId String
+  sender   User   @relation("LetterSender", fields: [senderId], references: [id], onDelete: Cascade)
+
+  /// "حذف از لیست" for the sender's own outgoing view. Never deletes the letter.
+  senderRemovedAt DateTime?
+
+  /// Idempotency key for the SEND operation (UNIQUE). A retried send carrying the
+  /// same key returns the already-sent letter instead of minting a duplicate —
+  /// the database, not client timing, arbitrates "sent exactly once".
+  sendKey String? @unique
+
+  readyAt     DateTime?
+  sentAt      DateTime?
+  cancelledAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  recipients  LetterRecipient[]
+  attachments LetterAttachment[]
+  referrals   LetterReferral[]
+  tracking    LetterTrackingEvent[]
+  archives    LetterArchive[]
+
+  /// Optional signature (drawn or uploaded PNG) attached to the letter.
+  signatureId String? @unique
+  signature   LetterSignature? @relation(fields: [signatureId], references: [id])
+
+  /// Numbering counter reads + per-tenant list queries lead with tenantId.
+  @@unique([tenantId, letterNumber])
+  @@index([tenantId, senderId, createdAt(sort: Desc), id(sort: Desc)])
+  @@index([tenantId, status, createdAt(sort: Desc), id(sort: Desc)])
+  @@index([tenantId, letterNumber])
+  @@index([senderId])
+}
+
+/// Per-(tenant, Jalali-year) numbering counter. The counter is allocated inside the
+/// send transaction by `INSERT … ON CONFLICT ("tenantId","year") DO UPDATE … RETURNING`,
+/// so a numbering race between concurrent sends is resolved by the database, not by
+/// application timing. tenantId is NOT nullable here: the service refuses to mint a
+/// number for a caller without tenant context, and Postgres would otherwise treat
+/// NULLs as distinct in the unique key.
+model LetterNumberCounter {
+  id       String @id @default(uuid())
+  tenantId String
+  /// Jalali year of the send instant, computed server-side via jalali.util.
+  year     Int
+  /// Last allocated sequence number for this (tenant, year). Never decremented.
+  counter  Int    @default(0)
+
+  @@unique([tenantId, year])
+}
+
+/// One addressed recipient of one letter. UNIQUE per (letter, user): a user appears
+/// ONCE per letter with ONE kind, so "TO and also CC" collapses to TO (the stronger
+/// need-to-know edge), decided server-side at recipient-set write time.
+model LetterRecipient {
+  id       String @id @default(uuid())
+  letterId String
+  userId   String
+
+  /// Snapshot of the recipient's tenant; the service refuses a recipient whose
+  /// tenant differs from the letter's.
+  tenantId String?
+
+  kind LetterRecipientKind @default(TO)
+
+  state       LetterRecipientState @default(DELIVERED)
+  deliveredAt DateTime?
+  viewedAt    DateTime?
+  readAt      DateTime?
+  actedAt     DateTime?
+
+  /// Remove from MY inbox (حذف از صندوق). Never deletes the letter.
+  removedAt DateTime?
+
+  createdAt DateTime @default(now())
+
+  letter Letter @relation(fields: [letterId], references: [id], onDelete: Cascade)
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([letterId, userId])
+  /// Serves the inbox: my rows, tenant-scoped, not removed, newest delivery first.
+  @@index([userId, deliveredAt(sort: Desc), id(sort: Desc)])
+  @@index([letterId, kind])
+}
+
+/// Referral / ارجاع. History is IMMUTABLE: there is no edit or delete of a referral
+/// row anywhere in the service, only status transitions (PENDING → VIEWED → ACTED).
+/// `clientKey` is an idempotency key (UNIQUE) so a retried or replayed create cannot
+/// mint a second identical referral — the first write wins with 409 for the loser.
+model LetterReferral {
+  id       String @id @default(uuid())
+  letterId String
+  tenantId String?
+
+  fromUserId String
+  from       User   @relation("ReferralFrom", fields: [fromUserId], references: [id], onDelete: Cascade)
+  toUserId   String
+  to         User   @relation("ReferralTo", fields: [toUserId], references: [id], onDelete: Cascade)
+
+  /// Snapshot of the letter's urgency at referral time, so a later letter edit
+  /// cannot retroactively rewrite what the referrer asked.
+  urgency LetterUrgency @default(NORMAL)
+  level   ReferralLevel @default(NORMAL)
+
+  /// Bounded by a DB CHECK as well as by the DTO.
+  instruction String?
+
+  /// محرمانه. The service sets this TRUE automatically for CONFIDENTIAL/SECRET
+  /// letters and refuses a client attempt to unset it.
+  isConfidential Boolean @default(false)
+
+  /// حذف از کارتابل پس از ارجاع. REAL domain behavior: when TRUE, the referrer's own
+  /// recipient row gets `removedAt` stamped in the same transaction as the referral.
+  removeFromInbox Boolean @default(false)
+
+  /// Idempotency/replay guard. UNIQUE; nullable because a referral created without
+  /// a client key carries none.
+  clientKey String? @unique
+
+  status      ReferralStatus @default(PENDING)
+  viewedAt    DateTime?
+  actedAt     DateTime?
+  completedAt DateTime?
+
+  createdAt DateTime @default(now())
+
+  letter Letter @relation(fields: [letterId], references: [id], onDelete: Cascade)
+
+  /// History read: all referrals of one letter, oldest first.
+  @@index([letterId, createdAt, id])
+  /// Serves the referrer's cartable and the target's cartable.
+  @@index([toUserId, status, createdAt(sort: Desc), id(sort: Desc)])
+  @@index([fromUserId, createdAt(sort: Desc), id(sort: Desc)])
+}
+
+/// Append-only operational trace. Written by the server on real actions only; never
+/// written for unauthorized access attempts. NOT every row is an audit row — only
+/// security-sensitive mutations reach AuditLog, matching the 49H doctrine.
+model LetterTrackingEvent {
+  id       String @id @default(uuid())
+  letterId String
+
+  type LetterTrackingEventType
+
+  /// Null for system-generated events; SetNull so removing a user never deletes
+  /// the letter's trace.
+  actorId String?
+  actor   User?   @relation("LetterTrackingActor", fields: [actorId], references: [id], onDelete: SetNull)
+
+  /// The recipient subject the event concerns (VIEWED/READ by whom).
+  recipientUserId String?
+  metadata        Json?
+
+  createdAt DateTime @default(now())
+
+  letter Letter @relation(fields: [letterId], references: [id], onDelete: Cascade)
+
+  /// Timeline read: one letter's events, oldest → newest, deterministic on ties.
+  @@index([letterId, createdAt, id])
+}
+
+/// Attachment on a letter, reusing the MinIO IStorageProvider and the 49F
+/// store-then-cleanup-on-failure ordering. Files live in object storage; only this
+/// metadata row is in core_db. SVG is deliberately excluded by the shared allowlist.
+model LetterAttachment {
+  id       String @id @default(uuid())
+  letterId String
+
+  uploadedBy     String
+  uploadedByUser User @relation("LetterAttachmentUploadedBy", fields: [uploadedBy], references: [id], onDelete: Cascade)
+
+  /// Bounded, character-closed basename. Never a client-controlled path component.
+  fileName  String
+  mimeType  String
+  /// Hard ceiling 10 MB, CHECKed in the migration and enforced in the service.
+  size      Int
+
+  /// Server-built key: `correspondence/{letterId}/{attachmentId}/{safeFileName}`.
+  /// Never leaves the server; download returns a signed URL only.
+  storageKey String
+
+  createdAt DateTime @default(now())
+
+  letter Letter @relation(fields: [letterId], references: [id], onDelete: Cascade)
+
+  @@index([letterId, createdAt])
+}
+
+/// Signature drawn or uploaded for a letter. Kept as a separate entity so it can be
+/// created before the letter exists and linked at send/draft-save time.
+model LetterSignature {
+  id       String @id @default(uuid())
+  tenantId String?
+  userId   String
+  user     User @relation("LetterSignatureUploadedBy", fields: [userId], references: [id], onDelete: Cascade)
+
+  fileName  String
+  mimeType  String
+  /// Hard ceiling 2 MB, enforced in the service.
+  size      Int
+
+  /// Server-built key: `correspondence/signatures/{userId}/{signatureId}/{safeFileName}`.
+  storageKey String
+
+  createdAt DateTime @default(now())
+
+  letter Letter?
+}
+
+/// Attachments uploaded before a draft exists. Moved into LetterAttachment when the
+/// draft is saved/sent; otherwise cleaned up by a background retention job.
+model LetterTempAttachment {
+  id       String @id @default(uuid())
+  tenantId String?
+
+  uploadedBy     String
+  uploadedByUser User @relation("LetterTempAttachmentUploadedBy", fields: [uploadedBy], references: [id], onDelete: Cascade)
+
+  fileName  String
+  mimeType  String
+  /// Hard ceiling 10 MB, enforced in the service.
+  size      Int
+
+  /// Server-built key: `correspondence/temp/{userId}/{attachmentId}/{safeFileName}`.
+  storageKey String
+
+  createdAt DateTime @default(now())
+
+  @@index([uploadedBy, createdAt])
+}
+
+/// Personal archive folder (پوشه بایگانی). Owned by exactly one user, inside that
+/// user's tenant. Depth is limited to TWO levels below the root (reference behavior)
+/// and enforced in the service; the DB cannot express depth, so the unique key covers
+/// sibling names instead.
+model ArchiveFolder {
+  id       String @id @default(uuid())
+  tenantId String?
+  ownerId  String
+  owner    User   @relation("ArchiveFolderOwner", fields: [ownerId], references: [id], onDelete: Cascade)
+
+  /// Bounded by a DB CHECK as well as by the DTO.
+  name String
+
+  /// NULL = root folder. Sibling names are unique under the same parent; a NULL
+  /// parent is distinct per row in Postgres' default semantics, so two roots with
+  /// the same name are possible by the index alone and REJECTED in the service.
+  parentId String?
+  parent   ArchiveFolder?  @relation("ArchiveFolderTree", fields: [parentId], references: [id], onDelete: Cascade)
+  children ArchiveFolder[] @relation("ArchiveFolderTree")
+
+  createdAt DateTime @default(now())
+
+  entries LetterArchive[]
+
+  @@index([ownerId, parentId])
+}
+
+/// One user's personal archive entry for one letter. UNIQUE per (letter, user), so
+/// re-archiving moves the entry (a new folder) instead of duplicating it. Setting
+/// `removedAt` (unarchive) keeps the row — an unarchive is a visible state, not a
+/// forgotten history.
+model LetterArchive {
+  id       String @id @default(uuid())
+  letterId String
+  userId   String
+  user     User   @relation("LetterArchiveOwner", fields: [userId], references: [id], onDelete: Cascade)
+
+  folderId String?
+  folder   ArchiveFolder? @relation(fields: [folderId], references: [id], onDelete: SetNull)
+
+  archivedAt DateTime @default(now())
+  removedAt  DateTime?
+
+  letter Letter @relation(fields: [letterId], references: [id], onDelete: Cascade)
+
+  @@unique([letterId, userId])
+  /// Serves the archive page: my entries, per folder, not unarchived.
+  @@index([userId, folderId, archivedAt(sort: Desc), id(sort: Desc)])
+}

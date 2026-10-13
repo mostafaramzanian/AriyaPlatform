@@ -1,0 +1,21 @@
+-- Phase PRODUCTION-BOM-HEADER: register the PRODUCTION domain member on PermissionDomain.
+--
+-- WHY THIS IS ITS OWN MIGRATION (and why the seed is a separate, later one):
+-- PostgreSQL 12+ allows `ALTER TYPE ... ADD VALUE` inside a transaction, but the new value
+-- CANNOT BE USED until the transaction that added it commits (SQLSTATE 55P04, "unsafe use
+-- of new value"). This repository has already paid for learning that once — the first
+-- version of Phase 50 put the ALTER and the permission INSERTs in ONE migration and failed
+-- on every deployment with 55P04 — which is why
+-- 20260912120500_add_correspondence_permission_domain,
+-- 20260916100000_add_hr_permission_domain and
+-- 20260926100000_add_commerce_permission_domain are each standalone files, and why this
+-- one is too: the enum member is added HERE, committed by this migration, and consumed by
+-- the INSERTs in 20261002100100_seed_production_permission_grants.
+--
+-- The `PRODUCTION` member itself is a business domain keeping its own domain tag rather
+-- than hiding under ADMIN — the same reasoning the CORRESPONDENCE comment records as the
+-- first business-domain member, and the one COMMERCE and HR repeat.
+--
+-- Idempotent: IF NOT EXISTS makes a re-run a no-op.
+
+ALTER TYPE "PermissionDomain" ADD VALUE IF NOT EXISTS 'PRODUCTION';

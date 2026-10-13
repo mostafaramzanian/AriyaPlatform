@@ -1,0 +1,233 @@
+// CMS Prisma schema (Phase 33J)
+// Owns Blog/Content-Management data only. This project is physically and
+// logically independent from the Core Prisma project
+// (apps/api/prisma/core/schema.prisma). CMS must never share a Prisma
+// client, a migration history, or a physical foreign key with Core.
+//
+// Per DC-CMS-01 (approved, Phase 33D/33E): authorId, editorId, uploadedBy,
+// and userId below are plain identifiers referencing Core's User.id. There
+// is NO physical foreign key and NO Prisma relation to Core's User model.
+datasource db {
+  provider = "postgresql"
+  url      = env("CMS_DATABASE_URL")
+}
+
+generator client {
+  provider      = "prisma-client-js"
+  output        = "../../src/generated/cms-client"
+  binaryTargets = ["native", "linux-musl-openssl-3.0.x"]
+}
+
+// Blog post status enum
+enum BlogStatus {
+  DRAFT // Work in progress, not visible to public
+  REVIEW // Submitted for review by publisher
+  SCHEDULED // Ready to publish at scheduled time
+  PUBLISHED // Live and visible to public
+  ARCHIVED // Intentionally hidden but soft-deleted
+}
+
+// CMS role enum for content permissions
+enum CmsRole {
+  AUTHOR // Can create and edit own posts
+  EDITOR // Can edit all posts and manage categories/tags
+  PUBLISHER // Can approve and publish posts
+}
+
+enum MediaType {
+  IMAGE
+  VIDEO
+  DOCUMENT
+  AUDIO
+}
+
+// Media model for storing file metadata (images, videos, documents)
+// Supports multiple media types and stores references for MinIO/S3
+model Media {
+  id         String    @id @default(uuid())
+  name       String // Original file name
+  slug       String    @unique // URL-friendly identifier
+  type       MediaType
+  mimeType   String // e.g., "image/jpeg", "video/mp4"
+  size       Int // File size in bytes
+  width      Int? // Image width in pixels
+  height     Int? // Image height in pixels
+  duration   Int? // Video/audio duration in seconds
+  path       String // Storage path (MinIO key)
+  url        String // Public URL
+  altText    String? // Accessibility text
+  caption    String? // Media caption
+  uploadedBy String @db.Text // User ID (DC-CMS-01: plain identifier, no physical FK to Core.User)
+  tags       String[]  @default([]) // For media organization
+  metadata   Json? // EXIF data, processing info, etc.
+  deletedAt  DateTime? // Soft delete
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+
+  blogPosts BlogPost[] @relation("FeaturedImage")
+
+  @@index([slug])
+  @@index([type])
+  @@index([uploadedBy])
+  @@index([createdAt])
+}
+
+// Category model for organizing blog posts
+model Category {
+  id           String    @id @default(uuid())
+  name         String // e.g., "Product Updates", "Best Practices"
+  slug         String    @unique // URL-friendly: "product-updates"
+  description  String? // SEO description
+  icon         String? // Icon name or emoji
+  displayOrder Int       @default(0) // For sorting in UI
+  isActive     Boolean   @default(true)
+  deletedAt    DateTime? // Soft delete
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  blogPosts BlogPostCategory[]
+
+  @@index([slug])
+  @@index([isActive])
+  @@index([createdAt])
+}
+
+// Tag model for flexible post labeling
+model Tag {
+  id        String    @id @default(uuid())
+  name      String // e.g., "saas", "marketing"
+  slug      String    @unique // URL-friendly: "saas"
+  color     String? // Hex color for UI
+  usage     Int       @default(0) // Denormalized for performance
+  deletedAt DateTime? // Soft delete
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  blogPosts BlogPostTag[]
+
+  @@index([slug])
+  @@index([usage])
+  @@index([createdAt])
+}
+
+// Many-to-many: BlogPost <-> Category
+model BlogPostCategory {
+  id           String   @id @default(uuid())
+  blogPostId   String
+  categoryId   String
+  displayOrder Int      @default(0)
+  createdAt    DateTime @default(now())
+
+  blogPost BlogPost @relation(fields: [blogPostId], references: [id], onDelete: Cascade)
+  category Category @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+
+  @@unique([blogPostId, categoryId])
+  @@index([blogPostId])
+  @@index([categoryId])
+}
+
+// Many-to-many: BlogPost <-> Tag
+model BlogPostTag {
+  id         String   @id @default(uuid())
+  blogPostId String
+  tagId      String
+  createdAt  DateTime @default(now())
+
+  blogPost BlogPost @relation(fields: [blogPostId], references: [id], onDelete: Cascade)
+  tag      Tag      @relation(fields: [tagId], references: [id], onDelete: Cascade)
+
+  @@unique([blogPostId, tagId])
+  @@index([blogPostId])
+  @@index([tagId])
+}
+
+// SEO Metadata model (One-to-one with BlogPost)
+// Handles search engine optimization and social media sharing
+model SeoMetadata {
+  id              String   @id @default(uuid())
+  blogPostId      String   @unique // One-to-one relation
+  metaTitle       String? // Page title (50-60 chars ideal)
+  metaDescription String? // Meta description (150-160 chars ideal)
+  ogImage         String? // Open Graph image URL
+  ogImageAlt      String? // Alt text for OG image
+  keywords        String[] @default([]) // Target keywords
+  canonicalUrl    String? // For duplicate content handling
+  noindex         Boolean  @default(false) // Exclude from search results
+  nofollow        Boolean  @default(false) // Don't follow links
+  structuredData  Json? // JSON-LD schema.org data
+  robotsDirective String   @default("index, follow") // robots.txt directive
+  locale          String   @default("en_US") // BCP 47 language tag
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  blogPost BlogPost @relation(fields: [blogPostId], references: [id], onDelete: Cascade)
+
+  @@index([blogPostId])
+  @@index([noindex])
+}
+
+// BlogPost model - main content entity
+// Core model for all blog articles on the marketing website
+model BlogPost {
+  id              String     @id @default(uuid())
+  title           String // Article title
+  slug            String     @unique // URL path: "/blog/how-to-integrate-saas"
+  excerpt         String? // Summary/preview text
+  content         String // Rich text content (markdown or HTML)
+  status          BlogStatus @default(DRAFT)
+  authorId        String @db.Text // User who created/owns the post (DC-CMS-01: plain identifier, no physical FK to Core.User)
+  editorId        String? @db.Text // Last editor (DC-CMS-01: plain identifier, no physical FK to Core.User)
+  publishedAt     DateTime? // When post was published
+  scheduledAt     DateTime? // Scheduled publish time (for future publishing)
+  featuredImageId String? // MinIO media reference
+  readingTimeMin  Int? // Estimated reading time in minutes
+  viewCount       Int        @default(0) // Analytics
+  likeCount       Int        @default(0) // Engagement
+  commentCount    Int        @default(0) // Engagement tracking
+
+  // i18n support: reserve for future multilingual content
+  language String @default("en") // BCP 47 language tag
+
+  // SEO metadata
+  deletedAt       DateTime? // Soft delete
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+  lastPublishedAt DateTime? // Track last publish time
+
+  // Relations
+  featuredImage Media?             @relation("FeaturedImage", fields: [featuredImageId], references: [id], onDelete: SetNull)
+  categories    BlogPostCategory[]
+  tags          BlogPostTag[]
+  seoMetadata   SeoMetadata? // One-to-one
+
+  // Indexes for query performance and sort
+  @@index([slug])
+  @@index([status])
+  @@index([publishedAt])
+  @@index([scheduledAt])
+  @@index([authorId])
+  @@index([editorId])
+  @@index([featuredImageId])
+  @@index([createdAt])
+  @@index([updatedAt])
+  @@index([language])
+  @@index([deletedAt])
+  // Composite indexes for common queries
+  @@index([status, publishedAt]) // Published posts sorted by date
+  @@index([status, createdAt]) // Posts by status and creation
+  @@index([authorId, status]) // Author's posts by status
+}
+
+// CMS User Permissions (future: for granular CMS role management)
+// Currently uses User.status, but CMS can extend this
+model CmsUserPermission {
+  id        String   @id @default(uuid())
+  userId    String @db.Text // DC-CMS-01: plain identifier, no physical FK to Core.User
+  role      CmsRole
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([userId, role])
+  @@index([userId])
+  @@index([role])
+}

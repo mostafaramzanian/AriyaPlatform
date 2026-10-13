@@ -1,0 +1,87 @@
+# Runtime image for the Ariya ERP API. Independent of Dockerfile.backend, which is
+# left unchanged for CI and E2E.
+#
+# Ships only: production node_modules for apps/api, the compiled dist, the Prisma
+# schemas/migrations for every datasource, and the runtime-policy-pruned Prisma clients.
+# Never copied: apps/api/test, jest-e2e.json, prisma/seed.ts, scripts/ (except
+# runtime-policy.mjs, used only in the builder), debug scripts, .env files, .git,
+# web app sources, and any node_modules/dist/.next from the host.
+
+# ---- builder: full install, build, prune -------------------------------------------
+# Node 24: the NestJS 12 / pino 10 dependency floor is >=22.12 (and the validated
+# dev toolchain is 24.16), so node:20 no longer satisfies the runtime engines.
+FROM node:24-alpine AS builder
+
+WORKDIR /app
+
+RUN apk add --no-cache python3 make g++ openssl openssl-dev
+
+COPY package.json package-lock.json .npmrc ./
+COPY apps/api/package.json ./apps/api/
+COPY apps/web/package.json ./apps/web/
+COPY packages ./packages
+
+RUN npm ci --workspace=apps/api --include-workspace-root --no-audit --prefer-offline
+
+COPY apps/api/tsconfig.json apps/api/tsconfig.build.json ./apps/api/
+COPY apps/api/src ./apps/api/src
+COPY apps/api/prisma ./apps/api/prisma
+COPY apps/api/runtime-policy.json ./apps/api/
+COPY apps/api/scripts/runtime-policy.mjs ./apps/api/scripts/
+
+# `npm run build` runs prebuild (rimraf dist + src/generated), prisma:generate for every
+# Prisma project, nest build, then postbuild (src/generated -> dist/generated).
+RUN npm run build --workspace=apps/api
+
+# Prune Prisma clients the combined runtime does not use. Same derived list as
+# Dockerfile.backend, computed from apps/api/runtime-policy.json.
+RUN for client in $(node apps/api/scripts/runtime-policy.mjs prune-clients-for combined); do \
+      rm -rf "/app/apps/api/src/generated/$client" "/app/apps/api/dist/generated/$client"; \
+    done
+
+# ---- runner: production dependencies only ------------------------------------------
+FROM node:24-alpine AS runner
+
+ENV NODE_ENV=production
+
+WORKDIR /app
+
+RUN apk add --no-cache openssl
+
+COPY package.json package-lock.json .npmrc ./
+COPY apps/api/package.json ./apps/api/
+COPY apps/web/package.json ./apps/web/
+# Stage 5.1: the source manifests carry the CI seed hooks (required by the CI
+# workflow and the e2e global-setup), but the runtime artifact must not ship
+# them. The seed file itself is already excluded by .dockerignore; strip the
+# hooks here so the shipped manifests are seed-free.
+RUN node -e "const fs=require('fs');const p=JSON.parse(fs.readFileSync('package.json','utf8'));delete p.scripts['db:seed'];fs.writeFileSync('package.json',JSON.stringify(p,null,2)+'\n');const a=JSON.parse(fs.readFileSync('apps/api/package.json','utf8'));delete a.scripts['db:seed'];delete a.prisma;fs.writeFileSync('apps/api/package.json',JSON.stringify(a,null,2)+'\n')"
+COPY packages ./packages
+
+RUN npm ci --workspace=apps/api --include-workspace-root --omit=dev --no-audit --prefer-offline
+
+# Prisma schemas and migration history for every datasource. The Prisma CLI is a
+# production dependency of apps/api, so `npm run db:migrate:*` works in this image.
+COPY --from=builder /app/apps/api/prisma/core ./apps/api/prisma/core
+COPY --from=builder /app/apps/api/prisma/cms ./apps/api/prisma/cms
+COPY --from=builder /app/apps/api/prisma/observability ./apps/api/prisma/observability
+COPY --from=builder /app/apps/api/prisma/correspondence ./apps/api/prisma/correspondence
+COPY --from=builder /app/apps/api/prisma/hr ./apps/api/prisma/hr
+COPY --from=builder /app/apps/api/prisma/commerce ./apps/api/prisma/commerce
+COPY --from=builder /app/apps/api/prisma/production ./apps/api/prisma/production
+COPY --from=builder /app/apps/api/prisma/financial ./apps/api/prisma/financial
+COPY --from=builder /app/apps/api/prisma/migrations ./apps/api/prisma/migrations
+
+# Generated Prisma clients (pruned) from the builder, not from the runner install.
+COPY --from=builder /app/node_modules/.prisma /app/node_modules/.prisma
+
+COPY --from=builder /app/apps/api/dist ./apps/api/dist
+COPY --from=builder /app/apps/api/src/generated ./apps/api/src/generated
+
+WORKDIR /app/apps/api
+
+USER node
+
+EXPOSE 3001
+
+CMD ["node", "dist/main.js"]
