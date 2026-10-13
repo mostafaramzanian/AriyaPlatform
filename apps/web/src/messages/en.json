@@ -1,0 +1,31 @@
+{
+  "eyebrow": {
+    "platform": "Platform"
+  },
+  "cta": {
+    "primary": "Request Enterprise Demo",
+    "secondary": "Contact the team",
+    "demo": "Request Enterprise Demo",
+    "book_demo": "Book Demo"
+  },
+  "hero": {
+    "trust_row": "Governance · Auditability · Role controls",
+    "loading": "Loading..."
+  },
+  "form": {
+    "submit": "Submit",
+    "sending": "Sending...",
+    "success_contact": "Message sent successfully! We will contact you shortly.",
+    "success_demo": "Demo request submitted! Our team will reach out within 24 hours."
+  },
+  "nav": {
+    "product": "Product",
+    "technology": "Technology",
+    "resources": "Resources",
+    "about": "About"
+  },
+  "accessibility": {
+    "skip_to_content": "Skip to content",
+    "open_menu": "Open menu"
+  }
+}

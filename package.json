@@ -1,0 +1,63 @@
+{
+  "name": "aria-erp",
+  "version": "1.0.0",
+  "description": "Enterprise-grade SaaS ERP platform",
+  "private": true,
+  "engines": {
+    "node": ">=20.0.0",
+    "npm": ">=10.0.0"
+  },
+  "workspaces": [
+    "apps/web",
+    "apps/api",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "npm run dev --workspace=apps/web & npm run dev --workspace=apps/api",
+    "dev:web": "npm run dev --workspace=apps/web",
+    "dev:api": "npm run dev --workspace=apps/api",
+    "build": "npm run build --workspaces --if-present",
+    "build:web": "npm run build --workspace=apps/web",
+    "build:api": "npm run build --workspace=apps/api",
+    "start": "npm run start --workspace=apps/web & npm run start --workspace=apps/api",
+    "start:web": "npm run start --workspace=apps/web",
+    "start:api": "npm run start --workspace=apps/api",
+    "lint": "npm run lint --workspaces --if-present",
+    "format": "prettier --write \"**/*.{js,jsx,ts,tsx,json,css,md}\" --ignore-path .gitignore",
+    "format:check": "prettier --check \"**/*.{js,jsx,ts,tsx,json,css,md}\" --ignore-path .gitignore",
+    "test": "npm run test --workspaces --if-present",
+    "test:web": "npm run test --workspace=apps/web",
+    "test:api": "npm run test --workspace=apps/api",
+    "db:migrate": "npm run db:migrate --workspace=apps/api",
+    "db:migrate:core": "npm run prisma:migrate:core --workspace=apps/api",
+    "db:migrate:cms": "npm run prisma:migrate:cms --workspace=apps/api",
+    "db:migrate:observability": "npm run prisma:migrate:observability --workspace=apps/api",
+    "db:migrate:correspondence": "npm run prisma:migrate:correspondence --workspace=apps/api",
+    "db:migrate:hr": "npm run prisma:migrate:hr --workspace=apps/api",
+    "db:migrate:commerce": "npm run prisma:migrate:commerce --workspace=apps/api",
+    "db:migrate:production": "npm run prisma:migrate:production --workspace=apps/api",
+    "db:migrate:financial": "npm run prisma:migrate:financial --workspace=apps/api",
+    "db:seed": "npm run db:seed --workspace=apps/api",
+    "test:architecture": "npm run test:architecture --workspace=apps/api",
+    "test:policy": "npm run test:policy --workspace=apps/api",
+    "arch:policy": "npm run arch:policy --workspace=apps/api",
+    "prisma:verify:enums": "npm run prisma:verify:enums --workspace=apps/api",
+    "docker:verify:artifacts": "npm run docker:verify:artifacts --workspace=apps/api",
+    "verify:drift": "npm run verify:drift --workspace=apps/api",
+    "test:e2e:financial-check": "npm run docker:up && npm run test:e2e:financial-check --workspace=apps/api",
+    "docker:up": "docker-compose up -d --build",
+    "docker:down": "docker-compose down",
+    "clean": "npm run clean --workspaces --if-present && rm -rf node_modules"
+  },
+  "devDependencies": {
+    "@nestjs/cli": "11.0.24",
+    "@nestjs/platform-express": "^12.0.0",
+    "@nestjs/schematics": "11.1.0",
+    "@types/node": "^20.0.0",
+    "chokidar": "4.0.3",
+    "eslint": "^9.39.5",
+    "prettier": "^3.2.5",
+    "rxjs": "7.8.2",
+    "typescript": "^5.3.3"
+  }
+}

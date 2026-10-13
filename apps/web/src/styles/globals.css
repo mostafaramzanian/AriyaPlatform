@@ -1,0 +1,396 @@
+/*
+ * Typography — Lovable-aligned font stacks.
+ *
+ * The core UI face is the same Vazirmatn family the lovable reference uses,
+ * served self-hosted (imported in `src/app/layout.tsx` as
+ * `@fontsource-variable/vazirmatn`, family name "Vazirmatn Variable").
+ * The stack mirrors lovable's `--font-sans` order: Vazirmatn Variable first
+ * (the webfont we bundle), then the static `Vazirmatn` name for systems that
+ * have it installed locally, then the same ui-sans-serif/system-ui fallbacks.
+ *
+ * NOTE: lovable's body rule carries `font-feature-settings: "ss01", "cv11"`.
+ * Vazirmatn's GSUB table defines neither tag (only calt/ccmp/liga/locl/rlig/
+ * tnum/...), so they render as no-ops; we keep the tags for exact styling
+ * parity with the lovable reference.
+ */
+:root {
+  --font-sans: 'Vazirmatn Variable', 'Vazirmatn', ui-sans-serif, system-ui, sans-serif;
+  --font-mono: ui-monospace, 'SF Mono', SFMono-Regular, Menlo, Monaco, Consolas,
+    'Liberation Mono', 'Courier New', monospace;
+}
+
+@config '../../tailwind.config.ts';
+@import 'tailwindcss';
+
+/* Custom variables */
+/* ---------------------------------------------------------------------------
+ * THEME — exact port of the lovable reference theme (`lovable/src/styles.css`).
+ *
+ * Lovable defines every token in `oklch()`. To keep Tailwind 3.4 opacity
+ * modifiers (`bg-primary/10`, `ring-ring/30`, ...) working, each variable below
+ * holds the oklch CHANNEL TRIPLET (`L C H`), and `tailwind.config.ts` wraps it
+ * as `oklch(var(--x) / <alpha-value>)`.
+ * - `--input` / `--sidebar-border` carry alpha inside the var in dark mode
+ *   (lovable values `1 0 0 / 10%`, `1 0 0 / 6%`), so their config mapping has
+ *   no `<alpha-value>` placeholder — they are never used with modifiers.
+ * - `--border` is used with modifiers a lot (`border-border/70`, ...), so its
+ *   dark-mode tone comes from `--border-alpha` (0.08 = lovable `1 0 0 / 8%`)
+ *   via a `var(--border-alpha, <alpha-value>)` fallback in the config.
+ *
+ * Values here match lovable EXACTLY — light and dark.
+ * ------------------------------------------------------------------------- */
+:root {
+  /* Brand / neutral scale — lovable oklch, hue ≈ 265–280 (indigo/violet). */
+  --primary: 0.36 0.16 270;
+  --primary-foreground: 0.99 0 0;
+  --primary-glow: 0.58 0.20 275;
+  --secondary: 0.96 0.01 260;
+  --secondary-foreground: 0.25 0.05 265;
+  --background: 0.985 0.005 250;
+  --foreground: 0.18 0.04 265;
+  --surface: 1 0 0;
+  --surface-muted: 0.96 0.01 260;
+  --accent: 0.94 0.04 270;
+  --accent-foreground: 0.30 0.10 270;
+  --destructive: 0.60 0.22 25;
+  --destructive-foreground: 0.99 0 0;
+  --muted: 0.96 0.01 260;
+  --muted-foreground: 0.50 0.03 260;
+  --border: 0.92 0.01 260;
+  --input: 0.92 0.01 260;
+  --ring: 0.58 0.18 275;
+  --card: 1 0 0;
+  --card-foreground: 0.18 0.04 265;
+  --popover: 1 0 0;
+  --popover-foreground: 0.18 0.04 265;
+  --success: 0.65 0.16 155;
+  --warning: 0.78 0.16 75;
+  --info: 0.65 0.15 230;
+  --radius: 0.75rem;
+
+  /* Sidebar is an always-dark surface in both themes (lovable token). */
+  --sidebar: 0.22 0.06 265;
+  --sidebar-foreground: 0.95 0.02 260;
+  --sidebar-accent: 0.32 0.10 270;
+  --sidebar-border: 0.30 0.06 265 / 50%;
+
+  /* Depth tokens — lovable shadows. */
+  --shadow-soft: 0 18px 45px -28px rgba(15, 23, 42, 0.32);
+  --shadow-card: 0 1px 3px oklch(0 0 0 / 0.04), 0 8px 24px -6px oklch(0 0 0 / 0.06);
+  --shadow-elevated: 0 10px 40px -10px oklch(0.30 0.10 270 / 0.20);
+  --shadow-glow: 0 8px 32px -8px oklch(0.58 0.20 275 / 0.35);
+
+  /* Shape / motion — lovable gradients. */
+  --gradient-primary: linear-gradient(135deg, oklch(var(--primary)) 0%, oklch(var(--primary-glow)) 100%);
+  --gradient-sidebar: linear-gradient(180deg, oklch(0.18 0.05 265) 0%, oklch(0.13 0.04 270) 100%);
+  --gradient-hero: radial-gradient(ellipse at top, oklch(0.62 0.20 275 / 0.15), transparent 60%);
+}
+
+/*
+ * Dark theme.
+ *
+ * Applied by ThemeProvider through `.dark` + `data-theme="dark"` on <html>, set
+ * by an inline pre-paint script so there is no flash. Frontend-only: the
+ * preference lives in localStorage, never in the backend or the database.
+ */
+.dark,
+:root[data-theme='dark'] {
+  --background: 0.14 0.025 265;
+  --foreground: 0.96 0.01 260;
+  --surface: 0.19 0.035 265;
+  --surface-muted: 0.24 0.04 265;
+  --card: 0.19 0.035 265;
+  --card-foreground: 0.96 0.01 260;
+  --popover: 0.19 0.035 265;
+  --popover-foreground: 0.96 0.01 260;
+  --primary: 0.62 0.20 275;
+  --primary-foreground: 0.99 0 0;
+  --primary-glow: 0.72 0.22 280;
+  --secondary: 0.24 0.04 265;
+  --secondary-foreground: 0.96 0.01 260;
+  --muted: 0.24 0.04 265;
+  --muted-foreground: 0.68 0.03 260;
+  --accent: 0.30 0.08 270;
+  --accent-foreground: 0.96 0.01 260;
+  --destructive: 0.62 0.22 25;
+  --destructive-foreground: 0.99 0 0;
+  --success: 0.70 0.17 155;
+  --warning: 0.80 0.17 75;
+  --info: 0.70 0.15 230;
+  --border: 1 0 0;
+  --border-alpha: 0.08; /* lovable `oklch(1 0 0 / 8%)` — applied via config fallback */
+  --input: 1 0 0 / 10%;
+  --ring: 0.62 0.20 275;
+  --sidebar: 0.16 0.03 265;
+  --sidebar-foreground: 0.95 0.02 260;
+  --sidebar-accent: 0.28 0.08 270;
+  --sidebar-border: 1 0 0 / 6%;
+
+  --shadow-soft: 0 18px 45px -28px rgba(0, 0, 0, 0.7);
+  --shadow-card: 0 1px 3px oklch(0 0 0 / 0.04), 0 8px 24px -6px oklch(0 0 0 / 0.06);
+  --shadow-elevated: 0 10px 40px -10px oklch(0.30 0.10 270 / 0.20);
+  /* Lovable keeps the gradients and shadow-glow identical in dark mode;
+     only the text/background tokens shift. */
+  --gradient-sidebar: linear-gradient(180deg, oklch(0.18 0.05 265) 0%, oklch(0.13 0.04 270) 100%);
+  --gradient-hero: radial-gradient(ellipse at top, oklch(0.62 0.20 275 / 0.15), transparent 60%);
+}
+
+/*
+ * ============================================================================
+ * Phase 49K: personalization tokens — density, text scale, motion.
+ *
+ * All three are driven by DATA ATTRIBUTES on <html>, written before first paint
+ * by `ThemeScript` and kept current by `ThemeProvider`, exactly like the
+ * `[data-theme]` block above. Nothing here is a per-component override: a
+ * component opts in through the Tailwind aliases declared in
+ * `tailwind.config.ts` (`h-core-row`, `h-core-header`, `p-core-card`,
+ * `p-core-card-lg`, `gap-core-gap`), so a density change is one declaration per
+ * token instead of a variant on every card and nav row.
+ *
+ * The COMFORTABLE values below are the spacing the Core shell already hardcoded
+ * (`h-11` rows, `h-[72px]` header, `p-6` cards / `md:p-8` at wide, `gap-6`
+ * grid), restated as tokens so the default rendering is unchanged by this phase.
+ *
+ * WHY A SECOND CARD PAD: the approved 48C reference escalates card padding at
+ * `md:` (`p-6 md:p-8`). If only the base step were a token, that `md:p-8` would
+ * pin every card back to 2rem at exactly the widths where density matters most
+ * (a 1366×768 laptop is already past `lg:`), so COMPACT would visibly do almost
+ * nothing on desktop. Both steps are tokens, so the escalation survives and
+ * compact applies at every breakpoint.
+ * ============================================================================
+ */
+:root {
+  --core-row-h: 2.75rem;
+  --core-row-sm-h: 2.25rem;
+  --core-header-h: 4.5rem;
+  --core-card-pad: 1.5rem;
+  --core-card-pad-lg: 2rem;
+  --core-gap: 1.5rem;
+
+  /* Root font-size multiplier. 1 = 100%, the untouched default. */
+  --text-scale: 1;
+}
+
+:root[data-density='compact'] {
+  --core-row-h: 2.25rem;
+  --core-row-sm-h: 1.875rem;
+  --core-header-h: 3.5rem;
+  --core-card-pad: 1rem;
+  --core-card-pad-lg: 1.25rem;
+  --core-gap: 1rem;
+}
+
+/*
+ * The four enumerated steps, matching the `UserPreference_textScale_allowed`
+ * CHECK and `TEXT_SCALE_STEPS` in the API DTO. Enumerated, not a range: an
+ * attribute the stylesheet has no rule for simply renders at 100% instead of
+ * producing a size no control can undo.
+ */
+:root[data-text-scale='110'] {
+  --text-scale: 1.1;
+}
+
+:root[data-text-scale='125'] {
+  --text-scale: 1.25;
+}
+
+:root[data-text-scale='140'] {
+  --text-scale: 1.4;
+}
+
+/* Smooth scroll behavior */
+html {
+  /* Lovable applies its font stack on <html> so every element inherits it,
+     including inputs/buttons that reset font-family to inherit. */
+  font-family: var(--font-sans);
+  scroll-behavior: smooth;
+  /*
+   * `100%` is the INHERITED browser base, not a hardcoded 16px, so a user who
+   * already enlarged their browser's default font keeps that base and this
+   * multiplies it rather than silently overriding their own setting.
+   */
+  font-size: calc(100% * var(--text-scale));
+}
+
+/*
+ * Motion. Three states, matching `MotionPreference` in the Core schema:
+ *
+ *  - SYSTEM (`data-motion="system"`, or the attribute absent) — follow the OS
+ *    switch, which the Core shell previously ignored entirely (WCAG 2.3.3).
+ *  - REDUCED (`data-motion="reduced"`) — force reduction even when the OS is
+ *    silent about it.
+ *  - FULL (`data-motion="full"`) — keep animation even when the OS switch is
+ *    ON, because that switch is global: a user who enabled it for one hostile
+ *    application must still be able to opt back in here.
+ *
+ * Reduction is a NEAR-ZERO duration rather than `none`, so `transitionend` and
+ * `animationend` listeners still fire and nothing ends up waiting forever for
+ * an event that was optimised away.
+ */
+@media (prefers-reduced-motion: reduce) {
+  :root:not([data-motion='full']) *,
+  :root:not([data-motion='full']) *::before,
+  :root:not([data-motion='full']) *::after {
+    animation-duration: 0.01ms !important;
+    animation-delay: 0ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    transition-delay: 0ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+:root[data-motion='reduced'] *,
+:root[data-motion='reduced'] *::before,
+:root[data-motion='reduced'] *::after {
+  animation-duration: 0.01ms !important;
+  animation-delay: 0ms !important;
+  animation-iteration-count: 1 !important;
+  transition-duration: 0.01ms !important;
+  transition-delay: 0ms !important;
+  scroll-behavior: auto !important;
+}
+
+body {
+  font-family: var(--font-sans);
+  /* Parity with the lovable reference's body rule. Both tags are no-ops for
+     Vazirmatn (see the note at the top of this file). */
+  font-feature-settings: 'ss01', 'cv11';
+  background-color: oklch(var(--background));
+  color: oklch(var(--foreground));
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+}
+html[dir='rtl'] { direction: rtl; }
+
+::selection {
+  background: oklch(var(--primary) / 0.2);
+  color: oklch(var(--foreground));
+}
+
+@layer components {
+  .container-shell {
+    @apply mx-auto w-full max-w-7xl px-6 sm:px-8 lg:px-10;
+  }
+
+  .section-shell {
+    @apply py-20 sm:py-24 lg:py-32;
+  }
+
+  .section-title {
+    @apply text-3xl font-semibold tracking-tight text-foreground sm:text-4xl;
+  }
+
+  .eyebrow {
+    @apply inline-flex items-center rounded-full border border-border bg-surface px-3 py-1 text-xs font-medium uppercase tracking-[0.24em] text-muted-foreground;
+  }
+
+  .card-panel {
+    @apply rounded-[1.75rem] border border-border/80 bg-surface shadow-card;
+  }
+
+  /*
+   * Core UI surface: flatter radius and a tighter border than the marketing
+   * `card-panel`, matching the approved reference's card treatment.
+   */
+  .core-card {
+    @apply rounded-2xl border border-border bg-card text-card-foreground shadow-card;
+  }
+
+  /*
+   * Stage 5 CI fix: Tailwind v4 (locked 4.3.3) only allows @apply of utilities
+   * or @utility-registered classes, and `.core-card` here is a plain CSS class
+   * (not registered anywhere as a utility), so `@apply core-card` failed the
+   * web build with "Cannot apply unknown utility class". The six declarations
+   * are inlined instead — rendered output and cascade position are unchanged
+   * for both classes and for every consumer.
+   */
+  .core-card-interactive {
+    @apply rounded-2xl border border-border bg-card text-card-foreground shadow-card transition-all duration-300 hover:-translate-y-0.5 hover:border-primary/30 hover:shadow-elevated;
+  }
+
+  .btn-primary {
+    @apply inline-flex items-center justify-center rounded-full bg-primary px-6 py-3 text-sm font-semibold text-primary-foreground transition-all duration-200 hover:-translate-y-0.5 hover:bg-primary/90;
+  }
+
+  .btn-secondary {
+    @apply inline-flex items-center justify-center rounded-full border border-border bg-surface px-6 py-3 text-sm font-semibold text-foreground transition-all duration-200 hover:-translate-y-0.5 hover:border-primary/40 hover:text-primary;
+  }
+
+  /*
+   * X1 (49K): the skip link is the first focusable element in the whole app, so it is
+   * also the first place a keyboard user learns whether this UI was built for them.
+   *
+   * Three fixes here, all inside the existing rule:
+   *  - `start-4` instead of `left-4`. The document is `dir="rtl"`, so a physical `left`
+   *    offset put the revealed link on the visually TRAILING side, away from where focus
+   *    starts.
+   *  - `fixed` instead of `absolute`, so the link is visible where the user is rather
+   *    than at the top of a document they may have scrolled past.
+   *  - Theme tokens instead of `bg-white`. With a hardcoded white panel and the inherited
+   *    near-white foreground of the dark theme, the label was white-on-white: present in
+   *    the a11y tree, invisible on screen.
+   */
+  .skip-link {
+    @apply sr-only focus:not-sr-only focus:fixed focus:top-4 focus:start-4 focus:z-[60] focus:rounded-md focus:border focus:border-border focus:bg-surface focus:px-4 focus:py-2 focus:text-sm focus:font-medium focus:text-foreground focus:shadow-elevated focus:outline-none focus:ring-2 focus:ring-ring;
+  }
+}
+
+@layer utilities {
+  /* Frosted header/overlay treatment from the reference. */
+  .glass {
+    background-color: oklch(var(--surface) / 0.72);
+    backdrop-filter: blur(16px) saturate(160%);
+    -webkit-backdrop-filter: blur(16px) saturate(160%);
+  }
+
+  .gradient-primary {
+    background-image: var(--gradient-primary);
+  }
+
+  .gradient-sidebar {
+    background-image: var(--gradient-sidebar);
+  }
+
+  .gradient-text {
+    background-image: var(--gradient-primary);
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+
+  .hero-glow {
+    background-image: var(--gradient-hero);
+  }
+}
+
+/* Focus-visible for accessibility */
+:focus-visible {
+  outline: 2px solid oklch(var(--ring));
+  outline-offset: 2px;
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: oklch(var(--background));
+}
+
+::-webkit-scrollbar-thumb {
+  background: oklch(var(--muted));
+  border-radius: 999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: oklch(var(--muted-foreground));
+}
+
+/* Firefox scrollbar */
+* {
+  scrollbar-color: oklch(var(--muted)) oklch(var(--background));
+  scrollbar-width: thin;
+}

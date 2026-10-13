@@ -1,0 +1,566 @@
+// Observability Prisma schema (Phase 49M-2)
+//
+// Owns Application Logs / Audit Events / Security Events / normalized platform
+// Lifecycle Events. This project is physically and logically independent from the
+// Core Prisma project (apps/api/prisma/core/schema.prisma) and the CMS one
+// (apps/api/prisma/cms/schema.prisma), exactly as 33J established for Core↔CMS:
+// three Prisma projects, three clients, three migration histories, three
+// databases, and never a shared physical foreign key.
+//
+// WHY A THIRD DATABASE RATHER THAN MORE TABLES IN core_db
+// ------------------------------------------------------
+// This is a data-volume decision, not a stylistic one. `core_db."AuditLog"` already
+// holds 35,757 rows / 17 MB across five weeks of development-scale traffic, and 94%
+// of those rows are `validation_failed` (21,401) and `unauthorized` (12,031) — i.e.
+// the HIGH-CARDINALITY, LOW-VALUE stream that an observability platform is supposed
+// to absorb. Adding request-level application logging to the same physical database
+// would put an unbounded-growth, write-heavy, retention-managed workload on the same
+// disk, WAL, autovacuum budget and connection pool as identity, RBAC and every
+// business transaction. A retention DELETE over millions of log rows would then
+// compete with a login.
+//
+// Consequences accepted deliberately:
+//   - NO physical foreign key to Core. `userId`, `tenantId`, `moduleId`, `instanceId`
+//     and `actorId` below are PLAIN IDENTIFIERS referencing Core rows, following the
+//     DC-CMS-01 precedent. A log line survives deletion of its user; that is correct
+//     for an audit trail and mandatory for a log.
+//   - NO cross-database JOIN. Reads project ids and the API resolves display names
+//     from Core separately when it needs to, which it mostly does not.
+//   - NO transactional coupling. An observability write can never participate in a
+//     business transaction, which is exactly the property §22 requires: observability
+//     failure must not fail the request being observed.
+//
+// core_db."AuditLog" IS DELIBERATELY LEFT IN PLACE, unmoved and unmirrored (§51 KEEP).
+// It has three live consumers — `AuditService.log` (writer),
+// `AuditDispatcherService` (RabbitMQ redelivery reader) and
+// `UsersService.getLoginHistory` (the /users/me/login-history surface). Copying its
+// 35,757 rows here would create two truths about the same past with no reconciliation
+// rule. This schema owns events recorded FROM 49M-2 ONWARD.
+datasource db {
+  provider = "postgresql"
+  url      = env("OBSERVABILITY_DATABASE_URL")
+}
+
+generator client {
+  provider      = "prisma-client-js"
+  output        = "../../src/generated/observability-client"
+  binaryTargets = ["native", "linux-musl-openssl-3.0.x"]
+}
+
+/// Severity of an application log line.
+///
+/// The pino level names, one-for-one, because `pino-config.ts` and `LOG_LEVEL` already
+/// speak them: a second vocabulary would mean translating a level twice and getting it
+/// wrong once. TRACE/DEBUG/INFO are the DROPPABLE tier (see the writer's drop policy);
+/// WARN and above are best-effort but are never the first thing shed under pressure.
+enum LogLevel {
+  TRACE
+  DEBUG
+  INFO
+  WARN
+  ERROR
+  FATAL
+}
+
+/// Who caused an audited change.
+///
+/// SYSTEM is not "unknown": it means a background pass, a scheduler tick or a startup
+/// task acted with no human on the request path. ANONYMOUS means an unauthenticated
+/// caller reached a public route. Collapsing the two would make "nobody was logged in"
+/// indistinguishable from "no human was involved", which is the first question asked of
+/// any audit trail.
+enum ActorType {
+  USER
+  MODULE
+  SYSTEM
+  ANONYMOUS
+}
+
+/// Result of an audited attempt.
+///
+/// DENIED is separate from FAILURE on purpose: an authorization refusal is a security
+/// signal, while a failure is an operational one. A single boolean `success` — the shape
+/// `core_db."AuditLog"` uses — cannot distinguish them, which is why 12,031 of its rows
+/// are an undifferentiated `unauthorized`.
+enum AuditOutcome {
+  SUCCESS
+  FAILURE
+  DENIED
+}
+
+/// Classes of security-relevant event.
+///
+/// A CLOSED SET, because these are routed on and alerted on. Every member below
+/// corresponds to something this repository can actually observe today —
+/// `LocalStrategy`/`AuthService` for the auth members, `RolesGuard` for
+/// AUTHORIZATION_DENIED, `RateLimitMiddleware` for RATE_LIMIT_EXCEEDED,
+/// `integration-url.guard.ts` for SSRF_BLOCKED, the HMAC verifiers in 49L/49M for
+/// SIGNATURE_INVALID, and the refresh-token rotation path for TOKEN_REUSE_DETECTED.
+/// Nothing here is speculative.
+enum SecurityEventType {
+  LOGIN_SUCCEEDED
+  LOGIN_FAILED
+  LOGOUT
+  TOKEN_REFRESHED
+  TOKEN_REUSE_DETECTED
+  PASSWORD_CHANGED
+  AUTHENTICATION_MISSING
+  AUTHORIZATION_DENIED
+  RATE_LIMIT_EXCEEDED
+  SIGNATURE_INVALID
+  SSRF_BLOCKED
+  VALIDATION_REJECTED
+  SUSPICIOUS_PAYLOAD
+}
+
+/// Operator-facing severity of a security event.
+///
+/// Distinct from `LogLevel` deliberately: a single failed login is INFO as a log line
+/// and LOW as a security signal, and an SSRF refusal is a successful defence (so not an
+/// ERROR) that an operator still needs to see (so not LOW).
+enum SecuritySeverity {
+  INFO
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+}
+
+/// Which platform seam a lifecycle event came from.
+///
+/// Three members, matching the three platforms that already emit lifecycle transitions:
+/// 49L integrations, 49M module registry/health, 49M-1 provisioning. There is no
+/// BUSINESS member and there will not be one — a business module emits through the same
+/// three seams or not at all.
+enum LifecycleDomain {
+  INTEGRATION
+  MODULE
+  PROVISIONING
+}
+
+/// Normalized phase of a lifecycle transition.
+///
+/// The union of the terminal vocabularies 49L/49M/49M-1 already use
+/// (PENDING/SENT/ACCEPTED/FAILED, HEALTHY/DEGRADED/UNAVAILABLE,
+/// PENDING/RUNNING/SUCCEEDED/FAILED, plus their refusal codes), reduced to the six
+/// outcomes that are comparable ACROSS domains. The domain-specific code is preserved
+/// verbatim in `outcomeCode`, so normalizing here loses nothing.
+enum LifecyclePhase {
+  STARTED
+  SUCCEEDED
+  FAILED
+  SKIPPED
+  REFUSED
+  TIMEOUT
+}
+
+/// One structured application log line.
+///
+/// THE DROPPABLE TABLE. This is the only model in the schema whose rows the writer is
+/// permitted to discard rather than persist (TRACE/DEBUG/INFO first, then WARN) when the
+/// bounded queue is full. That asymmetry with `AuditEvent`/`SecurityEvent` is the central
+/// design decision of the phase: a log line is diagnostic, an audit row is a record.
+///
+/// FOUR THINGS THIS MODEL DELIBERATELY DOES NOT STORE, and their absence is the privacy
+/// boundary rather than an omission:
+///   - NO request body and NO response body. `context` is a small structured bag written
+///     by the emitting code, never a captured payload.
+///   - NO headers. `Authorization`, `Cookie` and `x-api-key` cannot leak from a table
+///     that has no column for them; `audit-redactor.util.ts` is still applied to
+///     `context` as defence in depth.
+///   - NO raw query string. `route` is the matched Nest route pattern
+///     (`/users/:id`), not `req.originalUrl`, so ids and tokens embedded in a URL are
+///     never persisted and cardinality stays bounded.
+///   - NO free-form-only identity. `messageCode` is a stable enum-like code and
+///     `message` is the human sentence; dashboards group on the former.
+model ApplicationLog {
+  id String @id @default(uuid())
+
+  /// Emission time, set by the WRITER at enqueue and not by the flush, so a log line
+  /// carries when it happened rather than when the batch drained.
+  occurredAt DateTime @default(now())
+
+  level LogLevel
+
+  /// Stable machine code, e.g. `HTTP_REQUEST_COMPLETED`. Bounded vocabulary declared in
+  /// `observability.contract.ts`; a code not in that list is rejected before enqueue, so
+  /// this column cannot become unbounded.
+  messageCode String @db.VarChar(80)
+
+  /// Human sentence. Never parsed, never grouped on.
+  message String @db.VarChar(1000)
+
+  /// Emitting logical area, e.g. `http`, `auth`, `integrations`, `module-platform`.
+  source String @db.VarChar(64)
+
+  /// Deployment identity, so one table can hold lines from the combined process, the
+  /// Core-only process and a remote module without them being indistinguishable.
+  service     String  @db.VarChar(64)
+  environment String  @db.VarChar(32)
+  instanceRef String? @db.VarChar(96)
+
+  /// Correlation triple, carried from `RequestContextService` / the OTel context. These
+  /// are what make a log line joinable to an audit row, a security event and a lifecycle
+  /// event without a foreign key.
+  requestId     String? @db.VarChar(64)
+  correlationId String? @db.VarChar(64)
+  traceId       String? @db.VarChar(64)
+  spanId        String? @db.VarChar(32)
+
+  /// Plain identifiers (no FK — see the header). NULL for unauthenticated traffic, which
+  /// is information rather than a gap.
+  userId   String? @db.VarChar(64)
+  tenantId String? @db.VarChar(64)
+
+  /// HTTP facts, present only for lines emitted by the request interceptor.
+  httpMethod String? @db.VarChar(10)
+  route      String? @db.VarChar(200)
+  statusCode Int?
+  durationMs Int?
+
+  /// Distributed-platform attribution, for lines emitted while serving or calling a
+  /// registered module (49M). Plain columns, no FK to core_db."ModuleRegistration".
+  moduleId       String? @db.VarChar(64)
+  instanceId     String? @db.VarChar(96)
+  deploymentMode String? @db.VarChar(16)
+
+  /// Small structured bag, ALWAYS passed through `redactPayload` before insert and capped
+  /// by `MAX_CONTEXT_BYTES`. Json rather than columns because the useful keys differ per
+  /// `messageCode` and inventing a column per caller is how a log table becomes a schema
+  /// migration per feature.
+  context Json?
+
+  /// Error identity for ERROR/FATAL lines. `errorStack` is truncated and is NOT indexed:
+  /// it is read when one row is opened, never searched across rows.
+  errorName    String? @db.VarChar(160)
+  errorMessage String? @db.VarChar(1000)
+  errorStack   String?
+
+  createdAt DateTime @default(now())
+
+  /// INDEX STRATEGY (§21). Every read surface has a mandatory time range, so `occurredAt`
+  /// leads or co-leads every index — a filter without it would be a sequential scan of the
+  /// largest table in the system.
+  @@index([occurredAt])
+  @@index([level, occurredAt])
+  @@index([source, occurredAt])
+  @@index([messageCode, occurredAt])
+  @@index([requestId])
+  @@index([correlationId])
+  @@index([traceId])
+  @@index([userId, occurredAt])
+  @@index([tenantId, occurredAt])
+  @@index([moduleId, occurredAt])
+  @@index([statusCode, occurredAt])
+}
+
+/// One audited state change.
+///
+/// THE DURABLE PATH. Unlike `ApplicationLog`, an `AuditEvent` is NEVER dropped: the
+/// writer persists it on the request path (awaited, with a finite timeout) rather than
+/// through the droppable queue. If the observability database is unreachable the write
+/// fails and is reported through the health probe and a pino line — it is not silently
+/// discarded, and it still does not fail the business request (§22).
+///
+/// RELATIONSHIP TO core_db."AuditLog" (§51 KEEP, decided explicitly):
+///   - core_db."AuditLog" KEEPS its three existing consumers and is not migrated, mirrored
+///     or truncated by this phase. Its writer, its RabbitMQ dispatcher and
+///     `/users/me/login-history` are untouched.
+///   - This model is where NEW audit emission goes, through `ObservabilityAuditService`.
+///     It is a strict superset in expressive power: `actorType` distinguishes SYSTEM from
+///     ANONYMOUS, `outcome` distinguishes DENIED from FAILURE, and `traceId` ties a change
+///     to the request that made it.
+///   - No reconciliation job, no dual-write of the same event, and no code path that reads
+///     one and writes the other. Two tables, two eras, one documented boundary.
+model AuditEvent {
+  id String @id @default(uuid())
+
+  occurredAt DateTime @default(now())
+
+  /// Domain-owned action name, e.g. `MODULE_REGISTERED`, `integration.secret.rotated`.
+  /// Free-form by design: an audited action belongs to the capability that performs it, and
+  /// an enum here would mean every new capability edits this schema.
+  action String @db.VarChar(120)
+
+  /// WHAT was changed. `resourceType` is a stable class name; `resourceId` is the row id
+  /// (or a stable natural key) — never a URL, so it stays joinable.
+  resourceType String  @db.VarChar(80)
+  resourceId   String? @db.VarChar(200)
+
+  /// WHO. `actorType` is required, `actorId` is not: a SYSTEM or ANONYMOUS actor has no id,
+  /// and inventing a synthetic one would make "no human did this" unsearchable.
+  actorType ActorType
+  actorId   String?   @db.VarChar(64)
+  /// Snapshot of the actor's role name at the time of the change, so history stays readable
+  /// after a role reassignment. A label, never an authorization input.
+  actorRole String?   @db.VarChar(64)
+
+  outcome AuditOutcome
+
+  /// Why, when the outcome was not SUCCESS. A message, never a stack trace.
+  reason String? @db.VarChar(500)
+
+  /// Tenant snapshot. NULL is its own bucket and is never read as "any tenant" — every
+  /// tenant-scoped read applies the caller's predicate unconditionally, including when it
+  /// is null.
+  tenantId String? @db.VarChar(64)
+
+  /// Correlation, so an audit row, the log lines around it and the security event it may
+  /// have produced are one story.
+  requestId     String? @db.VarChar(64)
+  correlationId String? @db.VarChar(64)
+  traceId       String? @db.VarChar(64)
+
+  /// Request provenance. `ipAddress` is stored because an audit trail without origin is
+  /// half an answer; `userAgent` is truncated.
+  ipAddress String? @db.VarChar(64)
+  userAgent String? @db.VarChar(400)
+
+  /// Redacted before/after snapshots and the changed key list.
+  ///
+  /// PASSED THROUGH `redactPayload` WITH email/phone MASKING, exactly as
+  /// `AuditService.log` already does, and additionally capped: an over-large payload is
+  /// replaced by its size + checksum rather than truncated mid-structure, so a reader can
+  /// tell "this was too big" from "this was empty".
+  beforeValue   Json?
+  afterValue    Json?
+  changedFields String[] @default([])
+
+  /// Distributed attribution for changes made by or on behalf of a registered module.
+  moduleId   String? @db.VarChar(64)
+  instanceId String? @db.VarChar(96)
+
+  durationMs Int?
+
+  createdAt DateTime @default(now())
+
+  @@index([occurredAt])
+  @@index([action, occurredAt])
+  @@index([resourceType, resourceId, occurredAt])
+  @@index([actorId, occurredAt])
+  @@index([actorType, occurredAt])
+  @@index([outcome, occurredAt])
+  @@index([tenantId, occurredAt])
+  @@index([correlationId])
+  @@index([traceId])
+  @@index([moduleId, occurredAt])
+}
+
+/// One security-relevant event.
+///
+/// ALSO ON THE DURABLE PATH, and separate from `AuditEvent` for a reason that is
+/// structural rather than organisational: a security event is not necessarily a state
+/// change. A denied request, a rate-limit trip, a rejected signature and a blocked SSRF
+/// target all changed NOTHING — modelling them as audit rows would require a fake
+/// `resourceType`/`action` pair for every one, and would put "someone tried and failed"
+/// in the same table as "someone succeeded and here is the diff".
+///
+/// It is also read by a DIFFERENT role. `admin.security.read` is held by SUPER_ADMIN and
+/// SECURITY_ADMIN; `admin.audit.read` is additionally held by ADMIN. One table would mean
+/// one permission, which would either widen security visibility or narrow audit
+/// visibility.
+///
+/// NO CREDENTIAL MATERIAL IS EVER STORED HERE. There is no column for a password, a token,
+/// a signature, a secret or a header — not even a hash of one. `detail` is redacted before
+/// insert, so even a caller that put a token in a field name cannot land one in this table.
+model SecurityEvent {
+  id String @id @default(uuid())
+
+  occurredAt DateTime @default(now())
+
+  eventType SecurityEventType
+  severity  SecuritySeverity
+
+  /// Whether the attempt succeeded. FALSE is the common case here — a security event is
+  /// usually a refusal — which is exactly why it must be explicit rather than inferred
+  /// from `eventType`.
+  succeeded Boolean
+
+  /// WHO, when known. NULL for a pre-authentication event, which is the honest state: a
+  /// failed login has an attempted identifier, not a user.
+  actorType ActorType
+  actorId   String?   @db.VarChar(64)
+
+  /// The identifier that was ATTEMPTED, for pre-auth events.
+  ///
+  /// MASKED BEFORE INSERT by `redactPayload`'s email masking (`a***@example.com`), never
+  /// stored raw: a security table full of plaintext account identifiers is itself a
+  /// disclosure risk, and the masked form is enough to correlate repeated attempts.
+  attemptedIdentifier String? @db.VarChar(160)
+
+  /// WHERE from. The single most useful field on this table.
+  ipAddress String? @db.VarChar(64)
+  userAgent String? @db.VarChar(400)
+
+  /// WHAT was targeted. `route` is the matched route pattern, never the raw URL.
+  httpMethod String? @db.VarChar(10)
+  route      String? @db.VarChar(200)
+
+  /// The permission or scope that was required and refused, for AUTHORIZATION_DENIED.
+  /// A permission STRING, which is public information — not a role list, not a token.
+  requiredPermission String? @db.VarChar(120)
+
+  tenantId String? @db.VarChar(64)
+
+  requestId     String? @db.VarChar(64)
+  correlationId String? @db.VarChar(64)
+  traceId       String? @db.VarChar(64)
+
+  /// Distributed attribution, for events raised while serving or calling a module.
+  moduleId   String? @db.VarChar(64)
+  instanceId String? @db.VarChar(96)
+
+  /// Stable machine reason code, e.g. `SIGNATURE_MISMATCH`, `PRIVATE_TARGET_BLOCKED`.
+  /// Bounded in the contract file, so alerting can key on it.
+  reasonCode String? @db.VarChar(80)
+
+  /// Redacted structured detail. Capped like `ApplicationLog.context`.
+  detail Json?
+
+  createdAt DateTime @default(now())
+
+  @@index([occurredAt])
+  @@index([eventType, occurredAt])
+  @@index([severity, occurredAt])
+  @@index([succeeded, occurredAt])
+  @@index([actorId, occurredAt])
+  @@index([ipAddress, occurredAt])
+  @@index([tenantId, occurredAt])
+  @@index([correlationId])
+  @@index([traceId])
+  @@index([moduleId, occurredAt])
+}
+
+/// One normalized platform lifecycle event.
+///
+/// ONE DISCRIMINATED MODEL RATHER THAN THREE TABLES (integration / module /
+/// provisioning), and the reason is the read surface: an operator asking "what happened to
+/// the finance module in the last hour" wants provisioning steps, health transitions and
+/// automation dispatches interleaved on one timeline. Three tables would mean three
+/// queries and a client-side merge, and a UNION across differently-shaped tables is
+/// exactly the normalization this model performs once, in the schema.
+///
+/// `domain` + `eventType` is the discriminator; `outcomeCode` preserves the ORIGINAL
+/// domain code verbatim (`SSRF_BLOCKED`, `HEARTBEAT_STALE`, `EXECUTION_IN_PROGRESS`,
+/// `NOT_NEWER`, …) so normalizing to six `LifecyclePhase` values never destroys the
+/// specific reason.
+///
+/// THIS TABLE DOES NOT REPLACE `AutomationExecution` OR `ModuleProvisioningExecution`.
+/// Those are core_db STATE — claimed by retry passes, constrained by unique idempotency
+/// keys, and read to decide what to do next. This is an append-only HISTORY of
+/// transitions, written after the fact, which nothing in Core reads to make a decision.
+/// Confusing the two would put an observability write inside a claim window.
+model LifecycleEvent {
+  id String @id @default(uuid())
+
+  occurredAt DateTime @default(now())
+
+  domain LifecycleDomain
+
+  /// Domain event name, e.g. `automation.dispatched`, `module.heartbeat.received`,
+  /// `provisioning.step.completed`. Free-form for the same reason `AuditEvent.action` is:
+  /// the emitting capability owns its vocabulary.
+  eventType String @db.VarChar(120)
+
+  phase LifecyclePhase
+
+  /// The ORIGINAL domain-specific code, unnormalized. This is the field an engineer reads;
+  /// `phase` is the field a dashboard groups by.
+  outcomeCode String? @db.VarChar(80)
+
+  /// The subject. `subjectType` is the kind of thing (`integration`, `module`, `instance`,
+  /// `execution`, `release`, `target`), `subjectId` its id, `subjectKey` its human key
+  /// (`N8N`, `finance`, `finance-prod-01`). Plain columns, no FK — a lifecycle event must
+  /// survive the deletion of what it describes, which is the whole point of keeping the
+  /// history in a different database.
+  subjectType String  @db.VarChar(40)
+  subjectId   String? @db.VarChar(64)
+  subjectKey  String? @db.VarChar(120)
+
+  /// Logical module attribution, denormalized so the timeline query above is a single
+  /// index scan rather than a scan plus a subject-type case analysis.
+  moduleId   String? @db.VarChar(64)
+  instanceId String? @db.VarChar(96)
+
+  /// Correlation carried END TO END (§: Integration → remote module → n8n). This is what
+  /// makes "the ticket that triggered the automation that called the module" one query.
+  requestId     String? @db.VarChar(64)
+  correlationId String? @db.VarChar(64)
+  traceId       String? @db.VarChar(64)
+
+  /// Who initiated it, when a human did. NULL for a heartbeat, a sweep tick or a retry
+  /// pass — all three are SYSTEM-initiated and saying so is information.
+  actorType ActorType
+  actorId   String?   @db.VarChar(64)
+
+  tenantId String? @db.VarChar(64)
+
+  /// How long the step took, when the emitter measured it.
+  durationMs Int?
+
+  /// Attempt number for retried operations, so a timeline shows three attempts rather than
+  /// three indistinguishable failures.
+  attempt Int?
+
+  /// Redacted structured detail. NEVER an event payload, a webhook body, a credential or an
+  /// endpoint URL — a lifecycle event records that something happened to a subject, not what
+  /// was sent to it.
+  detail Json?
+
+  createdAt DateTime @default(now())
+
+  @@index([occurredAt])
+  @@index([domain, occurredAt])
+  @@index([domain, eventType, occurredAt])
+  @@index([phase, occurredAt])
+  @@index([subjectType, subjectId, occurredAt])
+  @@index([moduleId, occurredAt])
+  @@index([instanceId, occurredAt])
+  @@index([correlationId])
+  @@index([traceId])
+  @@index([tenantId, occurredAt])
+}
+
+/// Result of one retention pass.
+///
+/// WHY RETENTION IS A TABLE AND NOT JUST A CRON LINE: a pass that deletes 400,000 rows and
+/// a pass that deleted nothing because the database was unreachable look identical from
+/// outside, and "is retention actually running" is the first question asked when a disk
+/// fills. Each pass records what it targeted, how many rows it removed and how long it
+/// took, so the answer is a query rather than a guess.
+///
+/// It is also the only table in this schema that is NOT deleted by retention — the history
+/// of deletions must outlive the data it deleted, and it grows at one row per pass per
+/// category, which is bounded by configuration rather than by traffic.
+model RetentionRun {
+  id String @id @default(uuid())
+
+  startedAt  DateTime  @default(now())
+  finishedAt DateTime?
+
+  /// Which category the pass targeted: `APPLICATION_LOG`, `AUDIT_EVENT`, `SECURITY_EVENT`,
+  /// `LIFECYCLE_EVENT`. A string rather than an enum because adding a category must not be
+  /// a migration in a table nobody queries by category.
+  category String @db.VarChar(40)
+
+  /// The cutoff applied, derived from the category's retention setting. Recorded so a pass
+  /// is reproducible after the setting changes.
+  cutoff DateTime
+
+  /// Rows actually deleted. Zero is a normal, useful result.
+  deletedCount Int @default(0)
+
+  /// TRUE when the pass stopped at its per-run row cap with more rows still eligible, so an
+  /// operator can tell "retention is keeping up" from "retention is permanently behind".
+  truncated Boolean @default(false)
+
+  succeeded Boolean @default(false)
+
+  /// Failure reason, when the pass did not complete. A message, never a stack trace.
+  errorMessage String? @db.VarChar(500)
+
+  durationMs Int?
+
+  @@index([startedAt])
+  @@index([category, startedAt])
+}

@@ -1,0 +1,118 @@
+# Combined runtime image for Aria ERP.
+# Ships Core, CMS, Correspondence, HR, Commerce, Production and Financial modules;
+# requires Core, CMS, Correspondence, HR, Commerce, Production and Financial datasources
+# at runtime.
+FROM node:20-alpine AS base
+
+WORKDIR /app
+
+# Install system dependencies needed for native modules and Prisma
+RUN apk add --no-cache python3 make g++ openssl openssl-dev
+
+# Build stage - install all deps and build app
+FROM base AS builder
+
+COPY package.json pnpm-lock.yaml* package-lock.json* ./
+COPY apps/api/package.json ./apps/api/
+COPY apps/api/tsconfig*.json ./apps/api/
+COPY packages ./packages
+
+# Install all dependencies (including dev)
+RUN npm ci --prefer-offline --no-audit
+
+# Copy source
+COPY . .
+
+# Phase ARCH-1.3: `npm run build` runs `prisma:generate` for every Prisma project and
+# copies src/generated to dist/generated, then this image prunes what the combined
+# runtime must not carry. The prune list is DERIVED: since Phase 51-HR-1 this runtime
+# marks NO datasource `not-used` (HR joined Core, CMS and Correspondence here), so the
+# only prune is the disclosed opt-out in
+# `runtimes.combined.image.prunedArtifacts` (observability — optional in this runtime,
+# so a pruned artifact degrades it instead of blocking readiness).
+#
+# Order matters: prebuild rimrafs src/generated and postbuild re-copies it, so a prune
+# placed before the build would be undone by it.
+RUN npm run build --workspace=apps/api
+
+RUN for client in $(node apps/api/scripts/runtime-policy.mjs prune-clients-for combined); do \
+      rm -rf "/app/apps/api/src/generated/$client" "/app/apps/api/dist/generated/$client"; \
+    done
+
+# Production stage - copy only what's needed
+FROM base AS runner
+
+ENV NODE_ENV=production
+
+COPY package.json package-lock.json* tsconfig*.json ./
+COPY apps/api/package.json apps/api/tsconfig*.json ./apps/api/
+COPY packages ./packages
+
+# Install all dependencies including dev (for E2E tests)
+RUN npm ci --prefer-offline --no-audit --omit=optional
+
+# Copy Prisma projects needed by the combined runtime.
+COPY --from=builder /app/apps/api/prisma/core ./apps/api/prisma/core
+COPY --from=builder /app/apps/api/prisma/cms ./apps/api/prisma/cms
+# Observability is optional at runtime, but its schema must be present so the
+# repository's own `db:migrate` orchestration (`prisma:migrate:observability`)
+# works inside this image during bootstrap/CI.
+COPY --from=builder /app/apps/api/prisma/observability ./apps/api/prisma/observability
+COPY --from=builder /app/apps/api/prisma/correspondence ./apps/api/prisma/correspondence
+# Phase 51-HR-1: `hr_db` is required by this image, so it must carry the HR schema and
+# its migration history: without them there is no way to bring `hr_db` to the revision
+# the running code expects (`npm run prisma:migrate:hr` inside this layout).
+COPY --from=builder /app/apps/api/prisma/hr ./apps/api/prisma/hr
+# Phase C1: `commerce_db` is required by this image (the combined runtime marks Commerce
+# `required`), so it must carry the Commerce schema and its migration history: without
+# them there is no way to bring `commerce_db` to the revision the running code expects
+# (`npm run prisma:migrate:commerce` inside this layout).
+COPY --from=builder /app/apps/api/prisma/commerce ./apps/api/prisma/commerce
+# Phase PRODUCTION-BOM-HEADER: `production_db` is required by this image (the combined
+# runtime marks Production `required`), so it must carry the Production schema and its
+# migration history for the same reason Commerce's is carried above: without them there is
+# no way to bring `production_db` to the revision the running code expects
+# (`npm run prisma:migrate:production` inside this layout).
+COPY --from=builder /app/apps/api/prisma/production ./apps/api/prisma/production
+# Phase F1 — FINANCIAL FOUNDATION: `finance_db` is required by this image (the combined
+# runtime marks Financial `required`), so it must carry the Financial schema and its
+# migration history for the same reason Production's is carried above: without them there
+# is no way to bring `finance_db` to the revision the running code expects
+# (`npm run prisma:migrate:financial` inside this layout).
+COPY --from=builder /app/apps/api/prisma/financial ./apps/api/prisma/financial
+COPY --from=builder /app/apps/api/prisma/migrations ./apps/api/prisma/migrations
+COPY --from=builder /app/node_modules/.prisma /app/node_modules/.prisma
+
+# Copy the built application (which carries the pruned dist/generated tree).
+COPY --from=builder /app/apps/api/dist ./apps/api/dist
+# Phase ARCH-1.3: wholesale copy of the pruned src/generated tree. The boundary is the
+# derived prune above, not this COPY statement.
+COPY --from=builder /app/apps/api/src ./apps/api/src
+COPY --from=builder /app/apps/api/test ./apps/api/test
+COPY --from=builder /app/apps/api/jest-e2e.json ./apps/api/jest-e2e.json
+
+# Phase 49G-5: NO env file is baked into this image.
+#
+# This stage sets NODE_ENV=production, and it previously copied apps/api/.env.example
+# to .env and apps/api/.env.e2e to .env.local. The second one was the real defect:
+# ConfigModule reads envFilePath '.env.local', so the E2E file — carrying default MinIO
+# credentials and a development JWT secret — became the effective configuration of a
+# production-labelled image, and shipped those values inside every layer.
+#
+# All runtime configuration now arrives as environment variables from the orchestrator
+# (docker-compose environment, Docker secrets, or the deployment's secret mechanism).
+# ConfigModule skips a missing envFilePath, so absence is safe rather than fatal.
+#
+# apps/api/.env.e2e is deliberately NOT copied: E2E stays host-configured through
+# test/jest-setup.ts, and in-container E2E already inherits the compose environment.
+
+WORKDIR /app/apps/api
+
+EXPOSE 3001
+
+# Schema migrations are a dedicated deployment step (`npm run db:migrate`), never container startup.
+# This image's entry point IS the combined composition root: dist/main.js boots AppModule,
+# the only root that registers CommerceModule, HrModule and CorrespondenceModule.
+# dist/core-main.js (Core-only) is a DIFFERENT deployment contract served by
+# Dockerfile.core — it must never be substituted for this image's command.
+CMD ["node", "dist/main.js"]

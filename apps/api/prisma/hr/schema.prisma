@@ -1,0 +1,2115 @@
+// Phase 51-HR-1: the HR datasource's own Prisma project.
+//
+// WHY THIS FILE EXISTS
+// --------------------
+// `runtime-datasources.ts` has declared HR as a DATASOURCE OWNER since ARCH-1.2,
+// with `status: 'target'` — a declaration with no artifacts behind it. This phase
+// turns that target into an implementation: schema, migrations, generated client,
+// `HrPrismaModule` / `HrPrismaService` and a real `src/modules/hr` module.
+//
+// THE BOUNDARY THIS FILE DRAWS
+// ---------------------------
+// HR owns its database (`hr_db`, reached through `HR_DATABASE_URL`) and NOTHING
+// else. In particular:
+//
+//   * There is NO cross-database foreign key. `Employee.userId` is a PLAIN STRING
+//     that happens to hold a Core `"User".id`. PostgreSQL cannot express a FK across
+//     databases, and HR must not try to: Core identity is reached through
+//     `UserDirectoryContract` (`src/platform/user-directory/`), never through a join.
+//   * HR does NOT duplicate Core security fields. No passwordHash, no tokenVersion,
+//     no roles, no permission rows. An `Employee` is not a User; it is the HR domain's
+//     personnel record OF a person who may (or may not yet) have a Core identity.
+//   * `User.department` and `User.jobTitle` are NOT the source of truth for HR
+//     organisation or position. `OrganizationUnit` and `Position` below are.
+//
+// The Core.User lifecycle and the HR employment lifecycle are DELIBERATELY
+// independent (§16): a User may exist before an Employee, an Employee may be
+// INACTIVE while its User is active, terminating employment does not erase history,
+// rehiring appends a new EmploymentRecord, and deleting a Core User must never
+// cascade-delete HR history. Because there is no FK between the two databases, none
+// of that cascading is even expressible — which is the point.
+//
+// SCOPE OF THIS PHASE, AND THE DECISIONS THAT OUTLIVE IT
+// -----------------------------------------------------
+// §10 requires the numbering strategy to be decided ONCE, in 51-HR-1, and kept
+// uniform afterwards. Both decisions are therefore recorded here, together with the
+// reason the tables they describe are not in this file YET.
+//
+//   * DOCUMENT NUMBERING — DECIDED: ONE shared `HrDocumentCounter` with a `kind`
+//     column, keyed `(tenantId, kind, jalaliYear)`, allocated by an atomic
+//     `INSERT … ON CONFLICT DO UPDATE … RETURNING` INSIDE the creating transaction,
+//     so a rolled-back create can never burn a number. NOT per-document tables
+//     (`LeaveRequestNumberCounter`, `MissionNumberCounter`, …): the per-kind table
+//     duplicates the allocation SQL once per document type, and the duplication is
+//     how one of them silently loses its transaction. The table is DELIBERATELY NOT
+//     CREATED HERE, because nothing in 51-HR-1 is numbered — the first request
+//     document arrives with 51-HR-3, and it brings the counter, its CHECK and its
+//     concurrency spec together. A counter with no caller is a table no test can
+//     falsify.
+//   * `Employee.employeeCode` IS NOT COUNTER-GENERATED. A personnel code is an
+//     EXTERNAL, pre-existing fact (a payroll or legacy code the organization already
+//     uses), not an identifier this system mints. It is supplied by the operator and
+//     normalized (see the normalization contract on the Employee model), which is why
+//     the counter above is for documents HR ISSUES, not for people HR records.
+//   * LEAVE BALANCES — NOT IN THIS PHASE, AND NOT IN 51-HR-3A EITHER. `LeaveBalance`
+//     (`(employeeId, jalaliYear)` entitlement / used / requested, UNIQUE, mutated only
+//     inside the approval transaction so concurrent double-approval cannot overdraw —
+//     §13) presupposes an ENTITLEMENT the organization has decided and an APPROVER who
+//     enforces it. 51-HR-3A introduces leave REQUESTS and the tenant-owned leave-type
+//     catalogue (see the LEAVE section at the end of this file) and deliberately records
+//     no balance and no decision: a balance that no authoritative entitlement defines,
+//     moved by no approval, would be a number nothing can validate.
+//
+// What 51-HR-1 does deliver is the whole foundation those phases build ON: the
+// organization tree, the position catalogue, the personnel record and its
+// effective-dated history — the four tables below — plus the datasource, the client,
+// the generated artifacts, the RBAC domain and the HTTP surface.
+
+datasource db {
+  provider = "postgresql"
+  url      = env("HR_DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+  output   = "../../src/generated/hr-client"
+}
+
+// ===========================================================================
+// ENUMS
+// ===========================================================================
+//
+// Every enum below is HR's OWN vocabulary. None of them is derived from a Core
+// enum, and none of them is shared by import with Core: HR's Prisma client is a
+// separate generated client from a separate schema, so a shared enum is not even
+// expressible. `User.status` (Core) and `EmployeeStatus` (HR) are different
+// lifecycles on purpose — see §16.
+
+/// Personnel-record lifecycle. NOT the Core user lifecycle.
+///
+///   ACTIVE     — currently employed; the ordinary state
+///   INACTIVE   — record retained but not currently active (long leave without
+///                pay, suspension, unpaid absence). The Core user may well still
+///                be ACTIVE; the two are independent.
+///   TERMINATED — employment ended. The record and ALL of its EmploymentRecord
+///                history are retained; nothing is deleted. A rehire creates a new
+///                open-ended EmploymentRecord (see §16 and §10).
+enum EmployeeStatus {
+  ACTIVE
+  INACTIVE
+  TERMINATED
+}
+
+/// How the person is engaged. Effective-dated, so it lives on EmploymentRecord
+/// rather than on Employee: a person hired as CONTRACT and later made FULL_TIME
+/// must keep both facts.
+enum EmploymentType {
+  FULL_TIME
+  PART_TIME
+  CONTRACT
+  TEMPORARY
+  INTERNSHIP
+}
+
+/// Lifecycle of ONE effective-dated employment interval.
+///
+///   ACTIVE — the interval is in force (its `endDate` is normally NULL)
+///   ENDED  — the interval is closed; `endDate` records when
+///
+/// There is deliberately no "DELETED": intervals are never removed, only closed,
+/// which is what makes "terminated employment does not erase history" true at the
+/// storage layer and not merely in the UI.
+enum EmploymentStatus {
+  ACTIVE
+  ENDED
+}
+
+/// Whether an organisation unit or a position may currently be used.
+/// INACTIVE keeps the row addressable (old employment records still point at it)
+/// while removing it from the "assignable now" set.
+enum HrRecordStatus {
+  ACTIVE
+  INACTIVE
+}
+
+// ===========================================================================
+// ORGANIZATION UNIT — HR owns the organisation hierarchy (§11)
+// ===========================================================================
+//
+// This table IS the source of truth for organisation structure. Core's
+// `User.department` is a free-text label on an identity and is never consulted
+// to build this tree; the reverse is equally true — nothing in the HR tree is
+// written back into `User.department`.
+//
+// SELF-REFERENCING HIERARCHY:
+// `parentId` points at another OrganizationUnit in THIS database, so a real FK is
+// both possible and correct (unlike the Employee→User edge, which is a plain
+// string). The FK is declared `onDelete: Restrict` because deleting a parent that
+// still has children would silently re-root a subtree.
+//
+// CYCLE PREVENTION is enforced in two places, deliberately:
+//   1. the migration installs a `BEFORE INSERT OR UPDATE` trigger
+//      (`hr_org_unit_no_cycle_guard`) that walks the ancestor chain and raises,
+//      plus a CHECK forbidding self-parenting;
+//   2. `OrganizationUnitsService.assertNoCycle()` performs the same bounded walk
+//      before writing, so the API returns a 400/409 with a message instead of a
+//      raw Postgres error.
+// Doing it only in the service would leave the invariant violable by any other
+// writer; doing it only in the trigger would turn a validation failure into a 500.
+model OrganizationUnit {
+  id        String         @id @default(uuid()) @db.Uuid
+  /// Phase 51-HR-2: TEXT, because the PLATFORM's tenant identifier is TEXT.
+  ///
+  /// `core_db."Tenant"."id"` is a text column — the platform's own seeded tenant is
+  /// `tenant-test-1` — and correspondence (50-MOD-CORR) stores its `tenantId` as text for
+  /// the same reason. A uuid column here rejected every non-uuid tenant identifier with
+  /// 22P02, so HR was unreachable for exactly the tenants whose ids are not uuid-shaped.
+  /// See `20260916120000_hr_tenant_identifier_text`: the same declaration is repeated on
+  /// `Position`, `EmploymentRecord` and `Employee` (and on `Employee.userId`).
+  tenantId  String         @map("tenant_id") @db.Text
+  code      String         @db.VarChar(64)
+  name      String         @db.VarChar(200)
+  parentId  String?        @map("parent_id") @db.Uuid
+  status    HrRecordStatus @default(ACTIVE)
+  createdAt DateTime       @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime       @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  parent   OrganizationUnit?  @relation("OrganizationUnitHierarchy", fields: [parentId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  children OrganizationUnit[] @relation("OrganizationUnitHierarchy")
+
+  positions Position[]
+
+  employmentRecords EmploymentRecord[] @relation("EmploymentRecordOrganizationUnit")
+
+  /// Tenant-aware code uniqueness: two tenants may each own a "FIN" unit, but one
+  /// tenant may not own two. A global `@unique` on `code` would make tenants
+  /// collide with each other, which is a tenancy bug, not a data-integrity win.
+  @@unique([tenantId, code], map: "OrganizationUnit_tenantId_code_key")
+  /// Referenced by `EmploymentRecord`'s composite FK `(tenant_id, organization_unit_id)
+  /// -> OrganizationUnit(tenant_id, id)`, which is how Postgres — not a service
+  /// convention — proves that the unit and the employee of one employment record
+  /// belong to the SAME tenant.
+  @@unique([tenantId, id], map: "OrganizationUnit_tenantId_id_key")
+  /// Deterministic tree ordering and the parent-lookup path used by the cycle
+  /// guard's ancestor walk.
+  @@index([tenantId, parentId, code], map: "OrganizationUnit_tenantId_parentId_code_idx")
+  @@map("OrganizationUnit")
+}
+
+// ===========================================================================
+// POSITION — HR owns the position catalogue (§12)
+// ===========================================================================
+//
+// A Position is a slot definition ("Senior Accountant"), not a person and not a
+// seat count. It belongs to exactly one OrganizationUnit of the SAME tenant.
+//
+// WHAT IS DELIBERATELY *NOT* MODELLED:
+//   * No `@@unique` on `title`. "کارشناس" is a legitimate title in several units,
+//     and a legal entity may open the same title twice. Only `code` is unique, and
+//     only per tenant — the same rule as OrganizationUnit.code.
+//   * No "one employee per position" rule. Nothing in the domain forbids two
+//     people sharing a Position (job-sharing, back-to-back shifts), and a vacancy
+//     is a POSITION with no current EmploymentRecord — a state, not a row to
+//     delete. If a future phase needs a headcount rule it adds a numeric field to
+//     this model; it must not be inferred here.
+//   * No salary band, grade or payroll linkage. Payroll is out of scope for
+//     51-HR-1 (§8).
+//
+// CROSS-TENANT SAFETY: the FK to OrganizationUnit is single-database, so Postgres
+// enforces existence but NOT same-tenancy. `Position.organizationUnitId` pointing
+// at another tenant's unit is therefore blocked by the service
+// (`PositionsService.assertUnitInTenant`) and by the composite FK added in the
+// migration, which references `OrganizationUnit(tenantId, id)` — a real database
+// guarantee, not a convention.
+model Position {
+  id                 String         @id @default(uuid()) @db.Uuid
+  /// TEXT for the platform's tenant identifier — see `OrganizationUnit.tenantId`.
+  tenantId           String         @map("tenant_id") @db.Text
+  organizationUnitId String         @map("organization_unit_id") @db.Uuid
+  code               String         @db.VarChar(64)
+  title              String         @db.VarChar(200)
+  status             HrRecordStatus @default(ACTIVE)
+  createdAt          DateTime       @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt          DateTime       @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  organizationUnit OrganizationUnit @relation(fields: [organizationUnitId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+
+  employmentRecords EmploymentRecord[] @relation("EmploymentRecordPosition")
+
+  @@unique([tenantId, code], map: "Position_tenantId_code_key")
+  /// The reverse of the composite FK: lets Postgres prove a unit and a position
+  /// handed to one EmploymentRecord belong to the same tenant.
+  @@unique([tenantId, id], map: "Position_tenantId_id_key")
+  @@index([tenantId, organizationUnitId, title], map: "Position_tenantId_organizationUnitId_title_idx")
+  @@map("Position")
+}
+
+// ===========================================================================
+// EMPLOYMENT RECORD — effective-dated employment history (§10)
+// ===========================================================================
+//
+// Employee MUST NOT store only the CURRENT employment state. If
+// `Employee.organizationUnitId` / `positionId` / `managerEmployeeId` existed,
+// every transfer would overwrite the previous one and the personnel file would
+// lose the fact that the person ever worked anywhere else — including for the
+// periods a pay, seniority or audit query needs. So the current assignment is
+// not a column: it is the ONE interval that is open / latest, derived from this
+// table (`EmploymentService.currentRecord`), and everything else is history.
+//
+// THE FOUR STATES AN INTERVAL CAN BE IN:
+//   * open and in force      — `status = ACTIVE`, `endDate IS NULL`
+//   * closed normally        — `status = ENDED`,  `endDate` set (transfer,
+//                              promotion, contract expiry)
+//   * closed by termination  — `status = ENDED`,  `endDate` set, and the
+//                              `Employee.status` is TERMINATED. The interval is
+//                              retained; nothing is deleted.
+//   * rehire                 — a NEW row with a later `startDate`. The old row is
+//                              untouched, so the gap between the two is visible
+//                              and auditable rather than erased.
+//
+// TEMPORAL INTEGRITY IS ENFORCED BY POSTGRES, NOT BY THE UI (§10, §49). The
+// migration installs, in raw SQL because Prisma cannot express them:
+//   * `CHECK (end_date IS NULL OR start_date <= end_date)` — an interval cannot
+//     end before it starts;
+//   * `CHECK (start_date >= DATE '1900-01-01')` — a guard against epoch/typo
+//     sentinels that would otherwise make "latest interval" nonsense;
+//   * `EXCLUDE USING gist (employee_id WITH =, daterange(start_date,
+//     COALESCE(end_date, 'infinity'), '[]') WITH &&)` — NO TWO OVERLAPPING
+//     INTERVALS PER EMPLOYEE, using `btree_gist`. A partial unique index cannot
+//     say this (a NULL `end_date` is distinct from itself in every index), which
+//     is exactly why the exclusion constraint exists: it is the only
+//     database-level way to make "the current assignment is unambiguous" true.
+//     `EmploymentService` performs a bounded pre-check (`assertNoOverlap`) so the
+//     ordinary API path returns 409 with a message instead of a raw Postgres
+//     error, but the constraint is the guarantee.
+//   * `BEFORE INSERT OR UPDATE` triggers rejecting `manager_employee_id =
+//     employee_id` and any manager edge that would close a cycle across the
+//     effective-dated graph.
+//
+// DATE-ONLY SEMANTICS: `startDate`/`endDate` are `@db.Date`, not timestamps. An
+// employment interval is a calendar fact ("employed from 1403-01-01"), not an
+// instant; storing it as a timestamptz would make it shift with the server's
+// timezone and would make the Jalali display a lossy conversion. The API accepts
+// and emits `YYYY-MM-DD` only.
+//
+// SAME-TENANT GUARANTEE: every reference below is also backed by a composite FK
+// `(tenant_id, <ref>) -> <Target>(tenant_id, id)` added in the migration, so a
+// cross-tenant unit, position, employee or manager is rejected by Postgres even
+// if a future writer bypasses the service layer (§15).
+model EmploymentRecord {
+  id         String @id @default(uuid()) @db.Uuid
+  employeeId String @map("employee_id") @db.Uuid
+  /// TEXT for the platform's tenant identifier — see `OrganizationUnit.tenantId`.
+  tenantId   String @map("tenant_id") @db.Text
+
+  /// How the person is engaged FOR THIS INTERVAL. Changing FULL_TIME → CONTRACT
+  /// closes one interval and opens another; it never edits this field in place.
+  employmentType EmploymentType
+  /// ACTIVE while the interval is in force, ENDED once closed. There is no
+  /// DELETED — see the enum note.
+  status         EmploymentStatus @default(ACTIVE)
+  startDate      DateTime         @map("start_date") @db.Date
+  /// NULL while the interval is open. A CLOSED interval always carries a real end
+  /// date: "still employed" is the only meaning NULL is allowed to have here.
+  endDate        DateTime?        @map("end_date") @db.Date
+
+  /// The unit this person belonged to DURING THIS INTERVAL.
+  organizationUnitId String  @map("organization_unit_id") @db.Uuid
+  /// The position held DURING THIS INTERVAL.
+  positionId         String  @map("position_id") @db.Uuid
+  /// Direct manager DURING THIS INTERVAL. An EMPLOYEE reference, never a Core
+  /// user id and never a `managerUserId` (§13): the manager has their own HR
+  /// record, and HR managing HR is what keeps the §14 boundary intact.
+  managerEmployeeId  String? @map("manager_employee_id") @db.Uuid
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  employee         Employee         @relation("EmploymentRecordEmployee", fields: [employeeId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  manager          Employee?        @relation("EmploymentRecordManager", fields: [managerEmployeeId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  organizationUnit OrganizationUnit @relation("EmploymentRecordOrganizationUnit", fields: [organizationUnitId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  position         Position         @relation("EmploymentRecordPosition", fields: [positionId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+
+  /// Tenant-qualified key for THIS row. Every other model's composite FK points at
+  /// a `(tenantId, id)` pair, so the pair must be unique for Postgres to accept
+  /// the reference. It is not used by any query on its own.
+  @@unique([tenantId, id], map: "EmploymentRecord_tenantId_id_key")
+  /// The history read: "every interval of this employee, oldest first". Also the
+  /// index the overlap pre-check uses before the exclusion constraint replies.
+  @@index([employeeId, startDate], map: "EmploymentRecord_employeeId_startDate_idx")
+  /// "Who is in this unit" — serves the tenant-scoped organisation filter and the
+  /// unit's current-headcount read without scanning the table.
+  @@index([tenantId, organizationUnitId, startDate], map: "EmploymentRecord_tenantId_organizationUnitId_startDate_idx")
+  /// "Who holds this position" — serves the tenant-scoped position filter.
+  @@index([tenantId, positionId], map: "EmploymentRecord_tenantId_positionId_idx")
+  /// "Who reports to this manager" — the direct-report read. Deliberately NOT
+  /// tenant-prefixed: it is only ever reached from a query that already pinned the
+  /// tenant on `Employee`/`OrganizationUnit`.
+  @@index([managerEmployeeId], map: "EmploymentRecord_managerEmployeeId_idx")
+  @@map("EmploymentRecord")
+}
+
+// ===========================================================================
+// EMPLOYEE — HR's personnel record of a person (§9)
+// ===========================================================================
+//
+// AN EMPLOYEE IS NOT A CORE USER. The distinction is the whole reason this
+// table exists rather than a column on Core's `"User"`:
+//
+//   * `userId` is a PLAIN IDENTIFIER holding a Core `"User".id`. There is no FK
+//     and there cannot be one — the two live in different databases (§49). HR
+//     resolves the person behind it through `UserDirectoryContract`
+//     (`findTenantMember` on write, `findProfiles` in one batch per list page),
+//     never by joining Core's tables.
+//   * No Core security field is duplicated here. No passwordHash, no
+//     tokenVersion, no roles, no permission rows, no session state. A leak of
+//     hr_db must not yield a credential-adjacent column, and a change to Core's
+//     security model must not require an HR migration (§21).
+//   * `userId` is NULLABLE on purpose. §16 states the Core.User lifecycle and
+//     the HR employment lifecycle are independent: a person can be employed,
+//     paid and managed before anyone gives them a login, and a login can exist
+//     for someone with no personnel record (a service account, a contractor's
+//     portal identity). Requiring the link would make the first case impossible.
+//
+// WHY THERE IS NO `@@unique([tenantId, userId])`:
+// A partial-uniqueness rule ("at most one Employee per Core user per tenant")
+// is a plausible POLICY but not a rule this phase can prove. It would be wrong
+// for a person who holds two concurrent engagements that the domain later wants
+// as two records, and enforcing it now would turn a legitimate future shape into
+// a migration. The non-unique index below gives the lookup the planner needs
+// without asserting the policy. If a future phase decides the policy is real, it
+// adds the constraint with evidence.
+//
+// EMPLOYEE CODE NORMALIZATION (documented, and implemented in one place —
+// `EmployeesService.normalizeEmployeeCode`):
+//   1. Unicode NFC, then trim leading/trailing whitespace;
+//   2. reject any interior whitespace;
+//   3. ASCII-uppercase (so `e-1042` and `E-1042` are the SAME code);
+//   4. must match `^[A-Z0-9][A-Z0-9._/-]{0,63}$`.
+// Uniqueness is therefore enforced on the NORMALIZED form, per tenant, by the
+// `Employee_tenantId_employeeCode_key` constraint below — a database guarantee
+// rather than a service convention. Two tenants may each own `E-1042`.
+model Employee {
+  id           String         @id @default(uuid()) @db.Uuid
+  /// TEXT for the platform's tenant identifier — see `OrganizationUnit.tenantId`.
+  tenantId     String         @map("tenant_id") @db.Text
+  /// Core identity reference — a plain identifier, never a foreign key (§14).
+  ///
+  /// Phase 51-HR-2: also TEXT, for the same reason as `tenantId` above —
+  /// `core_db."User"."id"` is text (the platform's seeded administrator is
+  /// `super-admin-user`). Nothing can reach a non-uuid value here TODAY, because
+  /// `CreateEmployeeDto` validates `userId` with `@IsUUID('4')`; this declaration is
+  /// consistency, not a fix for an observed failure, and it is deliberately made in the
+  /// same migration as `tenantId` so a Core reference is never typed by the accident of
+  /// whether its value looks like a uuid.
+  userId       String?        @map("user_id") @db.Text
+  /// Normalized per `normalizeEmployeeCode` above; unique per tenant only.
+  employeeCode String         @map("employee_code") @db.VarChar(64)
+  status       EmployeeStatus @default(ACTIVE)
+  createdAt    DateTime       @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt    DateTime       @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  /// Every effective-dated interval this person has ever had — open, closed, and
+  /// after rehire. Rows are never deleted, which is what makes §10's "terminated
+  /// employment does not erase history" a storage fact.
+  employmentRecords EmploymentRecord[] @relation("EmploymentRecordEmployee")
+
+  /// The intervals on which THIS employee is the recorded direct manager of
+  /// somebody else. Management is a property of an interval, not of a person:
+  /// a manager who changes teams keeps their own history intact.
+  managedRecords EmploymentRecord[] @relation("EmploymentRecordManager")
+
+  /// Every attendance register row for this person (Phase 51-HR-3). Punches are
+  /// the employee's, and a terminated employment does not erase them (§10) — the
+  /// composite `(tenant_id, employee_id)` foreign key is RESTRICT, so the row
+  /// cannot be removed out from under its register either.
+  attendances Attendance[] @relation("AttendanceEmployee")
+
+  /// Every leave request recorded for this person (Phase 51-HR-3A). A request belongs
+  /// to the employee, and terminating an employment does not erase it (§10) — the
+  /// composite `(tenant_id, employee_id)` foreign key is RESTRICT, so a request cannot
+  /// be removed out from under its subject either.
+  leaveRequests LeaveRequest[] @relation("LeaveRequestEmployee")
+
+  /// Every policy version this person PUBLISHED (Phase 54-D §15). Publication is a decision
+  /// with an author, and the author is an Employee — never a bare Core user id (§15.3). The
+  /// composite `(tenant_id, published_by_employee_id)` foreign key is RESTRICT, so retiring an
+  /// employee cannot delete the record of what they put in force.
+  publishedLeavePolicyVersions         LeavePolicyVersion[]          @relation("LeavePolicyVersionPublisher")
+  /// Phase 54-E §17: the step definitions that name this person as the approver. RESTRICT — a
+  /// person who an approval flow routes to is evidence of a stated rule, and retiring them must
+  /// not delete the rule.
+  approverOfLeaveApprovalSteps         LeaveApprovalStepDefinition[] @relation("LeaveApprovalStepDefinitionApprover")
+  /// Phase 54-E §19: the substitutions in which this person is the one being REPLACED.
+  substitutedPrimaryForLeaveSteps      LeaveSubstitutionDefinition[] @relation("LeaveSubstitutionDefinitionPrimary")
+  /// Phase 54-E §19: the substitutions in which this person decides INSTEAD of somebody else.
+  substitutedSubstituteForLeaveSteps   LeaveSubstitutionDefinition[] @relation("LeaveSubstitutionDefinitionSubstitute")
+  /// Phase 54-E §19: the substitutions this person stated.
+  statedLeaveSubstitutions             LeaveSubstitutionDefinition[] @relation("LeaveSubstitutionDefinitionStatedBy")
+  /// Phase 54-E §17.3: the runtime steps in which this person was the RESOLVED approver — the
+  /// pairing the decision authorization presses on. RESTRICT: a decision is history, and history
+  /// is never removed by retiring a person.
+  resolvedApproverOfLeaveApprovalSteps LeaveApprovalStepInstance[]   @relation("LeaveApprovalStepInstanceResolvedApprover")
+  /// Phase 54-E §17.5: the runtime steps this person DECIDED. RESTRICT, for the same reason.
+  decidedLeaveApprovalSteps            LeaveApprovalStepInstance[]   @relation("LeaveApprovalStepInstanceDecidedBy")
+
+  /// Phase 55: every mission request recorded for this person. RESTRICT: the
+  /// mission outlives the employment record that once covered it.
+  missionRequests                        MissionRequest[]                @relation("MissionRequestEmployee")
+  /// Phase 55: reports this person filed. RESTRICT: a close-out is evidence.
+  submittedMissionReports                MissionReport[]                 @relation("MissionReportSubmitter")
+  /// Phase 55: configured mission steps that name this person. RESTRICT — a
+  /// stated approval rule is not erased by retiring the person it names.
+  approverOfMissionApprovalSteps         MissionApprovalDefinitionStep[] @relation("MissionApprovalDefinitionStepApprover")
+  /// Phase 55: runtime mission steps this person was resolved to answer.
+  resolvedApproverOfMissionApprovalSteps MissionApprovalStepInstance[]   @relation("MissionApprovalStepInstanceApprover")
+  /// Phase 55: runtime mission steps this person decided. RESTRICT, as above.
+  decidedMissionApprovalSteps            MissionApprovalStepInstance[]   @relation("MissionApprovalStepInstanceDecider")
+
+  /// Tenant-aware employee-code uniqueness (see normalization note above).
+  @@unique([tenantId, employeeCode], map: "Employee_tenantId_employeeCode_key")
+  /// Composite-key target for `EmploymentRecord`'s `(tenant_id, employee_id)` and
+  /// `(tenant_id, manager_employee_id)` foreign keys, added in the migration.
+  /// Those are how POSTGRES — not a service convention — proves that an interval,
+  /// its employee and its manager all belong to the SAME tenant (§15, §49).
+  @@unique([tenantId, id], map: "Employee_tenantId_id_key")
+  /// Deterministic list ordering: the employee list is always ordered
+  /// `(employeeCode, id)`, so this index serves the default page and the
+  /// status-filtered page without a sort.
+  @@index([tenantId, status, employeeCode], map: "Employee_tenantId_status_employeeCode_idx")
+  /// The `userId` lookup used by "find the personnel record for this identity".
+  /// Non-unique — see the reasoning above.
+  @@index([tenantId, userId], map: "Employee_tenantId_userId_idx")
+  @@map("Employee")
+}
+
+// ===========================================================================
+// ATTENDANCE — the punch register (§13, Phase 51-HR-3)
+// ===========================================================================
+//
+// WHAT THIS TABLE IS, IN ONE SENTENCE: ONE ROW PER EMPLOYEE PER WORK DAY, holding
+// the day's punch window (`clock_in` → `clock_out`) and nothing the domain can
+// DERIVE from it.
+//
+// ONE ROW PER DAY, NOT ONE PER PUNCH. A device that reports every door event would
+// want a row per event; the register the organization reads — "was this person here
+// that day, from when to when" — is a DAY. A second `DEVICE` row for the same
+// employee-day is therefore refused (the unique key below), and a late arrival, a
+// mid-day absence or a wrong punch is corrected through ONE `MANUAL` row rather
+// than by appending punches the register would then have to reconstruct. The
+// derived day status of §13 (`present | late | absent | leave | mission | holiday |
+// weekend`) is deliberately NOT stored — not here and not anywhere: it is a
+// FUNCTION of the punch window, the shift and the calendar, so storing it would
+// create a second answer that could disagree with the facts it was computed from.
+// `work_date` + `date_key` are the two facts that computation needs, and they are
+// both DERIVED SERVER-SIDE from `clock_in` (never client-supplied), so a row cannot
+// claim a Jalali day that contradicts its own timestamp.
+//
+// WHY THERE ARE TWO SOURCES AND A COMPOSITE UNIQUE KEY
+// ----------------------------------------------------
+// §13 states the rule: "Manual adjustments are `MANUAL` source rows carrying actor
+// + sanitized reason + audit event; never an in-place mutation of a `DEVICE` row."
+// That is why `source` is part of the row's identity rather than a column someone
+// may edit: the `DEVICE` row is the EVIDENCE (what the punch recorded), and the
+// `MANUAL` row is the CORRECTION (what an operator states happened). Both survive,
+// the correction can never launder the evidence, and a reader — or a later
+// derivation rule — can always tell which is which. The truth of a day is the
+// `MANUAL` row where one exists, and the fact that no constraint or UPDATE path can
+// turn the first into the second is what makes that statement auditable.
+//
+// WHY `workDate` AND `dateKey` ARE BOTH HERE
+// ------------------------------------------
+//   * `work_date` is the GREGORIAN civil day (`@db.Date`, no zone) — it is what the
+//     per-employee-per-day uniqueness and the ordinary `from`/`to` range filter
+//     press on, and it sorts and compares without a timezone question.
+//   * `date_key` is the JALALI day as `YYYY/MM/DD`, produced by `jalali.util`
+//     (`formatJalaliDateKey`) — the same wire format the calendar module uses and
+//     the form §13 requires report aggregation to group by, so a Jalali month or
+//     year boundary is resolved in ONE place (`APP_TIME_ZONE`) rather than
+//     re-derived per query.
+//
+// For an overnight shift the day attributed is the day the person CLOCKED IN on:
+// that is the shift's day, and it is the only attribution that keeps one work day
+// to one row.
+//
+// WHY THERE IS NO `status`, NO `shiftId`, NO `overtimeMinutes`, NO `lateMinutes`:
+// every one of them is derived (§13/§14), every one needs the shift or the calendar
+// that do not exist yet, and a stored column for a derived value is the exact shape
+// the audit forbids. They arrive with their derivation and their unit spec.
+//
+// TENANCY IS STRUCTURAL. `Attendance_tenant_employee_fkey`
+// (`(tenant_id, employee_id) -> Employee(tenant_id, id)`) is a composite same-tenant
+// foreign key added by the migration, exactly like the six that already guard the
+// employment graph: a row can only name an employee of ITS OWN tenant, even for a
+// writer that bypasses `AttendanceService` entirely.
+
+/// Where an attendance row came from (§13).
+enum AttendanceSource {
+  /// A punch recorded through the ordinary clock-in / clock-out flow. The EVIDENCE
+  /// row: it is written by the punch path and is never rewritten by an adjustment.
+  DEVICE
+  /// An operator's correction for a day, with a sanitized `reason`. The CORRECTION
+  /// row: at most one per employee-day, and it never touches the `DEVICE` row.
+  MANUAL
+}
+
+model Attendance {
+  id         String           @id @default(uuid()) @db.Uuid
+  tenantId   String           @map("tenant_id") @db.Text
+  /// The person whose day this is. Composite-FK target together with the tenant.
+  employeeId String           @map("employee_id") @db.Uuid
+  /// The GREGORIAN civil day the punches belong to — see the section header.
+  workDate   DateTime         @map("work_date") @db.Date
+  /// The same day as `YYYY/MM/DD` in Jalali, derived server-side (§13).
+  dateKey    String           @map("date_key") @db.VarChar(10)
+  /// When the day opened. Always present: a row exists because somebody punched in.
+  clockIn    DateTime         @map("clock_in") @db.Timestamptz(6)
+  /// `NULL` means the day is still OPEN — the person has not clocked out yet. That
+  /// is a state, not an error, which is why it is nullable rather than a sentinel
+  /// timestamp: a sentinel would be a second spelling of "no value" that every
+  /// reader would have to remember to special-case.
+  clockOut   DateTime?        @map("clock_out") @db.Timestamptz(6)
+  source     AttendanceSource @default(DEVICE)
+  /// The operator's sanitized reason. Written ONLY by a `MANUAL` correction; a
+  /// `DEVICE` row has none, and the DTO that creates one has no such field.
+  reason     String?          @db.VarChar(500)
+  createdAt  DateTime         @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt  DateTime         @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  employee Employee @relation("AttendanceEmployee", fields: [employeeId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+
+  /// THE identity of a register row: one day, one employee, one source. It is what
+  /// makes a repeated clock-in a 409 instead of a second row, and what lets a
+  /// correction be an idempotent UPSERT (`MANUAL` is created once, then SET) without
+  /// a read-then-write race.
+  @@unique([tenantId, employeeId, workDate, source], map: "Attendance_tenantId_employeeId_workDate_source_key")
+  /// The composite-key target for the same-tenant foreign key in the migration.
+  /// Not used by any query on its own.
+  @@unique([tenantId, id], map: "Attendance_tenantId_id_key")
+  /// The register read of §13's report: "the tenant's rows for this Jalali month",
+  /// which is the grouping `date_key` exists for.
+  @@index([tenantId, dateKey], map: "Attendance_tenantId_dateKey_idx")
+  /// The screen-A read: "this person's rows for this day/month", tenant-qualified so
+  /// the same index serves both the per-employee page and the tenant-wide one.
+  @@index([tenantId, employeeId, dateKey], map: "Attendance_tenantId_employeeId_dateKey_idx")
+  @@map("Attendance")
+}
+
+/// One leave request (Phase 51-HR-3A) — the FACT, and nothing about its fate.
+///
+/// WHAT A ROW MEANS: this employee, of this leave type, asked for these calendar days
+/// and gave this reason. `status` says only whether the request is still standing.
+///
+/// THE REASON IS REQUIRED, AND THE DATABASE ENFORCES IT. A request without a stated
+/// reason is one nobody can act on and nobody can audit, so `reason` is NOT NULL with a
+/// CHECK that it is not blank — the same discipline `Attendance`'s `MANUAL` correction
+/// follows. It is stored as ONE trimmed line of text, exactly as the operator typed it:
+/// this layer never re-words a person's own statement.
+model LeaveRequest {
+  id          String             @id @default(uuid()) @db.Uuid
+  /// The tenant every read of this row is scoped by. A snapshot column, like every other
+  /// HR row's — never client-supplied.
+  tenantId    String             @map("tenant_id") @db.Text
+  /// The person the request is FOR. Composite-FK target together with the tenant.
+  employeeId  String             @map("employee_id") @db.Uuid
+  /// The leave kind asked for. Composite-FK target together with the tenant, so a request
+  /// cannot cite another tenant's type.
+  leaveTypeId String             @map("leave_type_id") @db.Uuid
+  /// The FIRST day the request covers — INCLUSIVE. A calendar day (`@db.Date`), never an
+  /// instant: see DATE-ONLY SEMANTICS in the section header.
+  startDate   DateTime           @map("start_date") @db.Date
+  /// The LAST day the request covers — INCLUSIVE. `end_date = start_date` is a
+  /// single-day request, which is the ordinary case rather than a special one.
+  endDate     DateTime           @map("end_date") @db.Date
+  /// The requester's stated reason, non-blank. Written by the creating call and editable
+  /// only while the request is PENDING.
+  reason      String             @db.VarChar(500)
+  /// Where the request stands. FOUR members; see `LeaveRequestStatus`.
+  status      LeaveRequestStatus @default(PENDING)
+  /// When a PENDING request was withdrawn. `LeaveRequest_state_check` ties this
+  /// column to `status` in BOTH directions, so "CANCELLED with no timestamp" and "a
+  /// timestamp on a request that is still pending" are both unwritable — the discipline
+  /// the Letter table documents for its own status/timestamp pairs.
+  cancelledAt DateTime?          @map("cancelled_at") @db.Timestamptz(6)
+  /// When a routed flow reached its LAST step and that step approved (Phase 54-E §21).
+  /// The same two-way coupling as `cancelledAt`, extended to the two states a flow can
+  /// now reach: `APPROVED <=> approved_at IS NOT NULL`, with the other two timestamps
+  /// NULL. WHO approved and WHY is NOT here — those facts belong to the STEP that
+  /// produced them (§17.1), and one column could hold only one of them.
+  approvedAt  DateTime?          @map("approved_at") @db.Timestamptz(6)
+  /// When a step in the flow refused — the state a refusal reaches wherever it happens,
+  /// since a refusal ends the flow where it stands (§21). Same coupling as `approvedAt`,
+  /// and same absence of any decision detail.
+  rejectedAt  DateTime?          @map("rejected_at") @db.Timestamptz(6)
+  createdAt   DateTime           @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt   DateTime           @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  /// The two composite foreign keys in the migration are how POSTGRES — not a service
+  /// convention — proves that both ends of a request belong to the SAME tenant as the
+  /// request itself (§15, §49). RESTRICT: history is never erased (§10).
+  employee          Employee                @relation("LeaveRequestEmployee", fields: [employeeId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  leaveType         LeaveType               @relation("LeaveRequestLeaveType", fields: [leaveTypeId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  /// Phase 54-E §17: the approval flows opened for this request. RESTRICT, and there is NO
+  /// CASCADE — a request that has been through a flow is history, and deleting the request must
+  /// never delete the record of who was asked or what they stated.
+  ///
+  /// A LIST rather than a single optional relation because the relationship is genuinely
+  /// one-to-many over the request's lifetime: only ONE flow may be LIVE at a time (the partial
+  /// unique index on `(tenant_id, leave_request_id) WHERE status = 'ACTIVE'`), but a withdrawn
+  /// flow followed by a corrected request's flow is two rows, which is what keeps the first
+  /// flow's history intact.
+  approvalInstances LeaveApprovalInstance[] @relation("LeaveApprovalInstanceRequest")
+
+  /// Composite-key target for the two same-tenant foreign keys in the migration. Not
+  /// used by any query on its own.
+  @@unique([tenantId, id], map: "LeaveRequest_tenantId_id_key")
+  /// The register read: the tenant's requests in a state, earliest day first — the shape
+  /// the leave screen pages through.
+  @@index([tenantId, status, startDate], map: "LeaveRequest_tenantId_status_startDate_idx")
+  /// "This person's requests", tenant-qualified so ONE index serves both the per-person
+  /// read and the tenant-wide one.
+  @@index([tenantId, employeeId, startDate], map: "LeaveRequest_tenantId_employeeId_startDate_idx")
+  /// "What has been asked for of this type", which is the read a later report groups by.
+  @@index([tenantId, leaveTypeId, startDate], map: "LeaveRequest_tenantId_leaveTypeId_startDate_idx")
+  @@map("LeaveRequest")
+}
+
+/// The lifecycle of a leave REQUEST — now FOUR members (Phase 51-HR-3A; 54-E §21).
+///
+///   PENDING   — recorded, and nothing further has happened to it. The only state a create
+///               can produce.
+///   APPROVED  — a routed flow reached its LAST step, and that step approved. TERMINAL.
+///               (Phase 54-E §21.1 — the state this note always reserved, arriving with the
+///               machine that can reach it: the approval runtime, its permission and its Core
+///               seed row, in ONE change, exactly as the contract below required.)
+///   REJECTED  — a step in the flow refused. TERMINAL, whether or not it was the last step:
+///               a refusal ends the flow where it stands, and later steps become `SKIPPED`.
+///   CANCELLED — withdrawn, before any decision or mid-route. TERMINAL.
+///
+/// WHAT `APPROVED` AND `REJECTED` DELIBERATELY DO NOT CARRY. There is still no `approverId`, no
+/// `decidedAt` and no `decidedBy` here. Those facts belong to the STEP that produced them
+/// (§17.1), and a column on this table could hold only one of them — see the Leave approval
+/// section header for why that single column would be a lie rather than a summary.
+///
+/// The maintenance contract recorded here has been HONOURED, and it still binds future members:
+/// the enum member, the status CHECK in the migration, `LEAVE_REQUEST_STATUS_TRANSITIONS` in
+/// `src/modules/hr/domain/leave-status.ts`, the permission that gates the route and its Core
+/// seed row move TOGETHER — otherwise the new state is unreachable or the transition table
+/// silently disagrees with the database.
+enum LeaveRequestStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  CANCELLED
+}
+
+/// The tenant's own leave-type catalogue (Phase 51-HR-3A).
+///
+/// NO ROW IS SEEDED, ANYWHERE. The catalogue starts empty in every tenant by design —
+/// see the section header. A tenant that has decided which leave kinds it grants
+/// creates them here; until it does, the leave screen offers nothing to request OF,
+/// which is the honest rendering of "no policy has been stated yet".
+///
+/// `status` reuses `HrRecordStatus` rather than declaring a third two-member enum:
+/// ACTIVE / INACTIVE already means "may be used NOW while remaining addressable for
+/// everything that cites it", which is exactly a catalogue entry's lifecycle. A retired
+/// type therefore cannot be chosen for a NEW request, while every request already
+/// recorded against it keeps rendering its name — and deleting the row is not an option
+/// on either side of that sentence.
+model LeaveType {
+  id        String         @id @default(uuid()) @db.Uuid
+  /// TEXT, like every `tenantId` in this database — the platform's tenant identifier is
+  /// text (`20260916120000_hr_tenant_identifier_text`).
+  tenantId  String         @map("tenant_id") @db.Text
+  /// Normalized and validated by the SAME contract as `Employee.employeeCode` (see the
+  /// normalization note on that model): NFC, trimmed, no interior whitespace, ASCII
+  /// uppercase, `^[A-Z0-9][A-Z0-9._/-]{0,63}$`. HR has ONE spelling of "a normalized
+  /// code", and a leave-type code is a code.
+  code      String         @db.VarChar(64)
+  /// The human-facing name the screen renders — whatever the tenant calls its own leave.
+  /// This system never interprets it.
+  name      String         @db.VarChar(200)
+  /// ACTIVE (assignable to a new request) / INACTIVE (historical only).
+  status    HrRecordStatus @default(ACTIVE)
+  createdAt DateTime       @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime       @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  /// Every request recorded against this type, in any state. RESTRICT: a type that has
+  /// ever been requested cannot be deleted out from under its own history, which is why
+  /// retirement is a STATUS and not a delete.
+  requests LeaveRequest[] @relation("LeaveRequestLeaveType")
+
+  /// Every policy limit that COUNTS this type (Phase 54-D §16). RESTRICT on the limit's side:
+  /// a type a stated policy counts cannot be deleted out from under it, which is why retiring a
+  /// type is a STATUS change and never a removal.
+  limitDefinitions LeaveLimitDefinition[] @relation("LeaveLimitDefinitionLeaveType")
+
+  /// Tenant-aware code uniqueness: two tenants may each own `ANNUAL`, one tenant may not
+  /// own two. A global `@unique` would make tenants collide with each other, which is a
+  /// tenancy bug rather than a data-integrity win — the same rule, for the same reason,
+  /// as `OrganizationUnit_tenantId_code_key`.
+  @@unique([tenantId, code], map: "LeaveType_tenantId_code_key")
+  /// Composite-key target for `LeaveRequest`'s `(tenant_id, leave_type_id)` foreign key,
+  /// added in the migration. Not used by any query on its own.
+  @@unique([tenantId, id], map: "LeaveType_tenantId_id_key")
+  /// Deterministic catalogue ordering (`code`) and the "active types only" read the
+  /// request form issues.
+  @@index([tenantId, status, code], map: "LeaveType_tenantId_status_code_idx")
+  @@map("LeaveType")
+}
+
+// DATES ARE CALENDAR DAYS, NOT INSTANTS. `start_date` and `end_date` are `@db.Date`
+// for the reason `EmploymentRecord.startDate` states: a leave request is a claim
+// about calendar days, and accepting an instant would make the stored day depend on
+// the caller's timezone. No Jalali `date_key` is stored either — a leave RANGE spans
+// months, so one day key would have to pick an end of it and then disagree with the
+// other; a Jalali rendering is derived at the boundary from the same
+// `calendar/jalali.util` the rest of the platform uses.
+//
+// WHAT IS DELIBERATELY ABSENT, EACH BECAUSE IT IS A POLICY NOT YET DECIDED:
+//   * no balance, entitlement, accrual or carry-over (§13);
+//   * no half-day / hourly / minute granularity: a request is a whole-day range;
+//   * no overlap rule. Two requests covering the same day may both exist and the
+//     database says nothing about it: "leave must not overlap another leave" is audit
+//     §13's PROPOSAL, and a rule enforced before it is agreed would refuse legitimate
+//     rows — a corrected request, a re-recorded range — in the name of a policy nobody
+//     has approved. The ranges are stored RAW so the rule can be evaluated later
+//     against real data;
+//   * no workday or holiday arithmetic — `CalendarOccasion` owns working days and this
+//     table does not count them. A stored `durationDays` would be exactly the derived
+//     column the schema refuses everywhere else;
+//   * no attendance interaction. Deciding leave must never mutate or delete a punch,
+//     and this table has no path to `Attendance` at all: the two domains meet in a
+//     READER (a later phase) that knows both, never in a writer here.
+//
+// TENANCY IS STRUCTURAL, TWICE. `LeaveRequest_tenant_employee_fkey` and
+// `LeaveRequest_tenant_leave_type_fkey` are composite `(tenant_id, …)` foreign keys
+// added by the migration, exactly like the ones guarding `Attendance` and the
+// employment graph: a request can only name an employee AND a leave type of ITS OWN
+// tenant, even for a writer that bypasses `LeaveService` entirely. A bare uuid foreign
+// key would let one tenant's request cite another tenant's type, which no service-side
+// check can make impossible for the next writer.
+
+// WHY `status` HAS EXACTLY TWO MEMBERS, AND WHY THERE IS NO APPROVAL COLUMN
+// -------------------------------------------------------------------------
+// 51-HR-3A records requests. It does NOT decide them, and the reason is recorded
+// here because it is the decision a later phase must revisit rather than a
+// simplification: NO AUTHORITATIVE APPROVAL RULE EXISTS in this repository. The
+// readiness audit (`docs/reports/PHASE_51-HR_READINESS_AUDIT.md` §9) sketches
+// `hr.leave.approve` as "approve/reject FOR THE REPORTING SUBTREE", and the
+// reporting subtree is a server-side traversal that does not exist — a fact the
+// module already states in writing where it refused that same kind of permission
+// (`prisma/core/migrations/20260918130000_seed_hr_attendance_permission_grants`:
+// "a permission that claims subtree authority before the traversal exists would be
+// the widest kind of lie — it would be GRANTED"). So:
+//
+//   * there is NO `APPROVED` and NO `REJECTED` member. An enum member nothing can
+//     write is a promise this table does not keep, and a member added later — with
+//     its CHECK, its transition table and its permission, in one migration — is a
+// ===========================================================================
+// LEAVE POLICY — the tenant's stated leave POLICY, versioned and effective-dated
+// (Phase 54-D §15)
+// ===========================================================================
+//
+// WHY A POLICY IS NOT A COLUMN ON LeaveType
+// ----------------------------------------
+// A leave type says what a request may ask FOR. It does not say what the
+// organization GRANTS, and the two are different facts owned by different
+// people: the accountant who maintains the catalogue and the policy author who
+// decides that the third consecutive day of sickness needs a certificate are not
+// answering the same question, and folding the second into the first would make
+// every catalogue edit a policy change.
+//
+// So a policy is a NAMED, TENANT-OWNED thing with its own lifecycle and its own
+// versions. `LeavePolicy` is the stable identity (`code`, `name`) whose only job
+// is to be pointed at; it carries NO dates and NO status, because "which version
+// is in force" is a question about VERSIONS, and answering it in two places is
+// how the two answers come to disagree.
+//
+// WHY VERSIONS RATHER THAN AN EDITABLE ROW
+// ---------------------------------------
+//   * An explanation rendered last year must still be TRUE this year. A policy
+//     edited in place makes every historical decision a claim about a document
+//     that no longer exists (§13.2).
+//   * Publishing is a decision with an author and a moment; editing is not. The
+//     version row is where that decision is recorded (`status`, `published_at`,
+//     `published_by_employee_id`).
+//   * The stored payload is what the platform engine validated (§15.6). Keeping
+//     the text a version was published as — and never rewriting it — is what
+//     makes "the engine validated this body" an auditable statement rather than
+//     a hopeful one.
+//
+// THE THREE TABLES
+// ----------------
+//   * `LeavePolicy`          — stable identity of one tenant's policy.
+//   * `LeavePolicyVersion`   — one DRAFT / VALIDATED / PUBLISHED body of that
+//                              policy, effective-dated, with the publication
+//                              decision recorded alongside it.
+//   * `LeaveLimitDefinition` — a typed limit belonging to ONE version (§16). It
+//                              is a CHILD of the version, not of the policy: a
+//                              limit is part of the document that was published,
+//                              so it is versioned with it and, where the trigger
+//                              reaches, immutable with it.
+//
+// WHAT IS ENFORCED BY POSTGRES RATHER THAN BY A SERVICE CONVENTION
+// ---------------------------------------------------------------
+// A writer that bypasses the service must still be unable to break these. The
+// migration installs, in raw SQL because Prisma cannot express them:
+//
+//   * `LeavePolicyVersion_scope_no_overlap_excl` — an `EXCLUDE USING gist`
+//     constraint refusing two versions of the SAME POLICY whose effective
+//     intervals overlap AND which occupy the same publication scope. The scope
+//     is the frozen §15.4/§15.5 reading: `DRAFT` and `VALIDATED` share ONE
+//     authoring bucket (several drafts may be drawn up for one interval, which
+//     is what drafting IS), while a `PUBLISHED` version occupies its own — so
+//     "two equally-current published versions of one policy" is
+//     unrepresentable. §37.6 demands exactly this: "the persistence layer
+//     refuses a second PUBLISHED version for the same scope and effective
+//     interval".
+//   * `hr_assert_leave_policy_version_immutable` — a BEFORE UPDATE/DELETE
+//     trigger refusing any change to a version once it is PUBLISHED (§15.7).
+//     The precedent is `hr_org_unit_no_cycle_guard`: a guarantee for the writer
+//     that does not go through the service is a trigger, not a convention. A
+//     PUBLISHED version a second writer can edit is not immutable, it is merely
+//     polite.
+//   * `hr_assert_leave_limit_definition_immutable` — the same refusal for a
+//     limit whose PARENT version is PUBLISHED. A limit is part of the published
+//     document; leaving it mutable would make the trigger above a lock on the
+//     cover page while the terms stayed writable.
+//   * The composite `(tenant_id, …)` foreign keys the request already uses, so a
+//     version can no more cite another tenant's policy — or a limit another
+//     tenant's version — than a request can cite another tenant's type
+//     (§15.2, §15.3).
+//
+// WHAT THIS SECTION DELIBERATELY DOES NOT CONTAIN
+// ----------------------------------------------
+//   * NO approval machinery (`LeaveApprovalInstance`, steps, approvers). §18
+//     belongs to the approval phase, and a table with no producer is a table no
+//     test can falsify — the reasoning the numbering section already records for
+//     `HrDocumentCounter`.
+//   * NO `APPROVED` / `REJECTED` member in `LeaveRequestStatus`. A limit cannot
+//     consume a state the request lifecycle cannot reach, so the state arrives
+//     with the enforcer (54-E) and not before.
+//   * NO BALANCE, NO COUNTER, NO `durationDays`. §16 states that a limit is
+//     typed policy data that is EVALUATED, never a stored counter; the derived
+//     facts stay derived, which is the same refusal the section header above
+//     records for the request itself.
+//   * NO ROW IS SEEDED. No policy, no version, no limit — see §15.8. Until a
+//     tenant states a policy, the honest rendering is "no policy has been
+//     stated", not a default policy nobody approved.
+
+//     strictly cheaper change than one removed from a table whose rows already
+//     carry it;
+//   * there is NO `approverId`, NO `decidedAt` and NO `decidedBy`. A column that
+
+/// Stable identity of one tenant's leave policy (Phase 54-D §15).
+///
+/// This row answers "which policy is this?" and NOTHING else. It carries no dates and no
+/// status, because effectiveness and publication are facts about VERSIONS: a `status` here
+/// would be a second answer to "which version is in force", and two answers to that question
+/// is how one of them becomes wrong.
+///
+/// Nothing is seeded (§15.8). A tenant that has stated no policy has no row here, and the
+/// leave surface renders that absence rather than inventing a default.
+model LeavePolicy {
+  id        String   @id @default(uuid()) @db.Uuid
+  /// TEXT, like every `tenantId` in this database — the platform's tenant identifier is text
+  /// (`20260916120000_hr_tenant_identifier_text`).
+  tenantId  String   @map("tenant_id") @db.Text
+  /// Normalized by the SAME contract as `LeaveType.code`: NFC, trimmed, no interior
+  /// whitespace, ASCII uppercase, `^[A-Z0-9][A-Z0-9._/-]{0,63}$`. HR has ONE spelling of
+  /// "a normalized code", and a policy code is a code.
+  code      String   @db.VarChar(64)
+  /// The human-facing name the screen renders — whatever the tenant calls its own policy.
+  /// This system never interprets it.
+  name      String   @db.VarChar(200)
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  /// Every version ever authored under this policy, in any state. RESTRICT: a policy that has
+  /// ever been stated cannot be deleted out from under its own published text, which is why a
+  /// withdrawn policy is retired by publishing a version that grants nothing rather than by
+  /// deleting the record of what was granted (§15.5).
+  versions LeavePolicyVersion[] @relation("LeavePolicyVersionPolicy")
+
+  /// Every limit whose tenant chain is anchored to this policy (Phase 54-D §16). Reached
+  /// through the version, and present so the `(tenant_id, policy_id)` composite FK has a target.
+  limits LeaveLimitDefinition[] @relation("LeaveLimitDefinitionPolicy")
+
+  /// Tenant-aware code uniqueness: two tenants may each own `DEFAULT`, one tenant may not own
+  /// two. A global `@unique` would make tenants collide with each other, which is a tenancy
+  /// bug rather than a data-integrity win — the same rule, for the same reason, as
+  /// `LeaveType_tenantId_code_key`.
+  @@unique([tenantId, code], map: "LeavePolicy_tenantId_code_key")
+  /// Composite-key target for `LeavePolicyVersion`'s `(tenant_id, policy_id)` foreign key and
+  /// for `LeaveLimitDefinition`'s `(tenant_id, policy_id)` — the pair Postgres must find
+  /// unique before it will accept a same-tenant reference at all (§15.3).
+  @@unique([tenantId, id], map: "LeavePolicy_tenantId_id_key")
+  /// "This tenant's policies", the catalogue read. Tenant-qualified so ONE index serves it.
+  @@index([tenantId, code], map: "LeavePolicy_tenantId_code_idx")
+  @@map("LeavePolicy")
+}
+
+/// ONE authored body of a leave policy (Phase 54-D §15).
+///
+/// The version is the unit of decision: it is authored (DRAFT), checked (VALIDATED) and
+/// published (PUBLISHED), and once published it is IMMUTABLE AT THE STORAGE LAYER — a trigger
+/// refuses the change, not a service convention (§15.7). Publishing a correction means
+/// publishing the NEXT version, which is what keeps an explanation rendered from this row
+/// true forever (§13.2).
+///
+/// WHY THE EFFECTIVE INTERVAL IS ON THE VERSION
+/// -------------------------------------------
+/// Effective dating follows the EMPLOYMENT doctrine (§15.4): `effectiveFrom`, nullable
+/// `effectiveTo`, intervals never rewritten. Reusing that pattern rather than inventing one is
+/// deliberate — a closed interval keeps its own end instead of being overwritten by the one
+/// that replaced it, so "what was in force on this day" is reconstructible rather than
+/// remembered.
+///
+/// THE PUBLICATION SCOPE, AND WHY THE EXCLUSION CONSTRAINT IS NOT A PLAIN OVERLAP RULE
+/// ---------------------------------------------------------------------------------
+/// §15.4 refuses overlapping intervals "of the same scope", and §37.6 names the scope: a
+/// second PUBLISHED version for the same scope and effective interval is refused. So the
+/// constraint's scope column is derived from `status` — every non-PUBLISHED state collapses
+/// into ONE authoring bucket, while each PUBLISHED version keeps its own — which is what makes
+/// "two equally-current published versions of one policy" unrepresentable rather than merely
+/// discouraged.
+model LeavePolicyVersion {
+  id                    String                   @id @default(uuid()) @db.Uuid
+  /// TEXT, like every `tenantId` in this database.
+  tenantId              String                   @map("tenant_id") @db.Text
+  /// The policy this version belongs to. Composite-FK target together with the tenant.
+  policyId              String                   @map("policy_id") @db.Uuid
+  /// The tenant's own version label ("1404-01", "v3"). A LABEL, not a sequence this system
+  /// mints: the author states how they number their own document, and nothing here parses it.
+  versionLabel          String                   @map("version_label") @db.VarChar(64)
+  /// The tenant-visible Jalali year this version is authored FOR. A STATEMENT, not an
+  /// arithmetic input — the evaluated window is resolved from it at configuration time and
+  /// stored on the limits (§16.2).
+  jalaliYear            Int                      @map("jalali_year")
+  /// The FIRST day this version is in force — INCLUSIVE, a calendar day (`@db.Date`), never an
+  /// instant: an interval is a calendar fact, not a moment in the server's timezone.
+  effectiveFrom         DateTime                 @map("effective_from") @db.Date
+  /// The LAST day this version is in force — INCLUSIVE. NULL means OPEN-ENDED (the current
+  /// version), and that is the only meaning NULL is allowed to have here — the same date-only
+  /// discipline `EmploymentRecord.endDate` carries.
+  effectiveTo           DateTime?                @map("effective_to") @db.Date
+  /// Where the version stands: DRAFT → VALIDATED → PUBLISHED. It deliberately does NOT reuse
+  /// `HrRecordStatus`: that two-member enum means "may be used now, while remaining
+  /// addressable", and publication is a three-state lifecycle with a one-way door. Overloading
+  /// it would erase the difference between "checked" and "in force". See the enum note.
+  status                LeavePolicyVersionStatus @default(DRAFT)
+  /// The exact body the platform engine validated, stored with the text it was published as
+  /// (§15.6). The engine never reads this table (D12) — but an old explanation is rendered
+  /// FROM this payload, so it is data the repository keeps rather than recomputes.
+  payload               Json
+  /// When this version was published. NULL until the publish transition, and RETAINED FOREVER
+  /// AFTER — including once the version is `ARCHIVED`, because it *was* published and the instant
+  /// it entered force is a historical fact (§23.5). The
+  /// `LeavePolicyVersion_published_state_check` CHECK ties this column to `status` in BOTH
+  /// directions as "PUBLISHED-or-ARCHIVED ⟺ stamped", so "a live published version with no
+  /// timestamp" and "a DRAFT carrying one" are both unwritable.
+  publishedAt           DateTime?                @map("published_at") @db.Timestamptz(6)
+  /// WHO published it — an EMPLOYEE of the same tenant (composite FK), never a bare Core user
+  /// id (§15.3). The login link stays on `Employee.userId` and is read only through
+  /// `HrIdentityGateway`. NULL until publication and retained alongside `publishedAt` afterwards,
+  /// for the same reason: an archived version still has to answer "who put this in force?".
+  publishedByEmployeeId String?                  @map("published_by_employee_id") @db.Uuid
+  createdAt             DateTime                 @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt             DateTime                 @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  /// The policy this version belongs to. RESTRICT: a version is evidence of what was in force
+  /// on a day, and evidence is not deleted (§15.5).
+  policy              LeavePolicy               @relation("LeavePolicyVersionPolicy", fields: [policyId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  /// Phase 54-E §15/§17: the approval FLOW this version states, when it states one. AT MOST ONE —
+  /// a flow is part of a published document, and two live flows for one version would make "which
+  /// flow did this request take?" ambiguous at exactly the moment it must not be.
+  approvalDefinitions LeaveApprovalDefinition[] @relation("LeaveApprovalDefinitionPolicyVersion")
+  /// The publisher, when there is one. RESTRICT: retiring an employee must never delete the
+  /// record of what they published.
+  publishedByEmployee Employee?                 @relation("LeavePolicyVersionPublisher", fields: [publishedByEmployeeId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  /// The typed limits that belong to THIS version (§16). A limit is a child of the version
+  /// rather than of the policy, because a limit is part of the document that was published.
+  limits              LeaveLimitDefinition[]    @relation("LeaveLimitDefinitionVersion")
+
+  /// Composite-key target for `LeaveLimitDefinition`'s `(tenant_id, policy_version_id)` and
+  /// `(tenant_id, policy_id)` foreign keys. Not used by any query on its own.
+  @@unique([tenantId, id], map: "LeavePolicyVersion_tenantId_id_key")
+  /// One tenant does not label two versions of one policy the same. Tenant-qualified for the
+  /// same reason every other HR code key is.
+  @@unique([tenantId, policyId, versionLabel], map: "LeavePolicyVersion_tenantId_policyId_versionLabel_key")
+  /// The version catalogue read: "this policy's versions, earliest interval first", and the
+  /// index the overlap pre-check uses before the exclusion constraint replies.
+  @@index([tenantId, policyId, effectiveFrom], map: "LeavePolicyVersion_tenantId_policyId_effectiveFrom_idx")
+  /// "Which version of this policy occupies this state" — the read the publish guard and the
+  /// current-version resolver both perform.
+  @@index([tenantId, policyId, status], map: "LeavePolicyVersion_tenantId_policyId_status_idx")
+  @@map("LeavePolicyVersion")
+}
+
+/// Lifecycle of ONE leave policy version (Phase 54-D §15).
+///
+///   DRAFT     — authored, not yet checked. Editable while it stays here.
+///   VALIDATED — checked against the platform's rule vocabulary and accepted as a well-formed
+///               body. Still editable, because nothing is in force yet: the state records that
+///               the body was ACCEPTED, not that it was ADOPTED.
+///   PUBLISHED — IN FORCE, and from here the row's CONTENT is frozen by the trigger.
+///   ARCHIVED  — WITHDRAWN FROM SELECTION by the publish of its successor (§10.4, §11). Still
+///               resolvable for explanations and historical references (§10.3), and its content is
+///               frozen exactly as a published row's is.
+///
+/// PHASE 54-F ADDED `ARCHIVED`, AND IT WAS A CORRECTION RATHER THAN AN EXTENSION. §10.3 and the §11
+/// diagram both write the lifecycle as four states, with "Publishing a new version archives the
+/// previous one in the same act" (§10.4) and a terminal "no path back to DRAFT/DELETE". The
+/// three-member enum this phase inherited could not express that act at all: with no `ARCHIVED`
+/// member, a superseded version had nowhere to go, so "which version is in force" was answered by
+/// the effective window ALONE and a withdrawn successor could never be distinguished from a current
+/// one. The tracked specification is authoritative, so the enum was widened to it.
+///
+/// WHY THERE IS NO MEMBER MEANING "WAS PUBLISHED BUT NO LONGER APPLIES *TEMPORALLY*"
+/// -----------------------------------------------------------------------------
+/// That is not a lifecycle state and never was: a version whose `effectiveTo` has passed is still
+/// the one the specification calls PUBLISHED, and it is simply not the one whose window covers the
+/// day being asked about. `ARCHIVED` means something DIFFERENT — it was actively WITHDRAWN by a
+/// successor's publish, so no day makes it selectable again. Two facts, two columns: `status`
+/// answers "may this be selected for a new evaluation?", `effectiveFrom`/`effectiveTo` answer "on
+/// which days is it in force?". Collapsing them would lose whichever answer the other column had.
+enum LeavePolicyVersionStatus {
+  DRAFT
+  VALIDATED
+  PUBLISHED
+  ARCHIVED
+}
+
+/// ONE typed limit inside ONE leave policy version (Phase 54-D §16).
+///
+/// A limit is TYPED POLICY DATA THAT IS EVALUATED, never a stored counter (§16). That is the
+/// storage consequence of the schema's existing refusal to keep derived leave facts — no
+/// balance, no accrual, no `durationDays` — and of the module's refusal to run background work.
+/// The row below states a MAXIMUM and the terms it is counted on; the COUNT it meets on any
+/// given day is derived by the domain from stored requests, inside a bounded query, and handed
+/// to the engine as a number. Nothing here is incremented.
+///
+/// WHY THE COUNTING BASIS IS MANDATORY AND PART OF THE TYPE (§16.1, D7)
+/// ------------------------------------------------------------------
+/// `REQUEST_COUNT` and `DAY_COUNT` are different semantics, so a stored `3` is never
+/// interpreted without one. Making the basis a NON-NULL column rather than a nullable hint is
+/// the schema's half of that rule: there is no row in this table whose basis is absent, which
+/// is why no reader has to decide what an absent basis would have meant.
+///
+/// WHY THE WINDOW IS STORED RATHER THAN DERIVED
+/// -------------------------------------------
+/// §16.2 keeps calendar arithmetic on the domain side of the boundary, and this repository
+/// already owns ONE answer to "when does the tenant's year start" (`calendar/jalali.util.ts`,
+/// reached through `leave-policy-window.ts`). The window is resolved THERE, at configuration
+/// time, and two resolved inclusive days are written here. So:
+///
+///   * the engine compares stored days and performs no calendar arithmetic (D12);
+///   * a policy authored for 1404 keeps counting the 1404 window after the year has rolled,
+///     which is what "effective dating is configuration, not evaluation time" means (§11);
+///   * a historical explanation states the window it actually counted over, instead of
+///     re-deriving one from a calendar that may since have been corrected.
+///
+/// WHY `employmentType` IS NULLABLE AND WHY THAT IS NOT A DEFAULT
+/// ------------------------------------------------------------
+/// A limit that names an employment type applies only when the employment interval covering
+/// the requested range declares that type (§16.6). A limit that names NONE applies regardless
+/// of type. Those are two different statements and NULL is how the second is written — it never
+/// means "unknown", and the evaluator never resolves a missing interval by assuming a type: it
+/// REFUSES as insufficient context (§16.6).
+model LeaveLimitDefinition {
+  id              String               @id @default(uuid()) @db.Uuid
+  /// TEXT, like every `tenantId` in this database.
+  tenantId        String               @map("tenant_id") @db.Text
+  /// The VERSION this limit belongs to. Composite-FK target together with the tenant.
+  policyVersionId String               @map("policy_version_id") @db.Uuid
+  /// The version's policy, carried so a SECOND composite FK can prove the whole chain stays
+  /// inside one tenant (§15.2, §15.3): the limit is anchored to its version AND to the policy
+  /// that version belongs to, both tenant-qualified.
+  policyId        String               @map("policy_id") @db.Uuid
+  /// The leave kind this limit counts (a same-tenant `LeaveType`). REQUIRED: a limit that
+  /// counts nothing in particular is not a limit.
+  leaveTypeId     String               @map("leave_type_id") @db.Uuid
+  /// The employment type this limit is scoped to, or NULL when it applies to every type.
+  /// Effective-dated on `EmploymentRecord`, so the scope is matched TEMPORALLY (§16.6).
+  employmentType  EmploymentType?      @map("employment_type")
+  /// The maximum the limit permits, counted on `countingBasis` over the window. Postgres
+  /// enforces `> 0` — see `LeaveLimitDefinition_maximum_positive_check`. A maximum of zero is
+  /// not a limit, it is a prohibition, and stating one as the other would make "no leave of
+  /// this kind" indescribable in the vocabulary that describes every other cap.
+  maximum         Int
+  /// REQUEST_COUNT | DAY_COUNT — mandatory, never implied (§16.1, D7). A NON-NULL column, so an
+  /// uninterpretable stored maximum is unrepresentable rather than merely discouraged.
+  countingBasis   LeaveCountingBasis   @map("counting_basis")
+  /// The period kind the window was resolved from. `YEAR` is the only member in this phase
+  /// (§16.8); the column exists as a KIND rather than being assumed, because a limit that does
+  /// not state its period cannot be re-resolved and cannot be explained.
+  period          LeaveLimitPeriodKind
+  /// The tenant-visible Jalali year this limit's window belongs to. Recorded BESIDE the
+  /// resolved window so the two can be compared: a window and a year that disagree is a
+  /// contradiction that can be DETECTED rather than merely discovered late.
+  jalaliYear      Int                  @map("jalali_year")
+  /// The FIRST day of the resolved counting window — INCLUSIVE (§16.2).
+  windowStart     DateTime             @map("window_start") @db.Date
+  /// The LAST day of the resolved counting window — INCLUSIVE (§16.2).
+  windowEnd       DateTime             @map("window_end") @db.Date
+  /// The request states that CONSUME this limit — REQUIRED, never defaulted (§16.4).
+  ///
+  /// "Does a pending request consume the limit?" is a POLICY question, so the policy author
+  /// states it and the engine never guesses. An EMPTY set is refused by the
+  /// `LeaveLimitDefinition_consumes_states_non_empty_check` CHECK rather than silently counting
+  /// everything or nothing: a limit that consumes no state would be met by nobody, forever.
+  ///
+  /// The FULL authorable contract is stored here. Which of those states the request lifecycle
+  /// can REACH today is a separate question with a separate answer, and narrowing this column to
+  /// it would silently rewrite what the author stated. In this phase the lifecycle reaches
+  /// PENDING only, so enforcement over a set naming a state the lifecycle cannot reach is
+  /// refused as INSUFFICIENT CONTEXT rather than silently reinterpreted (54-E).
+  consumesStates  LeaveRequestStatus[] @map("consumes_states")
+  /// The FIRST day this limit is effective — INCLUSIVE. Deliberately separate from the counting
+  /// window: the WINDOW says which days are counted, this interval says when the RULE applies.
+  /// A limit introduced in Bahman still counts the whole year's window, which is the ordinary
+  /// case rather than a special one.
+  effectiveFrom   DateTime             @map("effective_from") @db.Date
+  /// The LAST day this limit is effective — INCLUSIVE, NULL when OPEN-ENDED, exactly as on
+  /// `LeavePolicyVersion` and `EmploymentRecord`.
+  effectiveTo     DateTime?            @map("effective_to") @db.Date
+  createdAt       DateTime             @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt       DateTime             @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  /// The version this limit belongs to. RESTRICT: a published document's terms are evidence.
+  policyVersion LeavePolicyVersion @relation("LeaveLimitDefinitionVersion", fields: [policyVersionId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  /// The policy, for the tenant-chain composite FK. RESTRICT for the same reason.
+  policy        LeavePolicy        @relation("LeaveLimitDefinitionPolicy", fields: [policyId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  /// The leave kind counted. RESTRICT: a type a stated policy counts cannot be deleted out from
+  /// under it — which is why retirement is a STATUS on `LeaveType`, not a delete.
+  leaveType     LeaveType          @relation("LeaveLimitDefinitionLeaveType", fields: [leaveTypeId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+
+  /// Composite-key target for this table's own `(tenant_id, id)` pair, kept uniform with every
+  /// other HR model.
+  @@unique([tenantId, id], map: "LeaveLimitDefinition_tenantId_id_key")
+  /// The read the evaluator performs: "every limit of this version counting this leave kind",
+  /// tenant-qualified so ONE index serves it.
+  @@index([tenantId, policyVersionId, leaveTypeId], map: "LeaveLimitDefinition_tenantId_policyVersionId_leaveTypeId_idx")
+  /// "What has been stated about this kind, across versions" — the reconciliation read.
+  @@index([tenantId, leaveTypeId, effectiveFrom], map: "LeaveLimitDefinition_tenantId_leaveTypeId_effectiveFrom_idx")
+  @@map("LeaveLimitDefinition")
+}
+
+/// How a limit's maximum is counted (Phase 54-D §16.1, D7).
+///
+///   REQUEST_COUNT — the maximum counts REQUESTS. Three separate one-day requests are three.
+///   DAY_COUNT     — the maximum counts CALENDAR DAYS, derived at evaluation from the stored
+///                   inclusive `start_date`..`end_date` of each counted request, never from a
+///                   stored duration column (§16.3).
+///
+/// The two are DIFFERENT SEMANTICS, which is why the basis is mandatory and part of the type:
+/// the same stored `3` means three requests under one member and three days under the other,
+/// and a reader who has to guess which is reading a different rule than the one stated.
+///
+/// Only these two bases exist in this phase. No monetary limit, no accrual, no carry-over, no
+/// encashment, no working-day arithmetic, no holiday subtraction and no overlap rule: each is a
+/// policy this repository has not been authorized to state (§16.8, §39, §40).
+enum LeaveCountingBasis {
+  REQUEST_COUNT
+  DAY_COUNT
+}
+
+/// The period a limit's counting window is resolved from (Phase 54-D §16).
+///
+///   YEAR — the tenant-visible JALALI year. The ONLY period in this phase.
+///
+/// A single-member enum rather than an omitted column, because the period is a STATEMENT the
+/// author makes and a limit that states no period cannot be re-resolved or explained. Adding a
+/// second member later becomes a compile error at `resolveLeaveLimitWindow`'s exhaustive
+/// `switch`, which forces that phase to decide what the new period MEANS instead of inheriting
+/// whatever a record lookup happened to return.
+enum LeaveLimitPeriodKind {
+  YEAR
+}
+
+// ===========================================================================
+// LEAVE APPROVAL — the flow a policy states, and its runtime (54-E §15, §17, §18, §19, §20)
+// ===========================================================================
+//
+// WHAT THIS SECTION IS, IN ONE SENTENCE: `LeaveRequest.status` is the BUSINESS state, and
+// the approval flow is SEPARATE HISTORY kept in two runtime tables — which is why a
+// request that was routed and then refused still renders WHAT was asked for, while the
+// steps say WHO was asked and WHAT each of them stated.
+//
+// WHY THERE ARE NO DECISION COLUMNS ON `LeaveRequest` — §17.1, IN WRITING
+// ----------------------------------------------------------------------
+// No `approverId`, no `decidedAt`, no `decidedBy`, no `approver1/2/3`. A `LeaveRequest`
+// column can hold ONE approver, and a flow has many; it can hold one decision, and a flow
+// has one per step. A single column would therefore have to pick which step it means, and
+// the row would be readable as "this is the approval" while up to four other decisions
+// existed elsewhere. The state stays on the request (it is a fact about the request) and
+// every fact about the DECISION stays on the step that produced it.
+//
+// THE FIVE TABLES, AND WHY FIVE RATHER THAN ONE
+// --------------------------------------------
+//   * `LeaveApprovalDefinition`     — the flow a policy VERSION states. Configuration.
+//   * `LeaveApprovalStepDefinition` — one ordered step: approver rule + substitute +
+//                                     availability. Configuration.
+//   * `LeaveSubstitutionDefinition` — primary → substitute, effective-dated, with its
+//                                     condition. Configuration (§19).
+//   * `LeaveApprovalInstance`       — the runtime flow for ONE request (§17).
+//   * `LeaveApprovalStepInstance`   — the runtime of ONE step: resolved approver,
+//                                     decision, reason (§17).
+//
+// Configuration and runtime are separate TABLES rather than separate rows in one table
+// because they have opposite lifetimes: a definition is edited (while its version is a
+// draft) and a step INSTANCE is append-only history that is frozen the moment it is
+// decided. One table would have to allow one behaviour and forbid the other, and the
+// trigger that enforces the second would be unable to tell which rows it meant.
+//
+// TENANCY IS STRUCTURAL, AS EVERYWHERE IN `hr_db` (§15.2)
+// ------------------------------------------------------
+// Every table carries `tenant_id` TEXT plus its own `@@unique([tenantId, id])` composite
+// target, so a sibling can carry a composite `(tenant_id, ...)` foreign key. A request can
+// no more cite another tenant's approval flow than it can cite another tenant's leave
+// type — the guarantee is PostgreSQL's, not a service convention.
+//
+// APPROVERS ARE HR PEOPLE, NOT CORE IDENTITIES (§15.3, §25)
+// --------------------------------------------------------
+// A step's approver is an `Employee` of the SAME tenant (composite FK), never a bare Core
+// user id. `Employee.userId` remains the OPTIONAL login link, read only through
+// `HrIdentityGateway`, and it is consulted for availability — never as the authority.
+//
+// WHAT IS DELIBERATELY ABSENT
+// ---------------------------
+//   * NO `DELEGATED` / `ESCALATED` / `EXPIRED` step status. §17.6 refuses escalation,
+//     timeout and reminder outright: there is no scheduler in these layers, so a status
+//     nothing can reach would be a promise with a column name.
+//   * NO seeded flow, approver or substitution. §15.8 — until a tenant states a policy,
+//     the honest rendering is "no policy has been stated", and a default flow would
+//     decide somebody's leave under a rule nobody approved.
+//   * NO global self-approval flag. §19.6 makes self-approval a POLICY statement, so
+//     `allow_self_approval` lives on the STEP definition and defaults to `false`; there is
+//     no platform-wide switch to consult.
+
+/// The approval FLOW a leave policy version states (Phase 54-E §15, §17).
+///
+/// This row answers "does this version route its requests, and under what term?" and nothing
+/// else. It belongs to a `LeavePolicyVersion` rather than to a `LeavePolicy`, because a flow is
+/// part of a published DOCUMENT: the same policy re-published for a new year may route
+/// differently, and a flow hung directly off the policy would have no version to cite when an
+/// old explanation is rendered (§15.6, §23).
+///
+/// ONE PER VERSION, and the unique index says so. Two live flows for one version would make
+/// "which flow did this request take?" ambiguous at exactly the moment it must not be — and the
+/// INSTANCE snapshots the flow it opened under precisely because configuration is allowed to
+/// change after the fact.
+model LeaveApprovalDefinition {
+  id              String   @id @default(uuid()) @db.Uuid
+  /// TEXT, like every `tenantId` in this database.
+  tenantId        String   @map("tenant_id") @db.Text
+  /// The policy VERSION whose document this flow is part of. Composite-FK target with the tenant.
+  policyVersionId String   @map("policy_version_id") @db.Uuid
+  /// The tenant's own label for this flow ("standard-2-step"). A LABEL, not a sequence this
+  /// system mints — the same discipline `LeavePolicyVersion.versionLabel` records.
+  code            String   @db.VarChar(64)
+  /// What the flow is called on screen. Free text, trimmed and non-blank (the migration's CHECK).
+  name            String   @db.VarChar(200)
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt       DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  /// The version this flow belongs to. RESTRICT: a flow is evidence of what was in force on a
+  /// day, and evidence is not deleted (§15.5).
+  policyVersion LeavePolicyVersion            @relation("LeaveApprovalDefinitionPolicyVersion", fields: [policyVersionId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  /// The ORDERED steps. `order` is the routing order and is stated, never inferred.
+  steps         LeaveApprovalStepDefinition[] @relation("LeaveApprovalStepDefinitionDefinition")
+  /// The runtime flows opened under this definition. RESTRICT: a history row is never orphaned
+  /// by deleting the configuration it cites (§17.2).
+  instances     LeaveApprovalInstance[]       @relation("LeaveApprovalInstanceDefinition")
+
+  /// Composite-key target for the same-tenant foreign keys below.
+  @@unique([tenantId, id], map: "LeaveApprovalDefinition_tenantId_id_key")
+  /// ONE flow per version — the read the publish guard and the router both perform.
+  @@unique([tenantId, policyVersionId], map: "LeaveApprovalDefinition_tenantId_policyVersionId_key")
+  /// The tenant's own flow label, unique inside the version it belongs to.
+  @@unique([tenantId, policyVersionId, code], map: "LeaveApprovalDefinition_tenantId_policyVersionId_code_key")
+  @@map("LeaveApprovalDefinition")
+}
+
+/// ONE ordered step of an approval flow (Phase 54-E §17, §19).
+///
+/// `order` IS THE ROUTING ORDER, stated rather than inferred. The migration makes it dense
+/// `1..n` inside its definition with a `CHECK (order > 0)` plus a unique `(definition, order)`
+/// index, and §18.4 requires density because a gap is a step somebody meant to add: a flow that
+/// reads `1, 2, 4` would route 1→2 and then jump, and the jump would be discovered by a request
+/// that stopped mid-way rather than by the author who made the gap.
+///
+/// INSERTION ORDER IS NEVER THE ORDER. A `createdAt` sort would make the route depend on when
+/// rows were written, so re-ordering a draft would silently re-route requests already recorded
+/// against the old sequence — which is exactly why the ordering is a stated integer.
+///
+/// TWO WAYS TO NAME AN APPROVER, AND WHY THAT IS NOT A THIRD ONE
+/// -----------------------------------------------------------
+///   * `approverEmployeeId` — a SPECIFIC person of this tenant (composite FK).
+///   * `approverRole`       — a ROLE the tenant has stated ("HR_ADMIN"), resolved to a person
+///                            at ROUTING TIME through the tenant's own role assignment.
+/// Exactly ONE of the two is set, and `LeaveApprovalStepDefinition_approver_check` states that
+/// in the database: the column that is absent is how the step says which KIND of rule it is,
+/// rather than a `mode` enum that could disagree with the columns beside it.
+///
+/// WHY THERE IS NO REPORTING-SUBTREE TRAVERSAL HERE. §25.3 refuses it in writing: the reporting
+/// subtree is a server-side traversal that does not exist, and a permission or a column claiming
+/// it would be the widest kind of lie because it would be GRANTED. The scope of whom a step may
+/// decide for is expressed by WHO the step names, which is tenant policy.
+model LeaveApprovalStepDefinition {
+  id                   String   @id @default(uuid()) @db.Uuid
+  /// TEXT, like every `tenantId` in this database.
+  tenantId             String   @map("tenant_id") @db.Text
+  /// The flow this step belongs to. Composite-FK target with the tenant.
+  approvalDefinitionId String   @map("approval_definition_id") @db.Uuid
+  /// The DENSE routing position, `1..n` inside this definition. Unique with the definition.
+  order                Int      @map("order")
+  /// What the step is called on screen ("Line manager", "HR"). Trimmed, non-blank.
+  name                 String   @db.VarChar(200)
+  /// The SPECIFIC approver, when the step names a person. Composite-FK target with the tenant.
+  /// NULL when `approverRole` is set — exactly one of the two (see the CHECK).
+  approverEmployeeId   String?  @map("approver_employee_id") @db.Uuid
+  /// The ROLE the step routes to, when it names a role instead of a person. Resolved to exactly
+  /// one person at routing time, inside the tenant. NULL when `approverEmployeeId` is set.
+  approverRole         String?  @map("approver_role") @db.VarChar(64)
+  /// The availability signal this step tests before falling back to a substitute (§19, §20).
+  /// One of the SIX frozen signals, or NULL meaning "no availability test" — never one of the
+  /// three refused tokens, which the publish validator rejects by name.
+  availabilitySignal   String?  @map("availability_signal") @db.VarChar(64)
+  /// WHETHER THE POLICY STATES THAT THE REQUESTER MAY BE THIS STEP'S APPROVER. §19.6 — there is
+  /// deliberately NO global default, so `false` here is the ABSENCE of a statement rather than a
+  /// product decision: a step that does not say `true` can never resolve to the requester, and
+  /// the step then blocks as `NO_RESOLUTION` instead of silently self-approving or silently
+  /// refusing. Do not add a platform-wide flag to consult instead of this column.
+  allowSelfApproval    Boolean  @default(false) @map("allow_self_approval")
+  createdAt            DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt            DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  /// The flow this step is part of. RESTRICT: configuration history is not erased.
+  approvalDefinition LeaveApprovalDefinition       @relation("LeaveApprovalStepDefinitionDefinition", fields: [approvalDefinitionId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  /// The named approver, when there is one. RESTRICT: retiring an employee must never delete the
+  /// record of a step that routes to them.
+  approverEmployee   Employee?                     @relation("LeaveApprovalStepDefinitionApprover", fields: [approverEmployeeId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  /// The substitutions whose PRIMARY is this step's configured approver (§19).
+  substitutions      LeaveSubstitutionDefinition[] @relation("LeaveSubstitutionDefinitionStep")
+  /// The runtime steps opened from this configuration. RESTRICT, as above.
+  instances          LeaveApprovalStepInstance[]   @relation("LeaveApprovalStepInstanceDefinition")
+
+  /// Composite-key target for the same-tenant foreign keys below.
+  @@unique([tenantId, id], map: "LeaveApprovalStepDefinition_tenantId_id_key")
+  /// THE ORDERING RULE: dense positions, unique inside the flow. The pair is what makes
+  /// "activate the next step" a lookup rather than a sort.
+  @@unique([tenantId, approvalDefinitionId, order], map: "LeaveApprovalStepDefinition_tenantId_definitionId_order_key")
+  @@index([tenantId, approverEmployeeId], map: "LeaveApprovalStepDefinition_tenantId_approverEmployeeId_idx")
+  @@map("LeaveApprovalStepDefinition")
+}
+
+/// A stated replacement for an approver who is unavailable, EFFECTIVE-DATED (Phase 54-E §19).
+///
+/// WHAT A SUBSTITUTION IS: "while `effectiveFrom..effectiveTo`, when the PRIMARY meets the
+/// stated condition, route this step to the SUBSTITUTE INSTEAD." It is EXCLUSIVE — never both,
+/// and never a chain (§19.2): the substitute is a person, and if the substitute is themselves
+/// unavailable the step is `NO_RESOLUTION` rather than a second hop. A chain would make "who
+/// decided this?" answerable only by walking history backwards through rows whose authors each
+/// assumed somebody else had stated the rule.
+///
+/// WHY IT IS NEVER EDITED IN PLACE (§19.4). Two facts about the same days cannot both be true,
+/// so a correction is a NEW row with its own effective interval — the same remedy the policy
+/// tables use. The migration's exclusion constraint refuses OVERLAPPING intervals for the same
+/// primary, which is how "which substitution applied on this day?" stays a single answer.
+///
+/// THE CONDITION IS A SIGNAL FROM THE SAME CLOSED VOCABULARY. `conditionSignal` names WHY the
+/// primary is being replaced — one of the six usable signals — and `ACTIVE_SUBSTITUTION` is the
+/// signal a STEP tests to discover that this row applies to it. The two directions are the same
+/// vocabulary read from opposite ends, which is why there is no second list.
+model LeaveSubstitutionDefinition {
+  id                       String    @id @default(uuid()) @db.Uuid
+  /// TEXT, like every `tenantId` in this database.
+  tenantId                 String    @map("tenant_id") @db.Text
+  /// The step whose configured approver this substitution replaces. Composite-FK target with the
+  /// tenant, so a substitution cannot be hung off another tenant's step.
+  approvalStepDefinitionId String    @map("approval_step_definition_id") @db.Uuid
+  /// The person being replaced — denormalized so the exclusion constraint can bound the
+  /// INTERVALS for one primary without joining, and so a historical explanation can state whose
+  /// unavailability triggered the replacement without reconstructing it from a step row that may
+  /// since have been re-pointed in a draft.
+  primaryEmployeeId        String    @map("primary_employee_id") @db.Uuid
+  /// The person who decides INSTEAD. Composite-FK target with the tenant: a substitute from
+  /// another tenant is unwritable.
+  substituteEmployeeId     String    @map("substitute_employee_id") @db.Uuid
+  /// The signal that makes this row apply — one of the six usable signals (§20).
+  conditionSignal          String    @map("condition_signal") @db.VarChar(64)
+  /// The FIRST day this substitution is effective — INCLUSIVE, a calendar day (`@db.Date`),
+  /// never an instant: an interval is a calendar fact, not a moment in the server's timezone.
+  effectiveFrom            DateTime  @map("effective_from") @db.Date
+  /// The LAST day it is effective — INCLUSIVE. NULL means OPEN-ENDED, and that is the only
+  /// meaning NULL has here — the same date-only discipline `EmploymentRecord.endDate` carries.
+  effectiveTo              DateTime? @map("effective_to") @db.Date
+  /// Who stated the substitution. An EMPLOYEE of this tenant (composite FK), never a Core user
+  /// id (§15.3). The login link stays on `Employee.userId` and is read only through
+  /// `HrIdentityGateway`.
+  statedByEmployeeId       String    @map("stated_by_employee_id") @db.Uuid
+  createdAt                DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt                DateTime  @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  /// The step this substitution belongs to. RESTRICT: configuration history is not erased.
+  approvalStepDefinition LeaveApprovalStepDefinition @relation("LeaveSubstitutionDefinitionStep", fields: [approvalStepDefinitionId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  /// The person replaced. RESTRICT, for the same reason the step's approver is.
+  primaryEmployee        Employee                    @relation("LeaveSubstitutionDefinitionPrimary", fields: [primaryEmployeeId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  /// The person who decides instead. RESTRICT.
+  substituteEmployee     Employee                    @relation("LeaveSubstitutionDefinitionSubstitute", fields: [substituteEmployeeId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  /// Who stated it. RESTRICT.
+  statedByEmployee       Employee                    @relation("LeaveSubstitutionDefinitionStatedBy", fields: [statedByEmployeeId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+
+  /// Composite-key target for the same-tenant foreign keys below.
+  @@unique([tenantId, id], map: "LeaveSubstitutionDefinition_tenantId_id_key")
+  /// The lookup the resolver and the exclusion constraint both press on: this primary's
+  /// intervals, inside this tenant. A plain index — the OVERLAP rule is an exclusion constraint
+  /// in the migration, which Prisma cannot express.
+  @@index([tenantId, primaryEmployeeId, effectiveFrom], map: "LeaveSubstitutionDefinition_tenantId_primaryEmployeeId_from_idx")
+  @@map("LeaveSubstitutionDefinition")
+}
+
+/// The runtime approval flow for ONE leave request (Phase 54-E §17, §18).
+///
+/// ONE LIVE INSTANCE PER REQUEST, enforced by the migration's PARTIAL UNIQUE index on
+/// `(tenant_id, leave_request_id) WHERE status = 'ACTIVE'`. The partiality is the point: a
+/// request may legitimately have more than one instance row over its life — a flow that was
+/// withdrawn and a flow opened after a correction — but only ONE may be open at a time. A plain
+/// unique index would make re-routing impossible; no index at all would let two flows run at
+/// once, with two people each believing they are the decision.
+///
+/// AN UNGOVERNED REQUEST HAS NO INSTANCE AT ALL (§18.5). When the policy states no flow, the
+/// request simply stays `PENDING` with no instance — there is no "instance with no steps" row,
+/// because such a row would look like a flow that exists and is merely waiting.
+///
+/// THE RANGE AND THE FLOW ARE SNAPSHOTTED (§17.4, §23). `requestStartDate`/`requestEndDate` are
+/// copied at routing time so an availability explanation cites the days it ACTUALLY asked about
+/// even after the request is corrected; `definitionId` records WHICH flow was taken, because
+/// configuration is allowed to change afterwards and a report that joined live configuration
+/// would silently rewrite history.
+///
+/// NEVER DELETED, NEVER REWRITTEN (§17.6). The migration's trigger refuses both, so the
+/// guarantee survives a writer that bypasses this module.
+model LeaveApprovalInstance {
+  id                   String                      @id @default(uuid()) @db.Uuid
+  /// TEXT, like every `tenantId` in this database.
+  tenantId             String                      @map("tenant_id") @db.Text
+  /// The request this flow decides. Composite-FK target with the tenant, so a flow cannot be
+  /// opened for another tenant's request.
+  leaveRequestId       String                      @map("leave_request_id") @db.Uuid
+  /// The flow configuration this instance was opened under. Composite-FK target with the tenant.
+  /// RESTRICT: the configuration a decision cites is never removed from under it.
+  approvalDefinitionId String                      @map("approval_definition_id") @db.Uuid
+  /// ACTIVE or COMPLETED — and deliberately nothing else. See `LeaveApprovalInstanceStatus`.
+  status               LeaveApprovalInstanceStatus @default(ACTIVE)
+  /// The request's FIRST day, COPIED at routing time. An availability answer is only true about
+  /// a stated range, so the range is recorded rather than re-read.
+  requestStartDate     DateTime                    @map("request_start_date") @db.Date
+  /// The request's LAST day, copied for the same reason.
+  requestEndDate       DateTime                    @map("request_end_date") @db.Date
+  /// How many steps this flow has, copied at routing time. Read with `order` to decide whether a
+  /// step is the LAST one (§18.1) — a count taken from live configuration could disagree with the
+  /// step rows the instance actually owns.
+  stepCount            Int                         @map("step_count")
+  /// When the flow was opened. A moment: this is when the platform did something.
+  routedAt             DateTime                    @default(now()) @map("routed_at") @db.Timestamptz(6)
+  /// When the flow reached `COMPLETED`, by decision or by withdrawal. The migration's CHECK ties
+  /// this to `status` in BOTH directions, so "COMPLETED with no timestamp" and "a timestamp on
+  /// an ACTIVE flow" are both unwritable — the discipline `LeaveRequest_cancelled_state_check`
+  /// and the Letter table already document.
+  completedAt          DateTime?                   @map("completed_at") @db.Timestamptz(6)
+  createdAt            DateTime                    @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt            DateTime                    @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  /// The request being decided. RESTRICT: a request that has been through a flow is history.
+  leaveRequest       LeaveRequest                @relation("LeaveApprovalInstanceRequest", fields: [leaveRequestId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  /// The flow configuration taken. RESTRICT.
+  approvalDefinition LeaveApprovalDefinition     @relation("LeaveApprovalInstanceDefinition", fields: [approvalDefinitionId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  /// The steps of this flow, in `order`. Append-only history; frozen per step once decided.
+  steps              LeaveApprovalStepInstance[] @relation("LeaveApprovalStepInstanceInstance")
+
+  /// Composite-key target for the same-tenant foreign keys below.
+  @@unique([tenantId, id], map: "LeaveApprovalInstance_tenantId_id_key")
+  /// The register read — "this request's flows", tenant-qualified.
+  @@index([tenantId, leaveRequestId, status], map: "LeaveApprovalInstance_tenantId_leaveRequestId_status_idx")
+  @@map("LeaveApprovalInstance")
+}
+
+/// The runtime of ONE step: who was asked, what they stated, and why (§17.3, §17.5).
+///
+/// THIS IS WHERE A DECISION LIVES, AND THERE IS NO OTHER PLACE. `decidedByEmployeeId`,
+/// `decisionReason`, `decidedAt` and `decision` are here rather than on `LeaveRequest`, because
+/// a request may have several steps and a single column cannot say which one it means (§17.1).
+///
+/// THE RESOLVED APPROVER IS RECORDED, NOT RE-DERIVED (§17.3). `resolvedApproverEmployeeId` is
+/// the person the flow actually asked. Re-deriving it at read time would answer a different
+/// question — "who WOULD be asked today?" — and an old step would appear to have been decided by
+/// somebody who never saw it. `resolutionReason` says HOW they were resolved
+/// (`PRIMARY` / `SUBSTITUTE` / `NO_RESOLUTION`) and `resolutionSignal` records WHICH availability
+/// signal fired, so the explanation is reproducible from the row alone.
+///
+/// EXACTLY ONE DECIDER, NEVER BOTH (§19.2). A step resolves to the primary OR to a substitute,
+/// and `NO_RESOLUTION` is the third answer — the fail-closed one, which leaves a step nobody may
+/// decide rather than routing to an arbitrary person.
+///
+/// APPEND-ONLY, AND FROZEN ONCE DECIDED (§17.6). The migration's trigger refuses DELETE on this
+/// table outright and refuses any UPDATE that changes a historical routing or decision field
+/// after a decision has been recorded — while still allowing the lifecycle moves the router
+/// needs (`PENDING -> ACTIVE -> APPROVED`/`REJECTED`, and the `SKIPPED`/`CANCELLED` cascade).
+model LeaveApprovalStepInstance {
+  id                         String                        @id @default(uuid()) @db.Uuid
+  /// TEXT, like every `tenantId` in this database.
+  tenantId                   String                        @map("tenant_id") @db.Text
+  /// The instance this step belongs to. Composite-FK target with the tenant.
+  approvalInstanceId         String                        @map("approval_instance_id") @db.Uuid
+  /// The step configuration this runtime step was opened from. Composite-FK target with the
+  /// tenant. RESTRICT — but the runtime step is self-describing, so a read never needs it.
+  approvalStepDefinitionId   String                        @map("approval_step_definition_id") @db.Uuid
+  /// The DENSE routing position, `1..n` inside its instance — unique with the instance.
+  order                      Int                           @map("order")
+  /// Where the step stands. Six members; the migration's CHECK lists them.
+  status                     LeaveApprovalStepStatus       @default(PENDING)
+  /// WHO was asked. NULL only for `NO_RESOLUTION`, where nobody could be resolved. An `Employee`
+  /// of the same tenant (composite FK) — never a Core user id (§15.3).
+  resolvedApproverEmployeeId String?                       @map("resolved_approver_employee_id") @db.Uuid
+  /// HOW that person was resolved. `NO_RESOLUTION` is the third answer, and it blocks.
+  resolutionReason           LeaveApprovalResolutionReason @default(NO_RESOLUTION) @map("resolution_reason")
+  /// WHICH availability signal produced the resolution, or NULL when none was tested. One of the
+  /// six usable signals — a REFUSED token here would make the row unexplainable.
+  resolutionSignal           String?                       @map("resolution_signal") @db.VarChar(64)
+  /// THE DECISION: `APPROVED` or `REJECTED`, or NULL while the step is live. The migration's
+  /// CHECK ties it to `status` in BOTH directions, so the two can never disagree.
+  decision                   LeaveApprovalStepDecision?    @map("decision")
+  /// WHO DECIDED. An `Employee` of this tenant, and one who was the RESOLVED approver of THIS
+  /// step — the pairing the service enforces, since "has the permission" is never "may decide
+  /// this one" (§25.2).
+  decidedByEmployeeId        String?                       @map("decided_by_employee_id") @db.Uuid
+  /// WHY THEY DECIDED. OPTIONAL for an approval, MANDATORY and non-blank for a rejection — the
+  /// service refuses a blank one, and the migration's CHECK refuses the stored shape a bypassing
+  /// writer could otherwise produce (`REJECTED` with no reason).
+  decisionReason             String?                       @map("decision_reason") @db.VarChar(500)
+  /// When the decision was recorded. A moment, not a day.
+  decidedAt                  DateTime?                     @map("decided_at") @db.Timestamptz(6)
+  /// The rule version the decision was made UNDER (§17.5) — the policy version's own label, so
+  /// an explanation states the document in force at that moment rather than the current one.
+  ruleVersionLabel           String?                       @map("rule_version_label") @db.VarChar(64)
+  createdAt                  DateTime                      @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt                  DateTime                      @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  /// The flow this step belongs to. RESTRICT: an instance is history, and history is not removed.
+  approvalInstance         LeaveApprovalInstance       @relation("LeaveApprovalStepInstanceInstance", fields: [approvalInstanceId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  /// The configuration this step came from. RESTRICT.
+  approvalStepDefinition   LeaveApprovalStepDefinition @relation("LeaveApprovalStepInstanceDefinition", fields: [approvalStepDefinitionId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  /// The person asked. RESTRICT: retiring an employee must never erase the record of a decision
+  /// they made or were asked for.
+  resolvedApproverEmployee Employee?                   @relation("LeaveApprovalStepInstanceResolvedApprover", fields: [resolvedApproverEmployeeId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  /// The person who decided. RESTRICT, for the same reason.
+  decidedByEmployee        Employee?                   @relation("LeaveApprovalStepInstanceDecidedBy", fields: [decidedByEmployeeId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+
+  /// Composite-key target for the same-tenant foreign keys below.
+  @@unique([tenantId, id], map: "LeaveApprovalStepInstance_tenantId_id_key")
+  /// THE ORDERING RULE at runtime: dense positions, unique inside the flow. It is also what makes
+  /// "activate step `order + 1`" a lookup rather than a sort.
+  @@unique([tenantId, approvalInstanceId, order], map: "LeaveApprovalStepInstance_tenantId_instanceId_order_key")
+  /// "What is waiting for this person?" — the read an approver's own queue performs.
+  @@index([tenantId, resolvedApproverEmployeeId, status], map: "LeaveApprovalStepInstance_tenantId_resolvedApprover_status_idx")
+  @@map("LeaveApprovalStepInstance")
+}
+
+/// The DECISION a step instance records. TWO members (§17.5).
+///
+///   APPROVED — the step's resolved approver allowed the request.
+///   REJECTED — the step's resolved approver refused it, and `decisionReason` is REQUIRED.
+///
+/// WHY THIS IS A SEPARATE ENUM FROM `LeaveApprovalStepStatus`, WHICH SHARES TWO OF ITS SPELLINGS.
+/// The two answer different questions. `status` is WHERE THE STEP STANDS — including `PENDING`,
+/// `ACTIVE`, `SKIPPED` and `CANCELLED`, none of which is a decision. `decision` is WHAT WAS
+/// STATED, and it is NULL for every step nobody decided. Merging them would make "this step was
+/// skipped" and "this step was decided" the same kind of value, so `decision IS NULL` would no
+/// longer be the single test for "nobody stated anything here".
+///
+/// The CHECK constraint is what keeps the two in step: `decision` is non-NULL exactly when
+/// `status` is `APPROVED` or `REJECTED`, in BOTH directions.
+
+/// Where ONE approval STEP stands (Phase 54-E §17). SIX members, and no more.
+///
+///   PENDING   — configured, not yet activated; a predecessor has not been decided.
+///   ACTIVE    — awaiting exactly the resolved approver's decision. AT MOST ONE per instance,
+///               which the migration's partial unique index enforces.
+///   APPROVED  — decided positively; `decision = APPROVED`, reason OPTIONAL.
+///   REJECTED  — decided negatively; `decision = REJECTED`, reason REQUIRED.
+///   SKIPPED   — the flow ended because a step REJECTED, before this one was asked.
+///   CANCELLED — the flow ended because the REQUEST was withdrawn, before this one was asked.
+///
+/// THERE IS DELIBERATELY NO `DELEGATED`, `ESCALATED`, `EXPIRED` OR `ON_HOLD` (§17.6). Escalation,
+/// timeouts and reminders are refused outright: there is no scheduler in these layers, and a
+/// member for a state nothing can reach is a promise with a column name rather than a
+/// placeholder. A substitution is NOT a `DELEGATED` step — it is the SAME step with a different
+/// resolved approver, which is why `SUBSTITUTE` is a resolution reason and not a status.
+///
+/// `SKIPPED` AND `CANCELLED` ARE DISTINCT ON PURPOSE (§18.2). Collapsing them would make "was
+/// this request withdrawn or refused?" answerable only by reading the request row, and an
+/// explanation rendered from an older step must answer that by itself.
+enum LeaveApprovalStepStatus {
+  PENDING
+  ACTIVE
+  APPROVED
+  REJECTED
+  SKIPPED
+  CANCELLED
+}
+
+/// Where ONE approval INSTANCE stands (Phase 54-E §17). Exactly two members.
+///
+///   ACTIVE    — routed, and no step has produced a terminal request state yet.
+///   COMPLETED — a step decided (the request reached `APPROVED` or `REJECTED`), OR the request
+///               was withdrawn. Terminal.
+///
+/// THERE IS NO `CANCELLED` MEMBER, deliberately. A withdrawn flow has still ENDED, and a third
+/// state would be a second spelling of "this flow is over" — the REQUEST's own `CANCELLED`
+/// already says which way it ended, while the step rows say which steps were decided.
+enum LeaveApprovalInstanceStatus {
+  ACTIVE
+  COMPLETED
+}
+
+/// WHY a step's resolved approver is the person it is (Phase 54-E §17.3, §19).
+///
+///   PRIMARY       — resolved from the step's own configured approver.
+///   SUBSTITUTE    — the configured approver was unavailable under a stated signal, and an
+///                   effective, EXCLUSIVE substitution supplied exactly one replacement.
+///   NO_RESOLUTION — nothing could be resolved. The step is still written (the signals consulted
+///                   are worth keeping), but it has NO resolved approver and therefore NOBODY
+///                   who may decide it. This is the fail-closed spelling: an unresolvable step
+///                   BLOCKS the flow rather than silently approving, rejecting, or routing to an
+///                   arbitrary person. It is also what an absent self-approval statement
+///                   produces (§19.6): no global default is consulted, so a step that does not
+///                   permit self-approval simply cannot resolve to the requester.
+enum LeaveApprovalResolutionReason {
+  PRIMARY
+  SUBSTITUTE
+  NO_RESOLUTION
+}
+
+enum LeaveApprovalStepDecision {
+  APPROVED
+  REJECTED
+}
+
+//   * NO delete route, and no `.delete(` anywhere: every relation is `ON DELETE RESTRICT`.
+
+//     records a decision nobody is entitled to make is the same lie in a different
+//     shape;
+//   * the ONE transition that needs no new policy IS implemented: a pending request
+//     can be WITHDRAWN (`PENDING` → `CANCELLED`), by the operator who manages the
+//     tenant's leave, through the ordinary HR authorization model — a permission gate
+//     and the server-derived actor — rather than an inferred manager chain.
+//
+// The maintenance contract for whoever adds approval: the enum member, the
+// `LeaveRequest_cancelled_state_check` in the migration, `LEAVE_REQUEST_STATUS_TRANSITIONS`
+// in `src/modules/hr/domain/leave-status.ts`, the permission that gates the new route
+// and its Core seed row must all move TOGETHER — otherwise the new state is
+// unreachable and the transition table silently disagrees with the database. That is
+// the same contract `letter-status.util.ts` carries, and it is the failure the
+// correspondence `SCHEDULED` migration had to repair.
+
+// ===========================================================================
+// LEAVE — HR owns the leave REQUEST and the leave-TYPE catalogue (51-HR-3A)
+// ===========================================================================
+//
+// WHAT THIS SECTION IS, IN ONE SENTENCE: a leave request records WHAT was asked
+// FOR — who, of which type, over which days, and why — and NOTHING about whether
+// it may be granted.
+//
+// TWO TABLES, AND THE SECOND ONE EXISTS BECAUSE THE FIRST NEEDS IT
+// ---------------------------------------------------------------
+//   * `LeaveType` is the tenant's OWN catalogue: `code`, `name` and a lifecycle
+//     (`ACTIVE` / `INACTIVE`, the same `HrRecordStatus` the organisation tree and
+//     the position catalogue use).
+//   * `LeaveRequest` names one employee, one type of the SAME tenant, an inclusive
+//     `start_date`..`end_date` range and the requester's stated `reason`.
+//
+// WHY THE TYPE CATALOGUE IS EMPTY, AND WHY THAT IS THE DESIGN RATHER THAN A GAP
+// ----------------------------------------------------------------------------
+// No leave type is seeded, and no cultural or legal leave name — annual, sick,
+// unpaid — appears in this schema, in its migration or in the module. Which leave
+// kinds an organization grants, and what each one ENTITLES a person to, is that
+// organization's own policy: a taxonomy invented here would be worn as a default by
+// every tenant that did not replace it, and a default that affects somebody's pay is
+// not a convenience. So the tenant names its own types through the module's catalogue
+// endpoints, and the database refuses a request that names no type of its tenant.
+
+// ===========================================================================
+// MISSION — independent HR request and configured-approval domain (Phase 55)
+// ===========================================================================
+//
+// A Mission is an employee's stated assignment request. It is not Leave,
+// Attendance, or generic task management: it owns its option catalogue, approval
+// configuration and runtime, and post-submission report. PROJECT / NON_PROJECT
+// is classification only; no Project model, foreign key, membership, or data is
+// part of this domain.
+//
+// Duration, location, and engagement are independent configured dimensions.
+// Approval authority is configured only, never inferred from reporting lines.
+// Correction supersedes an instance; resubmission creates a new instance and
+// preserves all prior decisions as immutable history.
+
+enum MissionDurationMode {
+  HOURLY
+  DAILY
+}
+
+enum MissionLocationType {
+  IN_CITY
+  OUT_OF_CITY
+}
+
+enum MissionEngagementType {
+  PROJECT
+  NON_PROJECT
+}
+
+enum MissionRequestStatus {
+  DRAFT
+  SUBMITTED
+  IN_APPROVAL
+  CORRECTION_REQUIRED
+  APPROVED
+  REJECTED
+  CANCELLED
+}
+
+enum MissionRoutingMode {
+  SEQUENTIAL
+  PARALLEL
+}
+
+enum MissionParallelCompletionMode {
+  ALL_REQUIRED
+}
+
+enum MissionApprovalInstanceStatus {
+  ACTIVE
+  COMPLETED
+  SUPERSEDED
+  CORRECTION_REQUIRED
+  REJECTED
+}
+
+enum MissionApprovalStepStatus {
+  PENDING
+  ACTIVE
+  APPROVED
+  REJECTED
+  CORRECTION_REQUIRED
+  SKIPPED
+  CANCELLED
+}
+
+enum MissionApprovalResolutionReason {
+  PRIMARY
+  SUBSTITUTE
+  NO_RESOLUTION
+}
+
+enum MissionApprovalStepDecision {
+  APPROVED
+  REJECTED
+  CORRECTION_REQUIRED
+}
+
+enum MissionSelfApprovalMode {
+  NOT_ALLOWED
+  ALLOWED
+}
+
+enum MissionApprovalDefinitionStatus {
+  DRAFT
+  ACTIVE
+  INACTIVE
+}
+
+enum MissionPolicyVersionStatus {
+  DRAFT
+  VALIDATED
+  PUBLISHED
+  ARCHIVED
+}
+
+model MissionOptionGroup {
+  id        String   @id @default(uuid()) @db.Uuid
+  tenantId  String   @map("tenant_id") @db.Text
+  code      String   @db.VarChar(64)
+  label     String   @db.VarChar(200)
+  required  Boolean  @default(true)
+  active    Boolean  @default(true)
+  sortOrder Int      @default(0) @map("sort_order")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  options    MissionOption[]                 @relation("MissionOptionGroupOption")
+  selections MissionRequestOptionSelection[] @relation("MissionOptionGroupSelection")
+
+  @@unique([tenantId, id], map: "MissionOptionGroup_tenantId_id_key")
+  @@unique([tenantId, code], map: "MissionOptionGroup_tenantId_code_key")
+  @@index([tenantId, active, sortOrder], map: "MissionOptionGroup_tenantId_active_sortOrder_idx")
+  @@map("MissionOptionGroup")
+}
+
+model MissionOption {
+  id            String   @id @default(uuid()) @db.Uuid
+  tenantId      String   @map("tenant_id") @db.Text
+  optionGroupId String   @map("option_group_id") @db.Uuid
+  code          String   @db.VarChar(64)
+  label         String   @db.VarChar(200)
+  active        Boolean  @default(true)
+  sortOrder     Int      @default(0) @map("sort_order")
+  createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt     DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  group      MissionOptionGroup              @relation("MissionOptionGroupOption", fields: [tenantId, optionGroupId], references: [tenantId, id], onDelete: Restrict, onUpdate: Cascade)
+  selections MissionRequestOptionSelection[] @relation("MissionOptionSelection")
+
+  @@unique([tenantId, id], map: "MissionOption_tenantId_id_key")
+  @@unique([tenantId, optionGroupId, code], map: "MissionOption_tenantId_groupId_code_key")
+  @@index([tenantId, optionGroupId, active, sortOrder], map: "MissionOption_tenantId_groupId_active_sortOrder_idx")
+  @@map("MissionOption")
+}
+
+model MissionRequest {
+  id                String                @id @default(uuid()) @db.Uuid
+  tenantId          String                @map("tenant_id") @db.Text
+  employeeId        String                @map("employee_id") @db.Uuid
+  status            MissionRequestStatus  @default(DRAFT)
+  durationMode      MissionDurationMode   @map("duration_mode")
+  locationType      MissionLocationType   @map("location_type")
+  engagementType    MissionEngagementType @map("engagement_type")
+  startDate         DateTime              @map("start_date") @db.Date
+  endDate           DateTime              @map("end_date") @db.Date
+  startTime         String?               @map("start_time") @db.VarChar(8)
+  endTime           String?               @map("end_time") @db.VarChar(8)
+  destination       String?               @db.VarChar(300)
+  description       String?               @db.VarChar(2000)
+  revision          Int                   @default(1)
+  submittedRevision Int?                  @map("submitted_revision")
+  correctionReason  String?               @map("correction_reason") @db.VarChar(500)
+  rejectionReason   String?               @map("rejection_reason") @db.VarChar(500)
+  approvedAt        DateTime?             @map("approved_at") @db.Timestamptz(6)
+  rejectedAt        DateTime?             @map("rejected_at") @db.Timestamptz(6)
+  cancelledAt       DateTime?             @map("cancelled_at") @db.Timestamptz(6)
+  createdAt         DateTime              @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt         DateTime              @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  employee          Employee                        @relation("MissionRequestEmployee", fields: [tenantId, employeeId], references: [tenantId, id], onDelete: Restrict, onUpdate: Cascade)
+  optionSelections  MissionRequestOptionSelection[] @relation("MissionRequestOptionSelection")
+  approvalInstances MissionApprovalInstance[]       @relation("MissionApprovalInstanceRequest")
+  reports           MissionReport[]                 @relation("MissionReportRequest")
+
+  @@unique([tenantId, id], map: "MissionRequest_tenantId_id_key")
+  @@index([tenantId, employeeId, status], map: "MissionRequest_tenantId_employeeId_status_idx")
+  @@index([tenantId, status, updatedAt], map: "MissionRequest_tenantId_status_updatedAt_idx")
+  @@map("MissionRequest")
+}
+
+model MissionRequestOptionSelection {
+  id               String   @id @default(uuid()) @db.Uuid
+  tenantId         String   @map("tenant_id") @db.Text
+  missionRequestId String   @map("mission_request_id") @db.Uuid
+  optionGroupId    String   @map("option_group_id") @db.Uuid
+  missionOptionId  String   @map("mission_option_id") @db.Uuid
+  createdAt        DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  missionRequest MissionRequest     @relation("MissionRequestOptionSelection", fields: [tenantId, missionRequestId], references: [tenantId, id], onDelete: Restrict, onUpdate: Cascade)
+  optionGroup    MissionOptionGroup @relation("MissionOptionGroupSelection", fields: [tenantId, optionGroupId], references: [tenantId, id], onDelete: Restrict, onUpdate: Cascade)
+  option         MissionOption      @relation("MissionOptionSelection", fields: [tenantId, missionOptionId], references: [tenantId, id], onDelete: Restrict, onUpdate: Cascade)
+
+  @@unique([tenantId, id], map: "MissionRequestOptionSelection_tenantId_id_key")
+  @@unique([tenantId, missionRequestId, optionGroupId], map: "MissionRequestOptionSelection_tenantId_requestId_groupId_key")
+  @@index([tenantId, missionRequestId], map: "MissionRequestOptionSelection_tenantId_requestId_idx")
+  @@map("MissionRequestOptionSelection")
+}
+
+model MissionApprovalDefinition {
+  id                     String                          @id @default(uuid()) @db.Uuid
+  tenantId               String                          @map("tenant_id") @db.Text
+  name                   String                          @db.VarChar(200)
+  routingMode            MissionRoutingMode              @default(SEQUENTIAL) @map("routing_mode")
+  parallelCompletionMode MissionParallelCompletionMode   @default(ALL_REQUIRED) @map("parallel_completion_mode")
+  selfApprovalMode       MissionSelfApprovalMode         @default(NOT_ALLOWED) @map("self_approval_mode")
+  status                 MissionApprovalDefinitionStatus @default(ACTIVE)
+  ruleSetId              String                          @default("hr.mission.approval") @map("rule_set_id") @db.VarChar(128)
+  createdAt              DateTime                        @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt              DateTime                        @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  steps     MissionApprovalDefinitionStep[] @relation("MissionApprovalDefinitionStep")
+  instances MissionApprovalInstance[]       @relation("MissionApprovalInstanceDefinition")
+
+  @@unique([tenantId, id], map: "MissionApprovalDefinition_tenantId_id_key")
+  @@unique([tenantId, name], map: "MissionApprovalDefinition_tenantId_name_key")
+  @@index([tenantId, status], map: "MissionApprovalDefinition_tenantId_status_idx")
+  @@map("MissionApprovalDefinition")
+}
+
+model MissionApprovalDefinitionStep {
+  id                   String   @id @default(uuid()) @db.Uuid
+  tenantId             String   @map("tenant_id") @db.Text
+  approvalDefinitionId String   @map("approval_definition_id") @db.Uuid
+  order                Int
+  name                 String   @db.VarChar(200)
+  approverEmployeeId   String?  @map("approver_employee_id") @db.Uuid
+  approverRole         String?  @map("approver_role") @db.VarChar(128)
+  required             Boolean  @default(true)
+  createdAt            DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt            DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  definition    MissionApprovalDefinition     @relation("MissionApprovalDefinitionStep", fields: [tenantId, approvalDefinitionId], references: [tenantId, id], onDelete: Restrict, onUpdate: Cascade)
+  approver      Employee?                     @relation("MissionApprovalDefinitionStepApprover", fields: [tenantId, approverEmployeeId], references: [tenantId, id], onDelete: Restrict, onUpdate: Cascade)
+  stepInstances MissionApprovalStepInstance[] @relation("MissionApprovalStepInstanceDefinition")
+
+  @@unique([tenantId, id], map: "MissionApprovalDefinitionStep_tenantId_id_key")
+  @@unique([tenantId, approvalDefinitionId, order], map: "MissionApprovalDefinitionStep_tenantId_definitionId_order_key")
+  @@index([tenantId, approverEmployeeId], map: "MissionApprovalDefinitionStep_tenantId_approverEmployeeId_idx")
+  @@map("MissionApprovalDefinitionStep")
+}
+
+model MissionApprovalInstance {
+  id                     String                        @id @default(uuid()) @db.Uuid
+  tenantId               String                        @map("tenant_id") @db.Text
+  missionRequestId       String                        @map("mission_request_id") @db.Uuid
+  approvalDefinitionId   String                        @map("approval_definition_id") @db.Uuid
+  submissionRevision     Int                           @map("submission_revision")
+  sequenceNumber         Int                           @default(1) @map("sequence_number")
+  status                 MissionApprovalInstanceStatus @default(ACTIVE)
+  routingMode            MissionRoutingMode            @map("routing_mode")
+  parallelCompletionMode MissionParallelCompletionMode @map("parallel_completion_mode")
+  selfApprovalMode       MissionSelfApprovalMode       @map("self_approval_mode")
+  ruleSetId              String                        @default("hr.mission.approval") @map("rule_set_id") @db.VarChar(128)
+  ruleVersionId          String?                       @map("rule_version_id") @db.Uuid
+  supersededAt           DateTime?                     @map("superseded_at") @db.Timestamptz(6)
+  completedAt            DateTime?                     @map("completed_at") @db.Timestamptz(6)
+  createdAt              DateTime                      @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt              DateTime                      @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  missionRequest MissionRequest                @relation("MissionApprovalInstanceRequest", fields: [tenantId, missionRequestId], references: [tenantId, id], onDelete: Restrict, onUpdate: Cascade)
+  definition     MissionApprovalDefinition     @relation("MissionApprovalInstanceDefinition", fields: [tenantId, approvalDefinitionId], references: [tenantId, id], onDelete: Restrict, onUpdate: Cascade)
+  steps          MissionApprovalStepInstance[] @relation("MissionApprovalStepInstance")
+
+  @@unique([tenantId, id], map: "MissionApprovalInstance_tenantId_id_key")
+  @@unique([tenantId, missionRequestId, submissionRevision], map: "MissionApprovalInstance_tenantId_requestId_revision_key")
+  @@index([tenantId, missionRequestId, status], map: "MissionApprovalInstance_tenantId_requestId_status_idx")
+  @@map("MissionApprovalInstance")
+}
+
+model MissionApprovalStepInstance {
+  id                         String                          @id @default(uuid()) @db.Uuid
+  tenantId                   String                          @map("tenant_id") @db.Text
+  approvalInstanceId         String                          @map("approval_instance_id") @db.Uuid
+  approvalStepDefinitionId   String                          @map("approval_step_definition_id") @db.Uuid
+  order                      Int
+  status                     MissionApprovalStepStatus       @default(PENDING)
+  resolvedApproverEmployeeId String?                         @map("resolved_approver_employee_id") @db.Uuid
+  resolutionReason           MissionApprovalResolutionReason @default(NO_RESOLUTION) @map("resolution_reason")
+  resolutionSignal           String?                         @map("resolution_signal") @db.VarChar(64)
+  decision                   MissionApprovalStepDecision?
+  decidedByEmployeeId        String?                         @map("decided_by_employee_id") @db.Uuid
+  decisionReason             String?                         @map("decision_reason") @db.VarChar(500)
+  decidedAt                  DateTime?                       @map("decided_at") @db.Timestamptz(6)
+  createdAt                  DateTime                        @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt                  DateTime                        @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  instance         MissionApprovalInstance       @relation("MissionApprovalStepInstance", fields: [tenantId, approvalInstanceId], references: [tenantId, id], onDelete: Restrict, onUpdate: Cascade)
+  stepDefinition   MissionApprovalDefinitionStep @relation("MissionApprovalStepInstanceDefinition", fields: [tenantId, approvalStepDefinitionId], references: [tenantId, id], onDelete: Restrict, onUpdate: Cascade)
+  resolvedApprover Employee?                     @relation("MissionApprovalStepInstanceApprover", fields: [tenantId, resolvedApproverEmployeeId], references: [tenantId, id], onDelete: Restrict, onUpdate: Cascade)
+  decidedBy        Employee?                     @relation("MissionApprovalStepInstanceDecider", fields: [tenantId, decidedByEmployeeId], references: [tenantId, id], onDelete: Restrict, onUpdate: Cascade)
+
+  @@unique([tenantId, id], map: "MissionApprovalStepInstance_tenantId_id_key")
+  @@unique([tenantId, approvalInstanceId, order], map: "MissionApprovalStepInstance_tenantId_instanceId_order_key")
+  @@index([tenantId, resolvedApproverEmployeeId, status], map: "MissionApprovalStepInstance_tenantId_approver_status_idx")
+  @@map("MissionApprovalStepInstance")
+}
+
+model MissionReport {
+  id               String   @id @default(uuid()) @db.Uuid
+  tenantId         String   @map("tenant_id") @db.Text
+  missionRequestId String   @map("mission_request_id") @db.Uuid
+  employeeId       String   @map("employee_id") @db.Uuid
+  content          String   @db.VarChar(4000)
+  submittedAt      DateTime @default(now()) @map("submitted_at") @db.Timestamptz(6)
+  createdAt        DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt        DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  missionRequest MissionRequest @relation("MissionReportRequest", fields: [tenantId, missionRequestId], references: [tenantId, id], onDelete: Restrict, onUpdate: Cascade)
+  submitter      Employee       @relation("MissionReportSubmitter", fields: [tenantId, employeeId], references: [tenantId, id], onDelete: Restrict, onUpdate: Cascade)
+
+  @@unique([tenantId, id], map: "MissionReport_tenantId_id_key")
+  @@unique([tenantId, missionRequestId], map: "MissionReport_tenantId_requestId_key")
+  @@index([tenantId, employeeId], map: "MissionReport_tenantId_employeeId_idx")
+  @@map("MissionReport")
+}
+
+model MissionPolicyVersion {
+  id            String                     @id @default(uuid()) @db.Uuid
+  tenantId      String                     @map("tenant_id") @db.Text
+  version       Int
+  status        MissionPolicyVersionStatus @default(DRAFT)
+  ruleSetId     String                     @default("hr.mission.approval") @map("rule_set_id") @db.VarChar(128)
+  configuration Json
+  publishedAt   DateTime?                  @map("published_at") @db.Timestamptz(6)
+  createdAt     DateTime                   @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt     DateTime                   @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@unique([tenantId, id], map: "MissionPolicyVersion_tenantId_id_key")
+  @@unique([tenantId, version], map: "MissionPolicyVersion_tenantId_version_key")
+  @@index([tenantId, ruleSetId, status], map: "MissionPolicyVersion_tenantId_ruleSetId_status_idx")
+  @@map("MissionPolicyVersion")
+}
+
+// ============================================================================
+// AUDIT OUTBOX — Phase B2.5: transactional durable audit delivery
+// ============================================================================
+//
+// THE PATTERN IS CONTEXT-LOCAL. Each bounded context that needs durable audit
+// adds its own `AuditOutbox` to its own schema — Financial was the first
+// (Phase B2), Commerce the second (Phase B2.3), Production the third
+// (Phase B2.4), HR is the fourth (Phase B2.5). The outbox is NOT a second
+// audit trail: it is a delivery buffer that ensures compliance-critical
+// events reach `core_db."AuditLog"` even when the relay or network fails
+// after commit.
+//
+// LIFECYCLE:
+//   1. Service builds an immutable outbox payload (via gateway.buildOutboxPayload)
+//   2. Repository writes business mutation + AuditOutbox.create in ONE transaction
+//   3. Relay polls due rows, delivers through AUDIT_PORT, deletes on success
+//   4. Failed deliveries are rescheduled with bounded backoff
+//
+// A rolled-back business mutation rolls back its outbox row — no orphan event.
+// A committed business mutation's event survives relay failure and is retried.
+
+/// The transactional outbox for HR audit events that require durable delivery.
+/// Written atomically with the business mutation inside the same HR database
+/// transaction.
+model AuditOutbox {
+  id        String   @id @default(uuid()) @db.Uuid
+  tenantId  String   @map("tenant_id") @db.Text
+
+  /// The producer-owned event identity, matching `AuditEventInput.auditId`.
+  auditId   String   @map("audit_id") @db.VarChar(64)
+
+  /// The full event payload, serialised as JSON.
+  payload   Json
+
+  /// Relay attempts so far. Incremented on each failed attempt.
+  attempts  Int      @default(0)
+
+  /// When the next relay attempt is allowed. Defaults to now (immediate).
+  nextAt    DateTime @default(now()) @map("next_at") @db.Timestamptz(6)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@unique([tenantId, auditId], map: "HrAuditOutbox_tenant_auditId_key")
+  @@index([tenantId, nextAt], map: "HrAuditOutbox_tenant_nextAt_idx")
+  @@index([tenantId, createdAt], map: "HrAuditOutbox_tenant_createdAt_idx")
+  @@map("AuditOutbox")
+}

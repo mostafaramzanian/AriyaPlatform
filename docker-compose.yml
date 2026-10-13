@@ -1,0 +1,510 @@
+version: '3.8'
+
+services:
+  postgres:
+    # Phase 49J-A: pgvector-capable PostgreSQL 16.
+    #
+    # postgres:16.3-alpine has no `vector` extension available, so CREATE EXTENSION
+    # vector fails and semantic search cannot be built on it. pgvector/pgvector:pg16
+    # is the same major version (16) with the extension control file shipped
+    # (vector 0.8.6), so no Prisma migration and no schema change is implied here.
+    #
+    # The image is Debian/glibc, while the old one was Alpine/musl. A PGDATA
+    # directory initialised under musl must NOT be mounted by a glibc build — the
+    # collation provider differs, which silently corrupts index ordering. The data
+    # was therefore migrated by dump/restore into a NEW volume rather than by
+    # remounting the old one:
+    #   pg_dump --clean --if-exists  ->  backups/core_db_pre_49j.sql (+ cms_db, aria_erp)
+    #   restore into postgres_data_pgv on pgvector/pgvector:pg16
+    # Verified before cutover: identical row counts on all 30 core_db base tables,
+    # identical index/constraint/column definitions, identical _prisma_migrations
+    # (12 rows, same checksums), and an unchanged 72-route API surface.
+    #
+    # postgres_data (the musl PGDATA) is deliberately left in place and untouched as
+    # the rollback anchor: restoring service means reverting these two lines. Do not
+    # delete that volume.
+    image: pgvector/pgvector:pg16
+    container_name: aria-erp-postgres
+    environment:
+      POSTGRES_USER: aria_user
+      POSTGRES_PASSWORD: aria_password
+      POSTGRES_DB: aria_erp
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data_pgv:/var/lib/postgresql/data
+      # GAP-ENV-1: creates the SEVEN owned databases on FIRST init of a fresh volume
+      # (official initdb mechanism) — core, cms, correspondence, hr, commerce,
+      # production, observability. That mounted file is the ONE authoritative
+      # bootstrap; nothing else in this repository creates databases. Existing
+      # volumes are untouched — create any missing database manually with the same
+      # file (see its header comment), which is how production_db was added to
+      # already-initialised clusters.
+      - ./infrastructure/postgres/initdb:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aria_user"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - aria-network
+
+  redis:
+    image: redis:7.4
+    container_name: aria-erp-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - aria-network
+
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    container_name: aria-erp-rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: aria
+      RABBITMQ_DEFAULT_PASS: aria_password
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - aria-network
+
+  minio:
+    image: minio/minio:RELEASE.2025-07-23T15-54-02Z
+    container_name: aria-erp-minio
+    environment:
+      # Credentials come from Docker secrets, never from literals in this file:
+      # the default `minioadmin` pair must never be the effective credential.
+      # The stack refuses to start without ./secrets/MINIO_ROOT_USER and
+      # ./secrets/MINIO_ROOT_PASSWORD present (fail-closed by design).
+      MINIO_ROOT_USER_FILE: /run/secrets/MINIO_ROOT_USER
+      MINIO_ROOT_PASSWORD_FILE: /run/secrets/MINIO_ROOT_PASSWORD
+    secrets:
+      - MINIO_ROOT_USER
+      - MINIO_ROOT_PASSWORD
+    command: server /data
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - aria-network
+
+  mailpit:
+    image: axllent/mailpit:v1.27
+    container_name: aria-erp-mailpit
+    ports:
+      - "8025:8025"
+      - "1025:1025"
+    volumes:
+      - mailpit_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8025/api/v1/info >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - aria-network
+
+  api:
+    build:
+      context: ./
+      dockerfile: ./infrastructure/docker/Dockerfile.backend
+    container_name: aria-erp-api
+    environment:
+      NODE_ENV: development
+      PORT: 3001
+      # Migrations are a dedicated pre-deployment step; container startup never mutates schemas.
+      # Run the owner-specific root `db:migrate:*` commands documented in ADR-0005.
+      CORE_DATABASE_URL: postgresql://aria_user:aria_password@postgres:5432/core_db
+      CMS_DATABASE_URL: postgresql://aria_user:aria_password@postgres:5432/cms_db
+      # Phase 50-MOD-CORR: the Correspondence module's own database.
+      #
+      # SAME postgres service, FOURTH database — registered here rather than by adding a
+      # second Postgres container, exactly as core_db/cms_db/observability_db were. The
+      # container is created once by the operator against this cluster (`CREATE DATABASE
+      # correspondence_db OWNER aria_user`) and its schema is applied by
+      # `npm run prisma:migrate:correspondence`, which keeps it on the same
+      # migration-driven footing as the other three.
+      #
+      # NOT CORE_DATABASE_URL, and this one matters more than the others: Correspondence
+      # used to be a Core-owned domain whose ten foreign keys cascaded from Core's
+      # "User" table, so reusing core_db here would silently keep the old coupling and
+      # make a User deletion destroy historical letters again.
+      CORRESPONDENCE_DATABASE_URL: postgresql://aria_user:aria_password@postgres:5432/correspondence_db
+      # Phase 51-HR-1: the Human Resources module's own database (منبع انسانی).
+      #
+      # SAME postgres service, FIFTH database — registered here rather than by adding a
+      # second Postgres container, exactly as core_db/cms_db/observability_db/
+      # correspondence_db were. The container is created once by the operator against this
+      # cluster (`CREATE DATABASE hr_db OWNER aria_user`) and its schema is applied by
+      # `npm run prisma:migrate:hr`, which keeps it on the same migration-driven footing
+      # as the other four.
+      #
+      # NOT CORE_DATABASE_URL. HR personnel records must outlive a Core login: an employee
+      # may never have an account, and a departed account must not take its employment
+      # history with it. Sharing core_db would also make the module's "no Core Prisma
+      # client" boundary check meaningless.
+      #
+      # Combined runtime only: core and cms mark HR `not-used` and their images carry no
+      # HR client, so neither needs this variable.
+      HR_DATABASE_URL: postgresql://aria_user:aria_password@postgres:5432/hr_db
+      # Phase C1: the Commerce / Procurement module's own database.
+      #
+      # SAME postgres service, SIXTH database — registered here rather than by adding a
+      # second Postgres container, exactly as core_db/cms_db/observability_db/
+      # correspondence_db/hr_db were. The container is created once by the operator
+      # against this cluster (`CREATE DATABASE commerce_db OWNER aria_user`) and its
+      # schema is applied by `npm run prisma:migrate:commerce`, which keeps it on the
+      # same migration-driven footing as the other five.
+      #
+      # NOT CORE_DATABASE_URL. Purchase documents, workflow history and the payment/
+      # receiving/return ledgers must not share Core's disk, WAL or connection pool with
+      # identity and RBAC — and the module's "no Core Prisma client" boundary check
+      # would be meaningless if it read Core's tables anyway.
+      #
+      # Combined runtime only: core, cms and future-hr mark Commerce `not-used`, so no
+      # other image needs this variable.
+      COMMERCE_DATABASE_URL: postgresql://aria_user:aria_password@postgres:5432/commerce_db
+      # Phase PRODUCTION-BOM-HEADER: the Production / BOM module's own database.
+      #
+      # SAME postgres service, SEVENTH database — registered here rather than by adding a
+      # second Postgres container, exactly as core_db/cms_db/observability_db/
+      # correspondence_db/hr_db/commerce_db were. It is created automatically by the
+      # mounted initdb script on first init of a fresh volume
+      # (`infrastructure/postgres/initdb/01-create-databases.sql`), and its schema is
+      # applied by `npm run prisma:migrate:production`, which keeps it on the same
+      # migration-driven footing as the other six.
+      #
+      # NOT CORE_DATABASE_URL. BOM headers, their lifecycle and their approver snapshots
+      # have a lifetime independent of Core identity and of HR employment, and the module's
+      # "no Core Prisma client" boundary check would be meaningless if it read Core's
+      # tables anyway.
+      #
+      # REQUIRED, not optional: `combined` composes ProductionModule and its health graph
+      # imports ProductionPrismaModule, so omitting this variable makes the
+      # `productionDatabase` probe fail closed and blocks readiness.
+      #
+      # Combined runtime only: core, cms and future-hr mark Production `not-used`, so no
+      # other image needs this variable.
+      PRODUCTION_DATABASE_URL: postgresql://aria_user:aria_password@postgres:5432/production_db
+      # Phase F1 — FINANCIAL FOUNDATION: the Financial module's own database.
+      #
+      # SAME postgres service, EIGHTH database — registered here rather than by adding a
+      # container, exactly like Production's: the database is created once by the operator
+      # against this cluster (infrastructure/postgres/initdb/01-create-databases.sql) and
+      # its schema is applied by the owner-specific step `npm run prisma:migrate:financial`.
+      #
+      # FINANCE_DATABASE_URL MUST NOT POINT AT core_db, commerce_db, hr_db or
+      # production_db: check requests carry a lifecycle independent of identity, of
+      # procurement and of BOM, and a shared database would make the module's isolation
+      # claims untestable. If this variable is missing in the combined runtime, the
+      # `financeDatabase` probe fails closed and blocks readiness.
+      #
+      # Combined runtime only: core, cms and future-hr mark Financial `not-used`, so no
+      # other image needs this variable.
+      FINANCE_DATABASE_URL: postgresql://aria_user:aria_password@postgres:5432/finance_db
+      # Phase 49M-2: the observability platform's own database.
+      #
+      # SAME postgres service, THIRD database — registered here rather than by adding a
+      # second Postgres container, exactly as core_db/cms_db were. The container is
+      # created once by the operator against this cluster (`CREATE DATABASE
+      # observability_db OWNER aria_user`) and its schema is applied by
+      # `npm run prisma:migrate:observability`, which keeps it on the same
+      # migration-driven footing as the other two.
+      #
+      # NOT CORE_DATABASE_URL. Reusing core_db here would put an unbounded,
+      # retention-managed log workload on the same disk, WAL and connection pool as
+      # identity, RBAC and every business transaction — the exact thing the split exists
+      # to prevent.
+      # Phase GAP-ENV-1: the URL is kept so the /ready probe can still report the
+      # observability datasource's state (optionalDegraded), but persistence is
+      # DISABLED here by default: the combined image prunes the observability
+      # client and ships no prisma/observability schema, so OBSERVABILITY_ENABLED=true
+      # in this image can never persist anything — it only degraded to a no-op.
+      # Enabling persistence is a deliberate contract: deploy an image that ships
+      # the observability schema + client AND create observability_db first.
+      OBSERVABILITY_DATABASE_URL: postgresql://aria_user:aria_password@postgres:5432/observability_db
+      OBSERVABILITY_ENABLED: "false"
+      LOG_RETENTION_DAYS: "30"
+      AUDIT_RETENTION_DAYS: "730"
+      SECURITY_EVENT_RETENTION_DAYS: "365"
+      LIFECYCLE_RETENTION_DAYS: "90"
+      REDIS_URL: redis://redis:6379
+      RABBITMQ_URL: amqp://aria:aria_password@rabbitmq:5672
+      MINIO_ENDPOINT: minio:9000
+      # MINIO_ACCESS_KEY / MINIO_SECRET_KEY are NOT literals here: the command
+      # loader exports them from /run/secrets/MINIO_ROOT_{USER,PASSWORD}, so the
+      # API always uses the same credential the MinIO server was started with
+      # and a default credential can never become effective.
+      # The provider dials MINIO_HOST/MINIO_PORT, not MINIO_ENDPOINT (which only the health
+      # check reads). Stated explicitly so the two do not drift: the code default happens
+      # to be `minio`, which silently matched, and that is not something to rely on.
+      MINIO_HOST: minio
+      MINIO_PORT: 9000
+      # Pins the SigV4 credential scope. Without it the SDK issues a GetBucketLocation to
+      # the signing endpoint — which is MINIO_PUBLIC_URL, i.e. the browser origin the API
+      # container cannot reach — and presigning fails with ECONNREFUSED.
+      MINIO_REGION: us-east-1
+      # Phase 49G-5: previously supplied by the .env.e2e file baked into the image.
+      # Now passed at runtime, because that file is no longer shipped. aria-erp is the
+      # canonical bucket audited in 49G-4 — the aria-media default in minio.provider.ts
+      # is a dev fallback and must not become the container's effective bucket.
+      MINIO_BUCKET: aria-erp
+      # Origin the BROWSER uses to reach MinIO. SigV4 signs the Host header, so this has
+      # to be correct at signing time; it cannot be rewritten afterwards. Local dev
+      # publishes 9000 on the host, so localhost is what a browser can actually resolve —
+      # minio:9000 is reachable only inside the compose network.
+      MINIO_PUBLIC_URL: http://localhost:9000
+      # Mail contract = the names EmailService actually reads (GAP-ENV-1).
+      # SMTP_HOST + SMTP_PORT enable the transport; SMTP_USER/SMTP_PASS are only
+      # needed for authenticated relays — Mailpit accepts anonymous submission.
+      # EMAIL_FROM is the sender. The old MAIL_* names configured nothing.
+      SMTP_HOST: mailpit
+      SMTP_PORT: 1025
+      EMAIL_FROM: no-reply@ariaerp.local
+      CORS_ORIGIN: http://localhost:3000,http://localhost:3003
+      # Stage 2.20: the HS256 shared-secret bridge is OFF by default in this deployment. The
+      # schema default is `true`, so omitting it would keep the bridge open. With the key set
+      # mounted (see secrets below) the verifier refuses HS256 regardless; this flag is what
+      # refuses HS256 in any configuration that has no key set.
+      JWT_LEGACY_HS256_ENABLED: "false"
+      # The shared secret is NOT a literal here. It is mounted from the secret file below and
+      # loaded by the `command:` loader, so no placeholder value is a live secret.
+
+      # Gate A: JWT signing key material is provided through Docker Compose secrets mounted at
+      # /run/secrets/ (JWT_SIGNING_KEYS, JWT_ACTIVE_KEY_ID). It is never interpolated from root .env
+      # or any other environment source. See top-level `secrets:` and the `command:` loader below.
+      # Phase 49J-B: embeddings.
+      #
+      # The key is INTERPOLATED, never written here. Compose resolves ${OPENAI_API_KEY}
+      # from the host environment or the root .env (which .gitignore already covers), so a
+      # real key never reaches a tracked file. `:-` makes it default to empty rather than
+      # abort the whole `up` when unset — OpenAIProvider warns at boot and only fails on an
+      # actual embedding call, so every other service still starts on a machine with no key.
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      # Phase GAP-ENV-1: production-required by env.validation.ts; interpolated from
+      # the host/root .env so a real key never lands in this tracked file. Empty is
+      # tolerated while NODE_ENV=development (local compose only).
+      AI_CONFIG_ENCRYPTION_KEY: ${AI_CONFIG_ENCRYPTION_KEY:-}
+      # Stated even though both match the code defaults, because these two ARE the vector
+      # space. Anything that stores a vector has to agree with them, so they belong
+      # somewhere greppable rather than living only as a fallback in the provider.
+      EMBEDDING_MODEL: text-embedding-3-small
+      EMBEDDING_DIMENSION: 1536
+      # Phase 49L: SSRF policy for the automation integration.
+      #
+      # No N8N_BASE_URL or N8N_WEBHOOK_SECRET is declared here on purpose — those are Core
+      # Settings in "IntegrationConfig", managed through /admin/integrations, with the
+      # secret encrypted under AI_CONFIG_ENCRYPTION_KEY. Duplicating a credential in env
+      # and in the database is what §15 forbids.
+      #
+      # `true` HERE and only here: inside this compose network the realistic n8n target is
+      # a private address (http://n8n:5678, or http://host.docker.internal:5678 for an n8n
+      # on the host), so a blanket private-address ban would make local automation
+      # impossible. A deployment reachable from the internet must NOT set this: the API
+      # container can reach redis:6379, rabbitmq:5672, minio:9000 and postgres:5432
+      # without authentication, and this flag is the only thing standing between an
+      # administrator-configurable URL and those services. Metadata endpoints
+      # (169.254.169.254) stay blocked regardless.
+      INTEGRATION_ALLOW_PRIVATE_TARGETS: "true"
+    secrets:
+      - JWT_SIGNING_KEYS
+      - JWT_ACTIVE_KEY_ID
+      - JWT_SECRET
+      - JWT_REFRESH_SECRET
+      - MINIO_ROOT_USER
+      - MINIO_ROOT_PASSWORD
+    ports:
+      - "3001:3001"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      mailpit:
+        condition: service_healthy
+    networks:
+      - aria-network
+    restart: unless-stopped
+    # GAP-ENV-1: THE AUTHORITATIVE ENTRY POINT IS dist/main.js (the COMBINED runtime).
+    #
+    # main.ts boots AppModule, the only composition root that registers CommerceModule,
+    # HrModule and CorrespondenceModule. dist/core-main.js boots CoreAppModule and CANNOT
+    # serve any Commerce/HR/Correspondence route — pinning it here would silently drop
+    # every /api/v1/commerce/* endpoint on the next recreate. The Core-only runtime has
+    # its own dedicated image (infrastructure/docker/Dockerfile.core); this service is
+    # the combined deployment and matches runtime-policy.json's `combined` runtime.
+    #
+    # The command is declared explicitly (rather than relying on the image CMD) so a
+    # reader can see, in the deployment manifest itself, which process :3001 serves.
+    # Gate A: load the signing-key Docker secrets from /run/secrets/ into environment variables
+    # before starting the API. `read -r` is used so JSON/PEM contents are not interpreted
+    # by the shell.
+    healthcheck:
+      # /api/v1/ready is the readiness contract (ADR-0005): 200 only when every
+      # REQUIRED datasource answers. wget ships in the node:20-alpine image.
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3001/api/v1/ready >/dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+    command:
+      - /bin/sh
+      - -c
+      - |
+        export JWT_ACTIVE_KEY_ID="$$(cat /run/secrets/JWT_ACTIVE_KEY_ID)" &&
+        export JWT_SIGNING_KEYS="$$(cat /run/secrets/JWT_SIGNING_KEYS)" &&
+        export JWT_SECRET="$$(cat /run/secrets/JWT_SECRET)" &&
+        export JWT_REFRESH_SECRET="$$(cat /run/secrets/JWT_REFRESH_SECRET)" &&
+        export MINIO_ACCESS_KEY="$$(cat /run/secrets/MINIO_ROOT_USER)" &&
+        export MINIO_SECRET_KEY="$$(cat /run/secrets/MINIO_ROOT_PASSWORD)" &&
+        exec node dist/main.js
+
+  web:
+    build:
+      context: ./
+      dockerfile: ./infrastructure/docker/Dockerfile.frontend
+      args:
+        # GAP-ENV-1: NEXT_PUBLIC_* values are inlined into the browser bundle at
+        # BUILD time — setting them as container environment cannot change a built
+        # image. The authoritative input is this build ARG, matching the format
+        # apps/web/src/lib/constants.ts expects: origin + '/api' (the '/v1' suffix
+        # is appended by the code, not stored here).
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:3001/api}
+        NEXT_PUBLIC_APP_URL: ${NEXT_PUBLIC_APP_URL:-http://localhost:3000}
+    container_name: aria-erp-web
+    ports:
+      - "3000:3000"
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      # The deployed app is a stock `next start` server; a 2xx/3xx on / proves
+      # it serves. wget ships in the node:20-alpine image.
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000 >/dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - aria-network
+    restart: unless-stopped
+    command: npm run start
+
+  nginx:
+    image: nginx:1.29-alpine
+    container_name: aria-erp-nginx
+    ports:
+      # GAP-ENV-1: only port 80 is served. The old "443:443" mapping published a
+      # TLS port with NO TLS server behind it — TLS termination is deliberately
+      # external to this compose contract (see docs/DEPLOYMENT.md); nothing in
+      # infrastructure/nginx listens on 443, so publishing it only answered a port
+      # that could never complete a handshake.
+      - "80:80"
+    volumes:
+      # The authoritative proxy configuration is infrastructure/nginx/.
+      # ./nginx/ was a stock placeholder (welcome page) that proxied nothing.
+      - ./infrastructure/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./infrastructure/nginx/conf.d:/etc/nginx/conf.d:ro
+    healthcheck:
+      # infrastructure/nginx/conf.d/api.conf maps /health -> /api/v1/health.
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1/health >/dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    depends_on:
+      web:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    networks:
+      - aria-network
+    restart: unless-stopped
+
+  e2e-dbproxy:
+    # GAP-ENV-1: the host-side database access used by developer tooling and the e2e
+    # suite (every *_DATABASE_URL in apps/api/.env.e2e points at localhost:5544) is
+    # declared here instead of living as a hand-started container outside the repo.
+    # socat proxies the compose postgres service on the host port the e2e contract
+    # already documents. Start only when needed: docker compose up -d e2e-dbproxy.
+    image: alpine/socat:latest
+    container_name: aria-erp-e2e-dbproxy
+    command: TCP-LISTEN:5544,fork,reuseaddr TCP:postgres:5432
+    ports:
+      - "5544:5544"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - aria-network
+    restart: unless-stopped
+
+secrets:
+  # Gate A: private JWT signing material is mounted from /run/secrets/ inside the container.
+  # These files are generated outside git and must never be committed.
+  JWT_SIGNING_KEYS:
+    file: ./secrets/JWT_SIGNING_KEYS
+  JWT_ACTIVE_KEY_ID:
+    file: ./secrets/JWT_ACTIVE_KEY_ID
+  # Stage 2.20: the shared secrets are mounted the same way. Generate them outside git
+  # (secrets/ is gitignored) and never commit a value.
+  JWT_SECRET:
+    file: ./secrets/JWT_SECRET
+  JWT_REFRESH_SECRET:
+    file: ./secrets/JWT_REFRESH_SECRET
+  # MinIO root credential is mounted the same way: generate the files outside
+  # git (secrets/ is gitignored) and never commit a value.
+  MINIO_ROOT_USER:
+    file: ./secrets/MINIO_ROOT_USER
+  MINIO_ROOT_PASSWORD:
+    file: ./secrets/MINIO_ROOT_PASSWORD
+
+volumes:
+  # Phase 49J-A rollback anchor. This is the Alpine/musl PGDATA that served
+  # postgres:16.3-alpine until 49J-A. It is intentionally still declared and still
+  # populated: reverting the postgres service back to postgres:16.3-alpine +
+  # postgres_data is the rollback path. Do not prune it.
+  postgres_data:
+  # Phase 49J-A: glibc PGDATA for pgvector/pgvector:pg16, populated by restoring
+  # the pre-cutover dumps in backups/*_pre_49j.sql. Created fresh — never a
+  # remount of postgres_data, which was initdb'd under musl.
+  postgres_data_pgv:
+  redis_data:
+  rabbitmq_data:
+  minio_data:
+  mailpit_data:
+
+networks:
+  aria-network:
+    driver: bridge

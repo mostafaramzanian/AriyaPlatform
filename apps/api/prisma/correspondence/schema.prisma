@@ -1,0 +1,506 @@
+// Correspondence Prisma schema (Phase 50-MOD-CORR)
+// ============================================================================
+// Official Correspondence / مکاتبات اداری owns its OWN database, its own Prisma
+// client, its own migration history and its own data-access layer. It is
+// physically and logically independent from the Core Prisma project
+// (apps/api/prisma/core/schema.prisma) — Correspondence must never share Core's
+// Prisma client, a migration history, or a physical foreign key with Core.
+//
+// Precedent: prisma/cms/schema.prisma (Phase 33J) for CMS, and
+// prisma/observability/schema.prisma (Phase 49M-2) for the observability
+// platform. This is the same mechanism — a separate database on the same
+// Postgres cluster, reached through its own env var — applied to a business
+// domain that used to live inside Core.
+//
+// ---------------------------------------------------------------------------
+// DC-CORR-01 (Decision 1 + Decision 2 of Phase 50-MOD-CORR): NO CROSS-DATABASE
+// FOREIGN KEYS, AND NO CASCADE FROM IDENTITY TO BUSINESS DOCUMENTS.
+// ---------------------------------------------------------------------------
+// Before this phase, ten columns pointed at Core's "User" table through physical
+// FKs, seven of them ON DELETE CASCADE. That made a User deletion silently
+// destroy historical letters, recipients, referrals, attachments, signatures,
+// folders and archive entries. Those FKs cannot exist across a database
+// boundary, and — more importantly — that behaviour was wrong for a document
+// domain:
+//
+//   Correspondence is a BUSINESS RECORD DOMAIN. A letter that was sent remains
+//   the organization's record of what was sent, to whom and when, independent of
+//   whether the person who sent it still has an account.
+//
+// Therefore every identity column below (`senderId`, `userId`, `uploadedBy`,
+// `ownerId`, `actorId`, `fromUserId`, `toUserId`, `recipientUserId`, `tenantId`)
+// is a PLAIN STABLE IDENTIFIER: a String with no relation and no FK. Identity
+// values are validated at the boundary through platform contracts
+// (`UserDirectoryContract` for "is this a member of the caller's tenant?") and
+// resolved from RequestContextService — never trusted from a request body.
+//
+// BEHAVIOUR CHANGE, documented per column:
+//   * was: DELETE FROM "User" cascaded into Letter/LetterRecipient/
+//     LetterReferral/LetterAttachment/LetterSignature/LetterTempAttachment/
+//     ArchiveFolder/LetterArchive.
+//     now: those rows SURVIVE the user's deletion; the identifier stays as the
+//     historical actor.
+//   * was / stays: LetterTrackingEvent.actorId was already ON DELETE SET NULL and
+//     is nullable; it keeps its old meaning of "system event" when a user is
+//     gone (the row itself is never deleted by Core either way).
+//   * Anonymous/purge requirements are NOT solved by Core writing here. A later
+//     controlled concern (event/contract-driven anonymization job) may blank
+//     these columns deliberately; it is not part of this extraction.
+//
+// ---------------------------------------------------------------------------
+// INTERNAL REFERENTIAL INTEGRITY IS UNCHANGED. All eight relations inside this
+// database (Letter ↔ recipients/attachments/referrals/tracking/archives/
+// signature, ArchiveFolder self-tree, LetterArchive → ArchiveFolder) keep their
+// exact cascade behaviour, because they are internal to the same database and
+// express real aggregate ownership.
+// ---------------------------------------------------------------------------
+datasource db {
+  provider = "postgresql"
+  url      = env("CORRESPONDENCE_DATABASE_URL")
+}
+
+generator client {
+  provider      = "prisma-client-js"
+  output        = "../../src/generated/correspondence-client"
+  binaryTargets = ["native", "linux-musl-openssl-3.0.x"]
+}
+
+// ============================================================================
+// Enums — identical membership to the enums Core used to define, so the data
+// copy is a straight column-to-column transfer.
+// ============================================================================
+
+/// Canonical lifecycle. A sent letter never becomes "read" for everyone — that
+/// state is per-recipient (LetterRecipient.state) — which is why there is
+/// deliberately no RECEIVED/VIEWED member here.
+///
+/// SCHEDULED is a REAL state, not a UI hint: the letter is committed, ready, and
+/// waiting for its clock. It was added to Core's enum by
+/// 20260914130000_add_scheduled_send but the status/timestamp CHECK constraint was
+/// never extended to admit it (defect D1 of this phase), and the send path refused
+/// to load a SCHEDULED letter (defect D2). Both are corrected here, in the module
+/// that now owns the scheduler.
+enum LetterStatus {
+  DRAFT
+  READY_TO_SEND
+  SCHEDULED
+  SENT
+  CANCELLED
+}
+
+enum LetterUrgency {
+  NORMAL
+  IMPORTANT
+  URGENT
+  CRITICAL
+}
+
+enum LetterClassification {
+  NORMAL
+  CONFIDENTIAL
+  SECRET
+}
+
+enum LetterRecipientKind {
+  TO
+  CC
+  BCC
+}
+
+/// Per-subject delivery/reading state of one recipient. DELIVERED is set when the
+/// send commits; VIEWED / READ come from explicit server-side marks (never guessed);
+/// ACTION_REQUIRED / REFERRED / ACTED come from the referral workflow.
+enum LetterRecipientState {
+  DELIVERED
+  VIEWED
+  READ
+  ACTION_REQUIRED
+  REFERRED
+  ACTED
+}
+
+enum ReferralLevel {
+  NORMAL
+  INFORM
+  REVIEW
+  DECIDE
+  EXECUTE
+  FINAL_APPROVE
+}
+
+enum ReferralStatus {
+  PENDING
+  VIEWED
+  ACTED
+}
+
+enum LetterTrackingEventType {
+  CREATED
+  SENT
+  VIEWED
+  READ
+  REFERRED
+  REFERRAL_ACTED
+  CLASSIFICATION_CHANGED
+  ARCHIVED
+  UNARCHIVED
+}
+
+// ============================================================================
+// Models
+// ============================================================================
+
+/// One official letter — the canonical record. The letter number is minted at send
+/// time (drafts carry none), which is also what makes the numbering race irrelevant:
+/// two concurrent sends of the same draft cannot both pass the conditional update.
+///
+/// `tenantId` is nullable following the Survey/Ticket column convention, but the
+/// service REQUIRES a tenant context to create or send: a letter without an
+/// organization has no directory to address and no archive to live in.
+model Letter {
+  id       String  @id @default(uuid())
+  tenantId String?
+
+  /// `AR-{JalaliYear}-{5-digit seq}` e.g. `AR-1405-00042`, allocated server-side at
+  /// send. UNIQUE per tenant; NULL while the letter is a draft, scheduled or a
+  /// cancelled draft.
+  letterNumber String?
+
+  /// Bounded by a DB CHECK as well as by the DTO.
+  subject String
+
+  /// SERVER-SANITIZED allowlisted rich text. Stored only after
+  /// `sanitizeLetterBody` has run; never stored raw from a client.
+  bodyHtml String
+
+  /// Free-text category (مکاتبات اداری، درخواست مرخصی، …). Not an enum: the taxonomy
+  /// is operational, and no code branches on it.
+  category String?
+
+  urgency        LetterUrgency        @default(NORMAL)
+  classification LetterClassification @default(NORMAL)
+  status         LetterStatus         @default(DRAFT)
+
+  /// تاریخ نامه — the official letter date, canonically stored as an instant at
+  /// 00:00 Asia/Tehran converted server-side from the Jalali date key.
+  letterDate DateTime?
+
+  /// Send at a future time. If set and in the future, the letter is stored as
+  /// SCHEDULED and `ScheduledSendDispatcherService` sends it when due.
+  ///
+  /// TYPE NORMALIZED (defect D3): Core's column was created as TIMESTAMPTZ by
+  /// 20260914130000_add_scheduled_send while every sibling timestamp in this table —
+  /// and in the platform — is TIMESTAMP(3). Mixing timestamp/timestamptz columns makes
+  /// comparisons and index use depend on the server TimeZone setting. This schema uses
+  /// the platform's single convention, and the migration converts existing values with
+  /// `AT TIME ZONE 'UTC'` so the stored INSTANT is unchanged.
+  scheduledAt DateTime?
+
+  /// Stable identifier of the sending user. NO relation, NO FK (DC-CORR-01): the
+  /// letter survives the sender's deletion. Resolved from RequestContextService on
+  /// create; never a body field.
+  senderId String
+
+  /// "حذف از لیست" for the sender's own outgoing view. Never deletes the letter.
+  senderRemovedAt DateTime?
+
+  /// Idempotency key for the SEND operation (UNIQUE). A retried send carrying the
+  /// same key returns the already-sent letter instead of minting a duplicate —
+  /// the database, not client timing, arbitrates "sent exactly once".
+  sendKey String? @unique
+
+  readyAt     DateTime?
+  sentAt      DateTime?
+  cancelledAt DateTime?
+
+  /// Scheduled-send bookkeeping (Phase 50-MOD-CORR, defects D8/D10). The dispatcher
+  /// claims a due letter BEFORE sending it; these three columns are what make the
+  /// retry bounded, observable and diagnosable instead of an infinite silent loop:
+  ///  - `sendAttempts` counts dispatcher attempts for this letter (0 until claimed);
+  ///  - `lastSendAttemptAt` is the last claim instant;
+  ///  - `lastSendError` is the last failure reason, kept for the operator and shown
+  ///    nowhere to a client.
+  /// A letter that exhausted its attempts stays SCHEDULED (it is not silently
+  /// cancelled and not silently sent) and is excluded from the due scan.
+  sendAttempts      Int       @default(0)
+  lastSendAttemptAt DateTime?
+  lastSendError     String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  recipients  LetterRecipient[]
+  attachments LetterAttachment[]
+  referrals   LetterReferral[]
+  tracking    LetterTrackingEvent[]
+  archives    LetterArchive[]
+
+  /// Optional signature (drawn or uploaded PNG) attached to the letter.
+  signatureId String?          @unique
+  signature   LetterSignature? @relation(fields: [signatureId], references: [id])
+  /// The dispatcher's due scan (`status = 'SCHEDULED' AND scheduledAt <= now`) is
+  /// served by the PARTIAL index `Letter_scheduled_due_idx`, declared in the
+  /// migration because Prisma cannot express a partial index — the same reason
+  /// `Reminder_pending_dueAt_idx` (49I) is declared in raw SQL.
+
+  /// Numbering counter reads + per-tenant list queries lead with tenantId.
+  @@unique([tenantId, letterNumber])
+  @@index([tenantId, senderId, createdAt(sort: Desc), id(sort: Desc)])
+  @@index([tenantId, status, createdAt(sort: Desc), id(sort: Desc)])
+  @@index([tenantId, letterNumber])
+  @@index([senderId])
+}
+
+/// Per-(tenant, Jalali-year) numbering counter. The counter is allocated inside the
+/// send transaction by `INSERT … ON CONFLICT ("tenantId","year") DO UPDATE … RETURNING`,
+/// so a numbering race between concurrent sends is resolved by the database, not by
+/// application timing. tenantId is NOT nullable here: the service refuses to mint a
+/// number for a caller without tenant context, and Postgres would otherwise treat
+/// NULLs as distinct in the unique key.
+model LetterNumberCounter {
+  id       String @id @default(uuid())
+  tenantId String
+  /// Jalali year of the send instant, computed server-side via jalali.util.
+  year     Int
+  /// Last allocated sequence number for this (tenant, year). Never decremented.
+  counter  Int    @default(0)
+
+  @@unique([tenantId, year])
+}
+
+/// One addressed recipient of one letter. UNIQUE per (letter, user): a user appears
+/// ONCE per letter with ONE kind, so "TO and also CC" collapses to TO (the stronger
+/// need-to-know edge), decided server-side at recipient-set write time.
+model LetterRecipient {
+  id       String @id @default(uuid())
+  letterId String
+
+  /// Stable identifier of the recipient. NO relation, NO FK (DC-CORR-01).
+  userId String
+
+  /// Snapshot of the recipient's tenant; the service refuses a recipient whose
+  /// tenant differs from the letter's.
+  tenantId String?
+
+  kind LetterRecipientKind @default(TO)
+
+  state       LetterRecipientState @default(DELIVERED)
+  deliveredAt DateTime?
+  viewedAt    DateTime?
+  readAt      DateTime?
+  actedAt     DateTime?
+
+  /// Remove from MY inbox (حذف از صندوق). Never deletes the letter.
+  removedAt DateTime?
+
+  createdAt DateTime @default(now())
+
+  letter Letter @relation(fields: [letterId], references: [id], onDelete: Cascade)
+
+  @@unique([letterId, userId])
+  /// Serves the inbox: my rows, tenant-scoped, not removed, newest delivery first.
+  @@index([userId, deliveredAt(sort: Desc), id(sort: Desc)])
+  @@index([letterId, kind])
+}
+
+/// Referral / ارجاع. History is IMMUTABLE: there is no edit or delete of a referral
+/// row anywhere in the service.
+///
+/// `clientKey` is an idempotency key (UNIQUE) so a retried or replayed create cannot
+/// mint a second identical referral — the first write wins with 409 for the loser.
+model LetterReferral {
+  id       String  @id @default(uuid())
+  letterId String
+  tenantId String?
+
+  /// Stable identifiers of the referrer and the target. NO relations, NO FKs
+  /// (DC-CORR-01): referral history survives user deletion.
+  fromUserId String
+  toUserId   String
+
+  /// Snapshot of the letter's urgency at referral time, so a later letter edit
+  /// cannot retroactively rewrite what the referrer asked.
+  urgency LetterUrgency @default(NORMAL)
+  level   ReferralLevel @default(NORMAL)
+
+  /// Bounded by a DB CHECK as well as by the DTO.
+  instruction String?
+
+  /// محرمانه. The service sets this TRUE automatically for CONFIDENTIAL/SECRET
+  /// letters and refuses a client attempt to unset it.
+  isConfidential Boolean @default(false)
+
+  /// حذف از کارتابل پس از ارجاع. REAL domain behavior: when TRUE, the referrer's own
+  /// recipient row gets `removedAt` stamped in the same transaction as the referral.
+  removeFromInbox Boolean @default(false)
+
+  /// Idempotency/replay guard. UNIQUE; nullable because a referral created without
+  /// a client key carries none.
+  clientKey String? @unique
+
+  status      ReferralStatus @default(PENDING)
+  viewedAt    DateTime?
+  actedAt     DateTime?
+  completedAt DateTime?
+
+  createdAt DateTime @default(now())
+
+  letter Letter @relation(fields: [letterId], references: [id], onDelete: Cascade)
+
+  /// History read: all referrals of one letter, oldest first.
+  @@index([letterId, createdAt, id])
+  /// Serves the referrer's cartable and the target's cartable.
+  @@index([toUserId, status, createdAt(sort: Desc), id(sort: Desc)])
+  @@index([fromUserId, createdAt(sort: Desc), id(sort: Desc)])
+}
+
+/// Append-only operational trace. Written by the server on real actions only; never
+/// written for unauthorized access attempts. NOT every row is an audit row — only
+/// security-sensitive mutations reach AuditLog (Core-owned), matching the 49H doctrine.
+model LetterTrackingEvent {
+  id       String @id @default(uuid())
+  letterId String
+
+  type LetterTrackingEventType
+
+  /// Null for system-generated events; nullable so a deleted user's trace survives
+  /// as "system" rather than disappearing (DC-CORR-01 keeps the old SET NULL meaning
+  /// without a cross-database FK).
+  actorId String?
+
+  /// The recipient subject the event concerns (VIEWED/READ by whom).
+  recipientUserId String?
+  metadata        Json?
+
+  createdAt DateTime @default(now())
+
+  letter Letter @relation(fields: [letterId], references: [id], onDelete: Cascade)
+
+  /// Timeline read: one letter's events, oldest → newest, deterministic on ties.
+  @@index([letterId, createdAt, id])
+}
+
+/// Attachment on a letter, reusing the MinIO IStorageProvider and the 49F
+/// store-then-cleanup-on-failure ordering. Files live in object storage; only this
+/// metadata row is in correspondence_db. SVG is deliberately excluded by the shared
+/// allowlist.
+model LetterAttachment {
+  id       String @id @default(uuid())
+  letterId String
+
+  /// Stable identifier of the uploader. NO relation, NO FK (DC-CORR-01).
+  uploadedBy String
+
+  /// Bounded, character-closed basename. Never a client-controlled path component.
+  fileName String
+  mimeType String
+  /// Hard ceiling 10 MB, CHECKed in the migration and enforced in the service.
+  size     Int
+
+  /// Server-built key: `correspondence/{letterId}/{attachmentId}/{safeFileName}`.
+  /// Never leaves the server; download returns a signed URL only.
+  storageKey String
+
+  createdAt DateTime @default(now())
+
+  letter Letter @relation(fields: [letterId], references: [id], onDelete: Cascade)
+
+  @@index([letterId, createdAt])
+}
+
+/// Signature drawn or uploaded for a letter. Kept as a separate entity so it can be
+/// created before the letter exists and linked at send/draft-save time.
+model LetterSignature {
+  id       String  @id @default(uuid())
+  tenantId String?
+
+  /// Stable identifier of the uploading user. NO relation, NO FK (DC-CORR-01).
+  userId String
+
+  fileName String
+  mimeType String
+  /// Hard ceiling 2 MB, enforced in the service.
+  size     Int
+
+  /// Server-built key: `correspondence/signatures/{userId}/{signatureId}/{safeFileName}`.
+  storageKey String
+
+  createdAt DateTime @default(now())
+
+  letter Letter?
+}
+
+/// Attachments uploaded before a draft exists. Moved into LetterAttachment when the
+/// draft is saved/sent; otherwise cleaned up by a background retention job.
+model LetterTempAttachment {
+  id       String  @id @default(uuid())
+  tenantId String?
+
+  /// Stable identifier of the uploader. NO relation, NO FK (DC-CORR-01).
+  uploadedBy String
+
+  fileName String
+  mimeType String
+  /// Hard ceiling 10 MB, enforced in the service.
+  size     Int
+
+  /// Server-built key: `correspondence/temp/{userId}/{attachmentId}/{safeFileName}`.
+  storageKey String
+
+  createdAt DateTime @default(now())
+
+  @@index([uploadedBy, createdAt])
+}
+
+/// Personal archive folder (پوشه بایگانی). Owned by exactly one user, inside that
+/// user's tenant. Depth is limited to TWO levels below the root (reference behavior)
+/// and enforced in the service; the DB cannot express depth, so the unique key covers
+/// sibling names instead.
+model ArchiveFolder {
+  id       String  @id @default(uuid())
+  tenantId String?
+
+  /// Stable identifier of the owner. NO relation, NO FK (DC-CORR-01): a folder the
+  /// user created is part of the archive record, not a child of the account.
+  ownerId String
+
+  /// Bounded by a DB CHECK as well as by the DTO.
+  name String
+
+  /// NULL = root folder. Sibling names are unique under the same parent; a NULL
+  /// parent is distinct per row in Postgres' default semantics, so two roots with
+  /// the same name are possible by the index alone and REJECTED in the service.
+  parentId String?
+  parent   ArchiveFolder?  @relation("ArchiveFolderTree", fields: [parentId], references: [id], onDelete: Cascade)
+  children ArchiveFolder[] @relation("ArchiveFolderTree")
+
+  createdAt DateTime @default(now())
+
+  entries LetterArchive[]
+
+  @@index([ownerId, parentId])
+}
+
+/// One user's personal archive entry for one letter. UNIQUE per (letter, user), so
+/// re-archiving moves the entry (a new folder) instead of duplicating it. Setting
+/// `removedAt` (unarchive) keeps the row — an unarchive is a visible state, not a
+/// forgotten history.
+model LetterArchive {
+  id       String @id @default(uuid())
+  letterId String
+
+  /// Stable identifier of the archiving user. NO relation, NO FK (DC-CORR-01).
+  userId String
+
+  folderId String?
+  folder   ArchiveFolder? @relation(fields: [folderId], references: [id], onDelete: SetNull)
+
+  archivedAt DateTime  @default(now())
+  removedAt  DateTime?
+
+  letter Letter @relation(fields: [letterId], references: [id], onDelete: Cascade)
+
+  @@unique([letterId, userId])
+  /// Serves the archive page: my entries, per folder, not unarchived.
+  @@index([userId, folderId, archivedAt(sort: Desc), id(sort: Desc)])
+}

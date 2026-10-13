@@ -1,0 +1,79 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="1600" height="900" viewBox="0 0 1600 900" fill="none" xmlns="http://www.w3.org/2000/svg" preserveAspectRatio="xMidYMid meet">
+  <defs>
+    <linearGradient id="g1" x1="0" x2="1">
+      <stop offset="0" stop-color="#6B5DF1" stop-opacity="0.9"/>
+      <stop offset="1" stop-color="#0FB6FF" stop-opacity="0.9"/>
+    </linearGradient>
+    <filter id="f1" x="-20%" y="-20%" width="140%" height="140%" filterUnits="objectBoundingBox">
+      <feGaussianBlur stdDeviation="12" result="blur"/>
+    </filter>
+  </defs>
+  <g id="aria-illus.root">
+    <!-- background -->
+    <rect id="aria-illus.bg" x="0" y="0" width="1600" height="900" fill="#F6F8FB"/>
+
+    <!-- infra_sources -->
+    <g id="aria-illus.infra">
+      <g id="source-erp" transform="translate(80,220)">
+        <rect x="0" y="0" width="220" height="120" rx="10" fill="#E6EEF8" stroke="#D6E3F6"/>
+        <text x="16" y="36" font-size="14" fill="#0B1226">سیستم‌های سازمانی</text>
+      </g>
+      <g id="source-crm" transform="translate(80,380)">
+        <rect x="0" y="0" width="180" height="96" rx="10" fill="#E6EEF8" stroke="#D6E3F6"/>
+        <text x="14" y="34" font-size="14" fill="#0B1226">مدیریت ارتباط با مشتری</text>
+      </g>
+      <g id="source-db" transform="translate(80,520)">
+        <rect x="0" y="0" width="200" height="96" rx="10" fill="#E6EEF8" stroke="#D6E3F6"/>
+        <text x="14" y="34" font-size="14" fill="#0B1226">انبار داده</text>
+      </g>
+    </g>
+
+    <!-- data_flows -->
+    <g id="aria-illus.flows">
+      <path id="flow-erp-to-core" d="M300 280 C520 260 640 300 760 360" stroke="url(#g1)" stroke-width="8" fill="none" stroke-linecap="round" opacity="0.9"/>
+      <path id="flow-crm-to-core" d="M260 420 C460 420 580 460 760 360" stroke="#3FB6FF" stroke-width="6" fill="none" stroke-linecap="round" opacity="0.75"/>
+      <path id="flow-db-to-core" d="M300 560 C520 540 640 500 760 360" stroke="#A58CFF" stroke-width="6" fill="none" stroke-linecap="round" opacity="0.7"/>
+    </g>
+
+    <!-- knowledge_core -->
+    <g id="aria-illus.knowledge_core" transform="translate(700,260)">
+      <g id="core-glass">
+        <ellipse cx="160" cy="120" rx="160" ry="120" fill="rgba(255,255,255,0.06)" stroke="rgba(255,255,255,0.08)"/>
+        <g id="core-nodes">
+          <circle id="node-01" cx="100" cy="100" r="10" fill="#6B5DF1"/>
+          <circle id="node-02" cx="150" cy="80" r="8" fill="#0FB6FF"/>
+          <circle id="node-03" cx="200" cy="120" r="9" fill="#6B5DF1"/>
+          <circle id="node-04" cx="130" cy="140" r="7" fill="#A58CFF"/>
+        </g>
+      </g>
+    </g>
+
+    <!-- decision_engine -->
+    <g id="aria-illus.decision_engine" transform="translate(980,300)">
+      <rect x="0" y="0" width="200" height="140" rx="12" fill="#FFFFFF" stroke="#E6EEF8"/>
+      <g id="modules" transform="translate(18,18)">
+        <rect x="0" y="0" width="68" height="44" rx="8" fill="#F8FAFF" stroke="#E1E8F8"/>
+        <rect x="76" y="0" width="68" height="44" rx="8" fill="#F8FAFF" stroke="#E1E8F8"/>
+        <rect x="0" y="56" width="68" height="44" rx="8" fill="#F8FAFF" stroke="#E1E8F8"/>
+      </g>
+    </g>
+
+    <!-- agents -> actions -->
+    <g id="aria-illus.agents" transform="translate(1220,220)">
+      <g id="agent-01" transform="translate(0,0)">
+        <rect x="0" y="0" width="160" height="80" rx="10" fill="#FFFFFF" stroke="#E6EEF8"/>
+        <text x="14" y="28" font-size="13" fill="#0B1226">عامل: صورتحساب</text>
+      </g>
+      <g id="agent-02" transform="translate(0,120)">
+        <rect x="0" y="0" width="160" height="80" rx="10" fill="#FFFFFF" stroke="#E6EEF8"/>
+        <text x="14" y="28" font-size="13" fill="#0B1226">عامل: ارجاع</text>
+      </g>
+    </g>
+
+    <!-- feedback loop -->
+    <g id="aria-illus.feedback" opacity="0.9">
+      <path id="feedback-loop-01" d="M1180 360 C1120 420 960 500 820 520" stroke="#C7E7FF" stroke-width="3" fill="none" stroke-linecap="round"/>
+    </g>
+  </g>
+</svg>

@@ -1,0 +1,547 @@
+{
+  "projectionOf": "apps/api/src/runtime-datasources.ts",
+  "generatedBy": "npm run arch:policy --workspace=apps/api",
+  "runtimes": {
+    "core": {
+      "runtime": "core",
+      "datasources": {
+        "CORE_DATABASE_URL": {
+          "requirement": "required",
+          "owner": "core",
+          "prismaProject": "core",
+          "prismaSchema": "prisma/core/schema.prisma",
+          "generatedClientDir": "core-client",
+          "generateScript": "prisma:generate:core",
+          "artifactStatus": "implemented"
+        },
+        "CMS_DATABASE_URL": {
+          "requirement": "not-used",
+          "owner": "cms",
+          "prismaProject": "cms",
+          "prismaSchema": "prisma/cms/schema.prisma",
+          "generatedClientDir": "cms-client",
+          "generateScript": "prisma:generate:cms",
+          "artifactStatus": "implemented"
+        },
+        "OBSERVABILITY_DATABASE_URL": {
+          "requirement": "optional",
+          "owner": "observability",
+          "prismaProject": "observability",
+          "prismaSchema": "prisma/observability/schema.prisma",
+          "generatedClientDir": "observability-client",
+          "generateScript": "prisma:generate:observability",
+          "artifactStatus": "implemented"
+        },
+        "CORRESPONDENCE_DATABASE_URL": {
+          "requirement": "not-used",
+          "owner": "correspondence",
+          "prismaProject": "correspondence",
+          "prismaSchema": "prisma/correspondence/schema.prisma",
+          "generatedClientDir": "correspondence-client",
+          "generateScript": "prisma:generate:correspondence",
+          "artifactStatus": "implemented"
+        },
+        "HR_DATABASE_URL": {
+          "requirement": "not-used",
+          "owner": "hr",
+          "prismaProject": "hr",
+          "prismaSchema": "prisma/hr/schema.prisma",
+          "generatedClientDir": "hr-client",
+          "generateScript": "prisma:generate:hr",
+          "artifactStatus": "implemented"
+        },
+        "COMMERCE_DATABASE_URL": {
+          "requirement": "not-used",
+          "owner": "commerce",
+          "prismaProject": "commerce",
+          "prismaSchema": "prisma/commerce/schema.prisma",
+          "generatedClientDir": "commerce-client",
+          "generateScript": "prisma:generate:commerce",
+          "artifactStatus": "implemented"
+        },
+        "PRODUCTION_DATABASE_URL": {
+          "requirement": "not-used",
+          "owner": "production",
+          "prismaProject": "production",
+          "prismaSchema": "prisma/production/schema.prisma",
+          "generatedClientDir": "production-client",
+          "generateScript": "prisma:generate:production",
+          "artifactStatus": "implemented"
+        },
+        "FINANCE_DATABASE_URL": {
+          "requirement": "not-used",
+          "owner": "financial",
+          "prismaProject": "financial",
+          "prismaSchema": "prisma/financial/schema.prisma",
+          "generatedClientDir": "financial-client",
+          "generateScript": "prisma:generate:financial",
+          "artifactStatus": "implemented"
+        }
+      },
+      "infrastructure": {
+        "redis": {
+          "requirement": "optional"
+        },
+        "rabbitmq": {
+          "requirement": "optional"
+        },
+        "minio": {
+          "requirement": "optional"
+        }
+      },
+      "instantiatedDatasources": ["CORE_DATABASE_URL", "OBSERVABILITY_DATABASE_URL"],
+      "notUsedDatasources": [
+        "CMS_DATABASE_URL",
+        "CORRESPONDENCE_DATABASE_URL",
+        "HR_DATABASE_URL",
+        "COMMERCE_DATABASE_URL",
+        "PRODUCTION_DATABASE_URL",
+        "FINANCE_DATABASE_URL"
+      ],
+      "instantiatedOwners": ["core", "observability"],
+      "notInstantiatedOwners": [
+        "cms",
+        "correspondence",
+        "hr",
+        "commerce",
+        "production",
+        "financial"
+      ],
+      "prismaProjects": ["core", "observability"],
+      "generatedClientDirs": ["core-client", "observability-client"],
+      "prunedClientDirs": [
+        "cms-client",
+        "correspondence-client",
+        "hr-client",
+        "commerce-client",
+        "production-client",
+        "financial-client"
+      ],
+      "generateScripts": ["prisma:generate:core", "prisma:generate:observability"],
+      "health": {
+        "className": "CoreHealthModule",
+        "file": "health/core-health.module.ts",
+        "appModuleFile": "core-app.module.ts",
+        "status": "implemented"
+      },
+      "image": {
+        "dockerfile": "infrastructure/docker/Dockerfile.core",
+        "prunedArtifacts": [
+          {
+            "clientDir": "observability-client",
+            "reason": "Core-only image: ObservabilityPrismaService degrades to a no-op without the artifact, and Core must not carry an artifact it does not use for business data."
+          }
+        ]
+      }
+    },
+    "cms": {
+      "runtime": "cms",
+      "datasources": {
+        "CORE_DATABASE_URL": {
+          "requirement": "required",
+          "owner": "core",
+          "prismaProject": "core",
+          "prismaSchema": "prisma/core/schema.prisma",
+          "generatedClientDir": "core-client",
+          "generateScript": "prisma:generate:core",
+          "artifactStatus": "implemented"
+        },
+        "CMS_DATABASE_URL": {
+          "requirement": "required",
+          "owner": "cms",
+          "prismaProject": "cms",
+          "prismaSchema": "prisma/cms/schema.prisma",
+          "generatedClientDir": "cms-client",
+          "generateScript": "prisma:generate:cms",
+          "artifactStatus": "implemented"
+        },
+        "OBSERVABILITY_DATABASE_URL": {
+          "requirement": "not-used",
+          "owner": "observability",
+          "prismaProject": "observability",
+          "prismaSchema": "prisma/observability/schema.prisma",
+          "generatedClientDir": "observability-client",
+          "generateScript": "prisma:generate:observability",
+          "artifactStatus": "implemented"
+        },
+        "CORRESPONDENCE_DATABASE_URL": {
+          "requirement": "not-used",
+          "owner": "correspondence",
+          "prismaProject": "correspondence",
+          "prismaSchema": "prisma/correspondence/schema.prisma",
+          "generatedClientDir": "correspondence-client",
+          "generateScript": "prisma:generate:correspondence",
+          "artifactStatus": "implemented"
+        },
+        "HR_DATABASE_URL": {
+          "requirement": "not-used",
+          "owner": "hr",
+          "prismaProject": "hr",
+          "prismaSchema": "prisma/hr/schema.prisma",
+          "generatedClientDir": "hr-client",
+          "generateScript": "prisma:generate:hr",
+          "artifactStatus": "implemented"
+        },
+        "COMMERCE_DATABASE_URL": {
+          "requirement": "not-used",
+          "owner": "commerce",
+          "prismaProject": "commerce",
+          "prismaSchema": "prisma/commerce/schema.prisma",
+          "generatedClientDir": "commerce-client",
+          "generateScript": "prisma:generate:commerce",
+          "artifactStatus": "implemented"
+        },
+        "PRODUCTION_DATABASE_URL": {
+          "requirement": "not-used",
+          "owner": "production",
+          "prismaProject": "production",
+          "prismaSchema": "prisma/production/schema.prisma",
+          "generatedClientDir": "production-client",
+          "generateScript": "prisma:generate:production",
+          "artifactStatus": "implemented"
+        },
+        "FINANCE_DATABASE_URL": {
+          "requirement": "not-used",
+          "owner": "financial",
+          "prismaProject": "financial",
+          "prismaSchema": "prisma/financial/schema.prisma",
+          "generatedClientDir": "financial-client",
+          "generateScript": "prisma:generate:financial",
+          "artifactStatus": "implemented"
+        }
+      },
+      "infrastructure": {
+        "redis": {
+          "requirement": "optional"
+        },
+        "rabbitmq": {
+          "requirement": "optional"
+        },
+        "minio": {
+          "requirement": "optional"
+        }
+      },
+      "instantiatedDatasources": ["CORE_DATABASE_URL", "CMS_DATABASE_URL"],
+      "notUsedDatasources": [
+        "OBSERVABILITY_DATABASE_URL",
+        "CORRESPONDENCE_DATABASE_URL",
+        "HR_DATABASE_URL",
+        "COMMERCE_DATABASE_URL",
+        "PRODUCTION_DATABASE_URL",
+        "FINANCE_DATABASE_URL"
+      ],
+      "instantiatedOwners": ["core", "cms"],
+      "notInstantiatedOwners": [
+        "observability",
+        "correspondence",
+        "hr",
+        "commerce",
+        "production",
+        "financial"
+      ],
+      "prismaProjects": ["core", "cms"],
+      "generatedClientDirs": ["core-client", "cms-client"],
+      "prunedClientDirs": [
+        "observability-client",
+        "correspondence-client",
+        "hr-client",
+        "commerce-client",
+        "production-client",
+        "financial-client"
+      ],
+      "generateScripts": ["prisma:generate:core", "prisma:generate:cms"],
+      "health": {
+        "className": "CmsHealthModule",
+        "file": "health/cms-health.module.ts",
+        "appModuleFile": "cms-app.module.ts",
+        "status": "implemented"
+      },
+      "image": {
+        "dockerfile": "infrastructure/docker/Dockerfile.cms",
+        "prunedArtifacts": []
+      }
+    },
+    "combined": {
+      "runtime": "combined",
+      "datasources": {
+        "CORE_DATABASE_URL": {
+          "requirement": "required",
+          "owner": "core",
+          "prismaProject": "core",
+          "prismaSchema": "prisma/core/schema.prisma",
+          "generatedClientDir": "core-client",
+          "generateScript": "prisma:generate:core",
+          "artifactStatus": "implemented"
+        },
+        "CMS_DATABASE_URL": {
+          "requirement": "required",
+          "owner": "cms",
+          "prismaProject": "cms",
+          "prismaSchema": "prisma/cms/schema.prisma",
+          "generatedClientDir": "cms-client",
+          "generateScript": "prisma:generate:cms",
+          "artifactStatus": "implemented"
+        },
+        "OBSERVABILITY_DATABASE_URL": {
+          "requirement": "optional",
+          "owner": "observability",
+          "prismaProject": "observability",
+          "prismaSchema": "prisma/observability/schema.prisma",
+          "generatedClientDir": "observability-client",
+          "generateScript": "prisma:generate:observability",
+          "artifactStatus": "implemented"
+        },
+        "CORRESPONDENCE_DATABASE_URL": {
+          "requirement": "required",
+          "owner": "correspondence",
+          "prismaProject": "correspondence",
+          "prismaSchema": "prisma/correspondence/schema.prisma",
+          "generatedClientDir": "correspondence-client",
+          "generateScript": "prisma:generate:correspondence",
+          "artifactStatus": "implemented"
+        },
+        "HR_DATABASE_URL": {
+          "requirement": "required",
+          "owner": "hr",
+          "prismaProject": "hr",
+          "prismaSchema": "prisma/hr/schema.prisma",
+          "generatedClientDir": "hr-client",
+          "generateScript": "prisma:generate:hr",
+          "artifactStatus": "implemented"
+        },
+        "COMMERCE_DATABASE_URL": {
+          "requirement": "required",
+          "owner": "commerce",
+          "prismaProject": "commerce",
+          "prismaSchema": "prisma/commerce/schema.prisma",
+          "generatedClientDir": "commerce-client",
+          "generateScript": "prisma:generate:commerce",
+          "artifactStatus": "implemented"
+        },
+        "PRODUCTION_DATABASE_URL": {
+          "requirement": "required",
+          "owner": "production",
+          "prismaProject": "production",
+          "prismaSchema": "prisma/production/schema.prisma",
+          "generatedClientDir": "production-client",
+          "generateScript": "prisma:generate:production",
+          "artifactStatus": "implemented"
+        },
+        "FINANCE_DATABASE_URL": {
+          "requirement": "required",
+          "owner": "financial",
+          "prismaProject": "financial",
+          "prismaSchema": "prisma/financial/schema.prisma",
+          "generatedClientDir": "financial-client",
+          "generateScript": "prisma:generate:financial",
+          "artifactStatus": "implemented"
+        }
+      },
+      "infrastructure": {
+        "redis": {
+          "requirement": "optional"
+        },
+        "rabbitmq": {
+          "requirement": "optional"
+        },
+        "minio": {
+          "requirement": "optional"
+        }
+      },
+      "instantiatedDatasources": [
+        "CORE_DATABASE_URL",
+        "CMS_DATABASE_URL",
+        "OBSERVABILITY_DATABASE_URL",
+        "CORRESPONDENCE_DATABASE_URL",
+        "HR_DATABASE_URL",
+        "COMMERCE_DATABASE_URL",
+        "PRODUCTION_DATABASE_URL",
+        "FINANCE_DATABASE_URL"
+      ],
+      "notUsedDatasources": [],
+      "instantiatedOwners": [
+        "core",
+        "cms",
+        "observability",
+        "correspondence",
+        "hr",
+        "commerce",
+        "production",
+        "financial"
+      ],
+      "notInstantiatedOwners": [],
+      "prismaProjects": [
+        "core",
+        "cms",
+        "observability",
+        "correspondence",
+        "hr",
+        "commerce",
+        "production",
+        "financial"
+      ],
+      "generatedClientDirs": [
+        "core-client",
+        "cms-client",
+        "observability-client",
+        "correspondence-client",
+        "hr-client",
+        "commerce-client",
+        "production-client",
+        "financial-client"
+      ],
+      "prunedClientDirs": [],
+      "generateScripts": [
+        "prisma:generate:core",
+        "prisma:generate:cms",
+        "prisma:generate:observability",
+        "prisma:generate:correspondence",
+        "prisma:generate:hr",
+        "prisma:generate:commerce",
+        "prisma:generate:production",
+        "prisma:generate:financial"
+      ],
+      "health": {
+        "className": "CombinedHealthModule",
+        "file": "health/combined-health.module.ts",
+        "appModuleFile": "app.module.ts",
+        "status": "implemented"
+      },
+      "image": {
+        "dockerfile": "infrastructure/docker/Dockerfile.backend",
+        "prunedArtifacts": [
+          {
+            "clientDir": "observability-client",
+            "reason": "Default backend image: observability is optional in the combined runtime, so a pruned artifact degrades observability instead of blocking readiness."
+          }
+        ]
+      }
+    },
+    "future-hr": {
+      "runtime": "future-hr",
+      "datasources": {
+        "CORE_DATABASE_URL": {
+          "requirement": "required",
+          "owner": "core",
+          "prismaProject": "core",
+          "prismaSchema": "prisma/core/schema.prisma",
+          "generatedClientDir": "core-client",
+          "generateScript": "prisma:generate:core",
+          "artifactStatus": "implemented"
+        },
+        "CMS_DATABASE_URL": {
+          "requirement": "not-used",
+          "owner": "cms",
+          "prismaProject": "cms",
+          "prismaSchema": "prisma/cms/schema.prisma",
+          "generatedClientDir": "cms-client",
+          "generateScript": "prisma:generate:cms",
+          "artifactStatus": "implemented"
+        },
+        "OBSERVABILITY_DATABASE_URL": {
+          "requirement": "optional",
+          "owner": "observability",
+          "prismaProject": "observability",
+          "prismaSchema": "prisma/observability/schema.prisma",
+          "generatedClientDir": "observability-client",
+          "generateScript": "prisma:generate:observability",
+          "artifactStatus": "implemented"
+        },
+        "CORRESPONDENCE_DATABASE_URL": {
+          "requirement": "not-used",
+          "owner": "correspondence",
+          "prismaProject": "correspondence",
+          "prismaSchema": "prisma/correspondence/schema.prisma",
+          "generatedClientDir": "correspondence-client",
+          "generateScript": "prisma:generate:correspondence",
+          "artifactStatus": "implemented"
+        },
+        "HR_DATABASE_URL": {
+          "requirement": "required",
+          "owner": "hr",
+          "prismaProject": "hr",
+          "prismaSchema": "prisma/hr/schema.prisma",
+          "generatedClientDir": "hr-client",
+          "generateScript": "prisma:generate:hr",
+          "artifactStatus": "implemented"
+        },
+        "COMMERCE_DATABASE_URL": {
+          "requirement": "not-used",
+          "owner": "commerce",
+          "prismaProject": "commerce",
+          "prismaSchema": "prisma/commerce/schema.prisma",
+          "generatedClientDir": "commerce-client",
+          "generateScript": "prisma:generate:commerce",
+          "artifactStatus": "implemented"
+        },
+        "PRODUCTION_DATABASE_URL": {
+          "requirement": "not-used",
+          "owner": "production",
+          "prismaProject": "production",
+          "prismaSchema": "prisma/production/schema.prisma",
+          "generatedClientDir": "production-client",
+          "generateScript": "prisma:generate:production",
+          "artifactStatus": "implemented"
+        },
+        "FINANCE_DATABASE_URL": {
+          "requirement": "not-used",
+          "owner": "financial",
+          "prismaProject": "financial",
+          "prismaSchema": "prisma/financial/schema.prisma",
+          "generatedClientDir": "financial-client",
+          "generateScript": "prisma:generate:financial",
+          "artifactStatus": "implemented"
+        }
+      },
+      "infrastructure": {
+        "redis": {
+          "requirement": "optional"
+        },
+        "rabbitmq": {
+          "requirement": "optional"
+        },
+        "minio": {
+          "requirement": "optional"
+        }
+      },
+      "instantiatedDatasources": [
+        "CORE_DATABASE_URL",
+        "OBSERVABILITY_DATABASE_URL",
+        "HR_DATABASE_URL"
+      ],
+      "notUsedDatasources": [
+        "CMS_DATABASE_URL",
+        "CORRESPONDENCE_DATABASE_URL",
+        "COMMERCE_DATABASE_URL",
+        "PRODUCTION_DATABASE_URL",
+        "FINANCE_DATABASE_URL"
+      ],
+      "instantiatedOwners": ["core", "observability", "hr"],
+      "notInstantiatedOwners": ["cms", "correspondence", "commerce", "production", "financial"],
+      "prismaProjects": ["core", "observability", "hr"],
+      "generatedClientDirs": ["core-client", "observability-client", "hr-client"],
+      "prunedClientDirs": [
+        "cms-client",
+        "correspondence-client",
+        "commerce-client",
+        "production-client",
+        "financial-client"
+      ],
+      "generateScripts": [
+        "prisma:generate:core",
+        "prisma:generate:observability",
+        "prisma:generate:hr"
+      ],
+      "health": {
+        "className": "HrHealthModule",
+        "file": "health/hr-health.module.ts",
+        "appModuleFile": "hr-app.module.ts",
+        "status": "target"
+      },
+      "image": {
+        "dockerfile": null,
+        "prunedArtifacts": []
+      }
+    }
+  }
+}

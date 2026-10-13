@@ -1,0 +1,66 @@
+# Phase 33K: Core-only image.
+# Runs core-main.js and ships only the Core generated Prisma client.
+FROM node:20-alpine AS base
+
+WORKDIR /app
+
+RUN apk add --no-cache python3 make g++ openssl openssl-dev
+
+FROM base AS builder
+
+COPY package.json pnpm-lock.yaml* package-lock.json* ./
+COPY apps/api/package.json ./apps/api/
+COPY apps/api/tsconfig*.json ./apps/api/
+COPY packages ./packages
+
+RUN npm ci --prefer-offline --no-audit
+
+COPY . .
+
+# Phase ARCH-1.3: `npm run build` runs prisma:generate for every Prisma project and
+# then copies src/generated to dist/generated (prebuild/build/postbuild), so the prune
+# below has to come AFTER it — a prune placed before the build is undone by the build.
+RUN npm run build --workspace=apps/api
+
+# Prune the client copies this image must not carry, from the DERIVED list
+# (`node apps/api/scripts/runtime-policy.mjs prune-clients-for core`): the client of
+# each `not-used` datasource of this runtime, plus this image's disclosed opt-out
+# (`runtimes.core.image.prunedArtifacts` in apps/api/runtime-policy.json).
+# The runner stage then copies src/generated wholesale, so a datasource added to the
+# Core policy appears here without editing this file — the old hand-maintained
+# `rm -rf` list is exactly what made the artifact boundary drift.
+RUN for client in $(node apps/api/scripts/runtime-policy.mjs prune-clients-for core); do \
+      rm -rf "/app/apps/api/src/generated/$client" "/app/apps/api/dist/generated/$client"; \
+    done
+
+FROM base AS runner
+
+ENV NODE_ENV=production
+
+COPY package.json package-lock.json* tsconfig*.json ./
+COPY apps/api/package.json apps/api/tsconfig*.json ./apps/api/
+COPY packages ./packages
+
+RUN npm ci --prefer-offline --no-audit --omit=optional
+
+# Only the Core Prisma project/migrations — never prisma/cms, observability,
+# correspondence or hr.
+COPY --from=builder /app/apps/api/prisma/core ./apps/api/prisma/core
+COPY --from=builder /app/apps/api/prisma/migrations ./apps/api/prisma/migrations
+
+# Only Core's compiled entrypoint + shared compiled sources; other entrypoints
+# are present in dist/ as a byproduct of the single tsc build but are never loaded
+# because core-main.js imports core-app.module.ts only.
+COPY --from=builder /app/apps/api/dist ./apps/api/dist
+
+# Phase ARCH-1.3: wholesale copy of the pruned client tree. The boundary is decided
+# by the derived prune above, not by a hand-maintained list here, so adding a
+# datasource to the Core policy cannot silently ship an unlisted client or omit a
+# required one.
+COPY --from=builder /app/apps/api/src/generated ./apps/api/src/generated
+
+WORKDIR /app/apps/api
+
+EXPOSE 3001
+
+CMD ["node", "dist/core-main.js"]

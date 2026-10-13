@@ -1,0 +1,256 @@
+npm warn Unknown project config "shamefully-hoist". This will stop working in the next major version of npm. See `npm help npmrc` for supported config options.
+npm warn Unknown project config "strict-peer-dependencies". This will stop working in the next major version of npm. See `npm help npmrc` for supported config options.
+
+> @aria-erp/api@1.0.0 test:cov
+> jest --coverage
+
+PASS src/modules/cms/blog/blog.repository.spec.ts (9.089 s)
+PASS src/common/audit-redactor.spec.ts
+PASS src/modules/cms/common/sanitize.util.spec.ts
+PASS src/common/cache.service.spec.ts (9.464 s)
+[33m[Nest] 29336  - [39m07/29/2026, 7:32:04 PM [33m   WARN[39m [38;5;3m[CacheService] [39m[33mFailed to initialize Redis client, falling back to cache-manager only[39m
+[33m[Nest] 29336  - [39m07/29/2026, 7:32:04 PM [33m   WARN[39m [38;5;3m[CacheService] [39m[33mFailed to initialize Redis client, falling back to cache-manager only[39m
+PASS src/modules/cms/common/reading-time.util.spec.ts
+PASS src/modules/cms/common/slug.util.spec.ts
+PASS src/auth/rbac/test/permission.service.spec.ts (9.743 s)
+FAIL src/auth/rbac/test/role.service.spec.ts (9.923 s)
+  ● RoleService › assignRoleToUser › should assign role to user successfully
+
+    TypeError: Cannot read properties of undefined (reading 'update')
+
+    [0m [90m 68 |[39m
+     [90m 69 |[39m     [90m// Increment tokenVersion to invalidate old JWTs[39m
+    [31m[1m>[22m[39m[90m 70 |[39m     [36mawait[39m [36mthis[39m[33m.[39mprisma[33m.[39muser[33m.[39mupdate({
+     [90m    |[39m                            [31m[1m^[22m[39m
+     [90m 71 |[39m       where[33m:[39m { id[33m:[39m userId }[33m,[39m
+     [90m 72 |[39m       data[33m:[39m { tokenVersion[33m:[39m { increment[33m:[39m [35m1[39m } }[33m,[39m
+     [90m 73 |[39m     })[33m;[39m[0m
+
+      at RoleService.update [as assignRoleToUser] (auth/rbac/services/role.service.ts:70:28)
+      at Object.<anonymous> (auth/rbac/test/role.service.spec.ts:98:7)
+
+  ● RoleService › assignRoleToUser › should throw if user already has role
+
+    expect(received).rejects.toThrow(expected)
+
+    Expected constructor: BadRequestException
+    Received constructor: TypeError
+
+    Received message: "Cannot read properties of undefined (reading 'update')"
+
+        [0m [90m 68 |[39m
+         [90m 69 |[39m     [90m// Increment tokenVersion to invalidate old JWTs[39m
+        [31m[1m>[22m[39m[90m 70 |[39m     [36mawait[39m [36mthis[39m[33m.[39mprisma[33m.[39muser[33m.[39mupdate({
+         [90m    |[39m                            [31m[1m^[22m[39m
+         [90m 71 |[39m       where[33m:[39m { id[33m:[39m userId }[33m,[39m
+         [90m 72 |[39m       data[33m:[39m { tokenVersion[33m:[39m { increment[33m:[39m [35m1[39m } }[33m,[39m
+         [90m 73 |[39m     })[33m;[39m[0m
+
+      at RoleService.update [as assignRoleToUser] (auth/rbac/services/role.service.ts:70:28)
+      at Object.<anonymous> (auth/rbac/test/role.service.spec.ts:127:7)
+      at Object.toThrow (../../../node_modules/expect/build/index.js:218:22)
+      at Object.<anonymous> (auth/rbac/test/role.service.spec.ts:129:17)
+
+  ● RoleService › removeRoleFromUser › should remove role from user successfully
+
+    TypeError: Cannot read properties of undefined (reading 'update')
+
+    [0m [90m 123 |[39m
+     [90m 124 |[39m     [90m// Increment tokenVersion to invalidate old JWTs[39m
+    [31m[1m>[22m[39m[90m 125 |[39m     [36mawait[39m [36mthis[39m[33m.[39mprisma[33m.[39muser[33m.[39mupdate({
+     [90m     |[39m                            [31m[1m^[22m[39m
+     [90m 126 |[39m       where[33m:[39m { id[33m:[39m userId }[33m,[39m
+     [90m 127 |[39m       data[33m:[39m { tokenVersion[33m:[39m { increment[33m:[39m [35m1[39m } }[33m,[39m
+     [90m 128 |[39m     })[33m;[39m[0m
+
+      at RoleService.update [as removeRoleFromUser] (auth/rbac/services/role.service.ts:125:28)
+      at Object.<anonymous> (auth/rbac/test/role.service.spec.ts:144:7)
+
+  ● RoleService › initializeDefaultRoles › should skip if roles already initialized
+
+    TypeError: this.prisma.role.count is not a function
+
+    [0m [90m 212 |[39m   [36masync[39m initializeDefaultRoles()[33m:[39m [33mPromise[39m[33m<[39m[36mvoid[39m[33m>[39m {
+     [90m 213 |[39m     [90m// Check if roles already exist[39m
+    [31m[1m>[22m[39m[90m 214 |[39m     [36mconst[39m existingRoles [33m=[39m [36mawait[39m [36mthis[39m[33m.[39mprisma[33m.[39mrole[33m.[39mcount()[33m;[39m
+     [90m     |[39m                                                  [31m[1m^[22m[39m
+     [90m 215 |[39m     [36mif[39m (existingRoles [33m>[39m [35m0[39m) {
+     [90m 216 |[39m       [36mthis[39m[33m.[39mlogger[33m.[39mdebug([32m'Default roles already initialized'[39m)[33m;[39m
+     [90m 217 |[39m       [36mreturn[39m[33m;[39m[0m
+
+      at RoleService.count [as initializeDefaultRoles] (auth/rbac/services/role.service.ts:214:50)
+      at Object.<anonymous> (auth/rbac/test/role.service.spec.ts:217:21)
+
+  ● RoleService › initializeDefaultRoles › should initialize default roles if none exist
+
+    TypeError: this.prisma.role.count is not a function
+
+    [0m [90m 212 |[39m   [36masync[39m initializeDefaultRoles()[33m:[39m [33mPromise[39m[33m<[39m[36mvoid[39m[33m>[39m {
+     [90m 213 |[39m     [90m// Check if roles already exist[39m
+    [31m[1m>[22m[39m[90m 214 |[39m     [36mconst[39m existingRoles [33m=[39m [36mawait[39m [36mthis[39m[33m.[39mprisma[33m.[39mrole[33m.[39mcount()[33m;[39m
+     [90m     |[39m                                                  [31m[1m^[22m[39m
+     [90m 215 |[39m     [36mif[39m (existingRoles [33m>[39m [35m0[39m) {
+     [90m 216 |[39m       [36mthis[39m[33m.[39mlogger[33m.[39mdebug([32m'Default roles already initialized'[39m)[33m;[39m
+     [90m 217 |[39m       [36mreturn[39m[33m;[39m[0m
+
+      at RoleService.count [as initializeDefaultRoles] (auth/rbac/services/role.service.ts:214:50)
+      at Object.<anonymous> (auth/rbac/test/role.service.spec.ts:228:21)
+
+PASS src/modules/cms/blog/blog.service.spec.ts (10.239 s)
+PASS src/modules/cms/blog/dto/create-blog.dto.spec.ts (10.332 s)
+FAIL src/auth/rbac/test/roles.guard.spec.ts
+  ● Test suite failed to run
+
+    [96msrc/auth/rbac/test/roles.guard.spec.ts[0m:[93m58[0m:[93m41[0m - [91merror[0m[90m TS2339: [0mProperty 'mockReturnValue' does not exist on type '() => HttpArgumentsHost'.
+
+    [7m58[0m       mockExecutionContext.switchToHttp.mockReturnValue({
+    [7m  [0m [91m                                        ~~~~~~~~~~~~~~~[0m
+    [96msrc/auth/rbac/test/roles.guard.spec.ts[0m:[93m73[0m:[93m41[0m - [91merror[0m[90m TS2339: [0mProperty 'mockReturnValue' does not exist on type '() => HttpArgumentsHost'.
+
+    [7m73[0m       mockExecutionContext.switchToHttp.mockReturnValue({
+    [7m  [0m [91m                                        ~~~~~~~~~~~~~~~[0m
+    [96msrc/auth/rbac/test/roles.guard.spec.ts[0m:[93m93[0m:[93m41[0m - [91merror[0m[90m TS2339: [0mProperty 'mockReturnValue' does not exist on type '() => HttpArgumentsHost'.
+
+    [7m93[0m       mockExecutionContext.switchToHttp.mockReturnValue({
+    [7m  [0m [91m                                        ~~~~~~~~~~~~~~~[0m
+    [96msrc/auth/rbac/test/roles.guard.spec.ts[0m:[93m112[0m:[93m41[0m - [91merror[0m[90m TS2339: [0mProperty 'mockReturnValue' does not exist on type '() => HttpArgumentsHost'.
+
+    [7m112[0m       mockExecutionContext.switchToHttp.mockReturnValue({
+    [7m   [0m [91m                                        ~~~~~~~~~~~~~~~[0m
+    [96msrc/auth/rbac/test/roles.guard.spec.ts[0m:[93m131[0m:[93m41[0m - [91merror[0m[90m TS2339: [0mProperty 'mockReturnValue' does not exist on type '() => HttpArgumentsHost'.
+
+    [7m131[0m       mockExecutionContext.switchToHttp.mockReturnValue({
+    [7m   [0m [91m                                        ~~~~~~~~~~~~~~~[0m
+
+PASS src/modules/cms/blog/blog.controller.spec.ts (10.687 s)
+-----------------------------------|---------|----------|---------|---------|-------------------------------------------------------------------------------------
+File                               | % Stmts | % Branch | % Funcs | % Lines | Uncovered Line #s                                                                   
+-----------------------------------|---------|----------|---------|---------|-------------------------------------------------------------------------------------
+All files                          |   25.89 |    18.48 |    16.9 |   26.66 |                                                                                     
+ src                               |       0 |        0 |       0 |       0 |                                                                                     
+  app.controller.ts                |       0 |        0 |       0 |       0 | 1-43                                                                                
+  app.module.ts                    |       0 |        0 |       0 |       0 | 1-66                                                                                
+  app.service.ts                   |       0 |        0 |       0 |       0 | 1-11                                                                                
+  main.ts                          |       0 |        0 |       0 |       0 | 1-72                                                                                
+ src/ai                            |       0 |      100 |       0 |       0 |                                                                                     
+  ai.module.ts                     |       0 |      100 |     100 |       0 | 1-21                                                                                
+  azure-openai.provider.ts         |       0 |      100 |       0 |       0 | 1-21                                                                                
+  claude.provider.ts               |       0 |      100 |       0 |       0 | 1-21                                                                                
+  local-llm.provider.ts            |       0 |      100 |       0 |       0 | 1-21                                                                                
+  openai.provider.ts               |       0 |      100 |       0 |       0 | 1-21                                                                                
+ src/auth                          |       0 |        0 |       0 |       0 |                                                                                     
+  auth.controller.ts               |       0 |        0 |       0 |       0 | 1-113                                                                               
+  auth.module.ts                   |       0 |        0 |       0 |       0 | 1-47                                                                                
+  auth.service.ts                  |       0 |        0 |       0 |       0 | 1-361                                                                               
+  refresh-token.service.ts         |       0 |        0 |       0 |       0 | 1-32                                                                                
+ src/auth/decorators               |   33.33 |      100 |   33.33 |      25 |                                                                                     
+  current-user.decorator.ts        |       0 |      100 |       0 |       0 | 1-11                                                                                
+  public.decorator.ts              |       0 |      100 |       0 |       0 | 1-8                                                                                 
+  roles.decorator.ts               |     100 |      100 |     100 |     100 |                                                                                     
+ src/auth/dto                      |       0 |      100 |     100 |       0 |                                                                                     
+  auth-response.dto.ts             |       0 |      100 |     100 |       0 | 5                                                                                   
+  forgot-password.dto.ts           |       0 |      100 |     100 |       0 | 1-5                                                                                 
+  login.dto.ts                     |       0 |      100 |     100 |       0 | 1-9                                                                                 
+  refresh-token.dto.ts             |       0 |      100 |     100 |       0 | 1-5                                                                                 
+  register.dto.ts                  |       0 |      100 |     100 |       0 | 1-20                                                                                
+  resend-verification.dto.ts       |       0 |      100 |     100 |       0 | 1-9                                                                                 
+  reset-password.dto.ts            |       0 |      100 |     100 |       0 | 1-9                                                                                 
+  verify-email.dto.ts              |       0 |      100 |     100 |       0 | 1-5                                                                                 
+ src/auth/entities                 |       0 |      100 |       0 |       0 |                                                                                     
+  auth-token.entity.ts             |       0 |      100 |       0 |       0 | 5-9                                                                                 
+ src/auth/guards                   |       0 |        0 |       0 |       0 |                                                                                     
+  jwt-auth.guard.ts                |       0 |        0 |       0 |       0 | 1-34                                                                                
+  local-auth.guard.ts              |       0 |      100 |     100 |       0 | 1-5                                                                                 
+  optional-auth.guard.ts           |       0 |        0 |       0 |       0 | 1-22                                                                                
+ src/auth/rbac                     |       0 |        0 |       0 |       0 |                                                                                     
+  development-rbac.controller.ts   |       0 |      100 |       0 |       0 | 7-42                                                                                
+  rbac.controller.ts               |       0 |        0 |       0 |       0 | 6-226                                                                               
+  rbac.module.ts                   |       0 |        0 |     100 |       0 | 6-38                                                                                
+ src/auth/rbac/constants           |      76 |      100 |   16.66 |      76 |                                                                                     
+  permissions.ts                   |     100 |      100 |     100 |     100 |                                                                                     
+  roles.ts                         |   72.72 |      100 |   16.66 |   72.72 | 207,220,227-230                                                                     
+ src/auth/rbac/dto                 |       0 |      100 |     100 |       0 |                                                                                     
+  rbac.dto.ts                      |       0 |      100 |     100 |       0 | 5-76                                                                                
+ src/auth/rbac/guards              |       0 |        0 |       0 |       0 |                                                                                     
+  roles.guard.ts                   |       0 |        0 |       0 |       0 | 7-89                                                                                
+ src/auth/rbac/services            |    40.2 |    26.66 |   29.26 |   38.17 |                                                                                     
+  hierarchy-validation.service.ts  |    12.5 |        0 |       0 |    8.69 | 13-189                                                                              
+  permission.service.ts            |   44.04 |    33.33 |      30 |    42.5 | 112-113,137-349                                                                     
+  role.service.ts                  |   56.45 |    71.42 |      50 |      55 | 76-84,131-139,171-201,215-365                                                       
+ src/auth/services                 |       0 |        0 |       0 |       0 |                                                                                     
+  session.service.ts               |       0 |        0 |       0 |       0 | 1-96                                                                                
+  token-hash.service.ts            |       0 |        0 |       0 |       0 | 1-48                                                                                
+ src/auth/strategies               |       0 |        0 |       0 |       0 |                                                                                     
+  jwt.strategy.ts                  |       0 |        0 |       0 |       0 | 1-56                                                                                
+  local.strategy.ts                |       0 |        0 |       0 |       0 | 1-17                                                                                
+ src/common                        |    41.1 |     41.6 |   26.66 |   42.76 |                                                                                     
+  audit-dispatcher.service.ts      |       0 |        0 |       0 |       0 | 1-46                                                                                
+  audit-redactor.util.ts           |    78.7 |    71.87 |   83.33 |   84.21 | 87,118-119,133-134,159-160,174-176,194-199                                          
+  audit.service.ts                 |   19.44 |        0 |       0 |   15.15 | 26-98                                                                               
+  cache.service.ts                 |   34.12 |    36.66 |   35.29 |   35.57 | 16,24,32-33,44,48-81,94,100-121,139-167,186-195                                     
+  otel-bootstrap.ts                |       0 |        0 |       0 |       0 | 1-16                                                                                
+  pino-config.ts                   |       0 |        0 |       0 |       0 | 3-45                                                                                
+  request-context.service.ts       |      40 |        0 |   14.28 |   38.46 | 20,28-46                                                                            
+  setup-swagger.ts                 |       0 |        0 |       0 |       0 | 3-29                                                                                
+ src/common/filters                |   10.16 |        0 |       0 |    7.01 |                                                                                     
+  standard-exception.filter.ts     |   10.16 |        0 |       0 |    7.01 | 28-160                                                                              
+ src/common/guards                 |       0 |      100 |     100 |       0 |                                                                                     
+  jwt-auth.guard.ts                |       0 |      100 |     100 |       0 | 1-5                                                                                 
+ src/common/middleware             |       0 |        0 |       0 |       0 |                                                                                     
+  request-context.middleware.ts    |       0 |        0 |       0 |       0 | 1-55                                                                                
+ src/database                      |   41.66 |      100 |       0 |    37.5 |                                                                                     
+  prisma.module.ts                 |       0 |      100 |     100 |       0 | 1-9                                                                                 
+  prisma.service.ts                |   71.42 |      100 |       0 |      60 | 7-11                                                                                
+ src/health                        |       0 |        0 |       0 |       0 |                                                                                     
+  health.controller.ts             |       0 |        0 |       0 |       0 | 1-28                                                                                
+  health.module.ts                 |       0 |      100 |     100 |       0 | 1-11                                                                                
+  health.service.ts                |       0 |        0 |       0 |       0 | 1-73                                                                                
+ src/modules/cms/blog              |   38.59 |     19.2 |   25.88 |   41.58 |                                                                                     
+  blog-response.interceptor.ts     |   27.27 |        0 |       0 |   21.05 | 17-49                                                                               
+  blog.controller.ts               |   59.15 |        0 |   15.78 |   61.53 | 55,61,67,73,80,86,92,98,104,134-135,152-153,167-168,185-186,200-201,218-222,236-237 
+  blog.module.ts                   |       0 |      100 |     100 |       0 | 1-18                                                                                
+  blog.repository.ts               |      59 |    31.42 |   35.48 |   59.34 | 18,21,24,29,32,58-123,132-135,152-155,170,182-204,221-229                           
+  blog.service.ts                  |   28.13 |    19.82 |    25.8 |   32.11 | 38-130,157,177,195-405,437,449                                                      
+ src/modules/cms/blog/dto          |   76.08 |        0 |       0 |   76.08 |                                                                                     
+  create-blog.dto.ts               |   68.18 |        0 |       0 |   68.18 | 8,15,23,29,36,43,50                                                                 
+  publish-blog.dto.ts              |   76.92 |        0 |       0 |   76.92 | 18,25,32                                                                            
+  update-blog.dto.ts               |    90.9 |        0 |       0 |    90.9 | 19                                                                                  
+ src/modules/cms/blog/entities     |       0 |      100 |     100 |       0 |                                                                                     
+  blog.entity.ts                   |       0 |      100 |     100 |       0 | 1                                                                                   
+ src/modules/cms/common            |    52.3 |     12.9 |      80 |   53.33 |                                                                                     
+  rate-limit.decorator.ts          |     100 |        0 |     100 |     100 | 3                                                                                   
+  rate-limit.guard.ts              |   18.42 |        0 |       0 |   15.15 | 15-67                                                                               
+  reading-time.util.ts             |     100 |    66.66 |     100 |     100 | 2                                                                                   
+  sanitize.util.ts                 |     100 |      100 |     100 |     100 |                                                                                     
+  slug.util.ts                     |     100 |      100 |     100 |     100 |                                                                                     
+ src/modules/cms/common/validators |   88.88 |    66.66 |     100 |   88.88 |                                                                                     
+  is-future-date.decorator.ts      |   88.88 |    66.66 |     100 |   88.88 | 13                                                                                  
+ src/notifications                 |      25 |        0 |       0 |   18.75 |                                                                                     
+  notification.module.ts           |       0 |      100 |     100 |       0 | 1-8                                                                                 
+  notification.publisher.ts        |   33.33 |        0 |       0 |   23.07 | 7-28                                                                                
+ src/notifications/email           |       0 |        0 |       0 |       0 |                                                                                     
+  email.service.ts                 |       0 |        0 |       0 |       0 | 1-43                                                                                
+ src/storage                       |       0 |        0 |       0 |       0 |                                                                                     
+  minio.provider.ts                |       0 |        0 |       0 |       0 | 2-35                                                                                
+  storage.module.ts                |       0 |      100 |     100 |       0 | 1-14                                                                                
+ src/types                         |       0 |        0 |       0 |       0 |                                                                                     
+  amqplib.d.ts                     |       0 |        0 |       0 |       0 |                                                                                     
+  nodemailer.d.ts                  |       0 |        0 |       0 |       0 |                                                                                     
+ src/users                         |       0 |        0 |       0 |       0 |                                                                                     
+  users.controller.ts              |       0 |      100 |       0 |       0 | 1-25                                                                                
+  users.module.ts                  |       0 |      100 |     100 |       0 | 1-12                                                                                
+  users.service.ts                 |       0 |        0 |       0 |       0 | 1-27                                                                                
+-----------------------------------|---------|----------|---------|---------|-------------------------------------------------------------------------------------
+
+Test Suites: 2 failed, 10 passed, 12 total
+Tests:       5 failed, 39 passed, 44 total
+Snapshots:   0 total
+Time:        23.838 s
+Ran all test suites.
+npm error Lifecycle script `test:cov` failed with error:
+npm error code 1
+npm error path E:\ERP\apps\api
+npm error workspace @aria-erp/api@1.0.0
+npm error location E:\ERP\apps\api
+npm error command failed
+npm error command C:\WINDOWS\system32\cmd.exe /d /s /c jest --coverage

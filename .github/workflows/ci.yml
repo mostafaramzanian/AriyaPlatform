@@ -1,0 +1,283 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  api-checks:
+    runs-on: ubuntu-latest
+    env:
+      CI: "true"
+      SKIP_PRISMA_VERSION_CHECK: "1"
+      # NestJS 12 packages are ESM-only; Jest needs the VM-modules flag to load
+      # them (and every `npx jest` step inherits it from the job env).
+      NODE_OPTIONS: "--experimental-vm-modules"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Generate Prisma clients (all owners)
+        run: npm run prisma:generate --workspace=apps/api
+
+      - name: API lint
+        run: npm run lint --workspace=apps/api
+
+      - name: API type-check
+        run: npx tsc --noEmit -p tsconfig.json
+        working-directory: apps/api
+
+      - name: API unit tests
+        run: npm run test --workspace=apps/api -- --runInBand
+
+      - name: Contract suites (env validation, architecture, runtime policy)
+        run: >-
+          npx jest --runInBand
+          src/config/env.validation.spec.ts
+          src/architecture-boundaries.spec.ts
+          src/runtime-policy.spec.ts
+        working-directory: apps/api
+
+      - name: Prisma schema / migration / generated-client enum drift guard
+        run: npm run prisma:verify:enums --workspace=apps/api
+
+      - name: Docker runtime artifact completeness guard
+        run: npm run docker:verify:artifacts --workspace=apps/api
+
+      - name: Commerce unit regressions
+        run: npx jest --runInBand src/modules/commerce
+        working-directory: apps/api
+
+      - name: Build API
+        run: npx nest build
+        working-directory: apps/api
+
+  web-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Web lint
+        run: npm run lint --workspace=apps/web
+
+      - name: Web type-check
+        run: npm run type-check --workspace=apps/web
+
+      - name: Web unit tests
+        run: npm run test --workspace=apps/web -- --runInBand
+
+      - name: Build web
+        run: npm run build --workspace=apps/web
+        env:
+          NEXT_PUBLIC_API_URL: http://localhost:3001/api
+          NEXT_PUBLIC_APP_URL: http://localhost:3000
+
+  # Phase B1 — Real-E2E Release Gate.
+  #
+  # This job provisions a real PostgreSQL instance with all eight owned databases,
+  # a real Redis instance, runs all Prisma migrations, seeds the bootstrap data,
+  # boots the production-style NestJS application, and executes the E2E suite
+  # against it. A failure here FAILS the CI run — it is not continue-on-error.
+  #
+  # RabbitMQ and MinIO are NOT provisioned: the publisher degrades to unconfigured
+  # (audit dispatch records are written to the retry table instead of published),
+  # and tests that require real object storage are excluded from the CI gate set.
+  # The gate proves: tenant isolation, authorization, RBAC, module entitlement,
+  # persistence, API-to-database behavior, and at least one representative
+  # cross-context boundary (Financial Check Issuance lifecycle).
+  e2e-checks:
+    runs-on: ubuntu-latest
+    needs: [api-checks]
+    services:
+      postgres:
+        # pgvector-capable PostgreSQL 16: plain postgres:16 has no `vector`
+        # extension, and migration 20260903120000_add_global_search_projection
+        # runs CREATE EXTENSION vector. Same PG major as compose (pg16).
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: aria_user
+          POSTGRES_PASSWORD: aria_password
+          POSTGRES_DB: aria_erp
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U aria_user -d aria_erp"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+      # Phase FINALIZE (CI hardening): disposable MinIO for the attachment
+      # lifecycle. The financial-check suite uploads real files through the
+      # real storage provider (no mocks, no skipped tests), so the gate needs
+      # real object storage. Same pinned image the project's compose uses.
+      # `command` (actions/runner#4276, GA 2026-03) is required because the
+      # image's default CMD only prints CLI help — verified locally — while
+      # compose starts it with the identical `server /data` argument.
+      minio:
+        image: minio/minio:RELEASE.2025-07-23T15-54-02Z
+        env:
+          MINIO_ROOT_USER: minioadmin
+          MINIO_ROOT_PASSWORD: minioadmin
+        ports:
+          - 9000:9000
+        command: server /data
+        options: >-
+          --health-cmd "curl -f http://localhost:9000/minio/health/live"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      CI: "true"
+      SKIP_PRISMA_VERSION_CHECK: "1"
+      # ESM flag for Jest against the ESM-only NestJS 12 packages (also covers
+      # the e2e global-setup's db:seed respawn).
+      NODE_OPTIONS: "--experimental-vm-modules"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Generate Prisma clients (all owners)
+        run: npm run prisma:generate --workspace=apps/api
+
+      # Create the eight owned databases. The GHA postgres service starts with
+      # only `aria_erp`; the per-owner databases must be created before
+      # migrations can target them.
+      - name: Create owned databases
+        run: |
+          for db in core_db cms_db correspondence_db hr_db commerce_db production_db finance_db observability_db; do
+            psql -h localhost -U aria_user -d aria_erp -c "SELECT 'CREATE DATABASE ${db} OWNER aria_user' WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = '${db}')" | grep -q 'CREATE DATABASE' && \
+              psql -h localhost -U aria_user -d aria_erp -c "CREATE DATABASE ${db} OWNER aria_user" || true
+          done
+        env:
+          PGPASSWORD: aria_password
+
+      # Load the CI-specific .env.ci (pointing at localhost:5432 instead of
+      # the compose proxy at 5544) and run all-owner migrations + seed.
+      - name: Run migrations (all owners)
+        run: npm run db:migrate --workspace=apps/api
+        env:
+          CORE_DATABASE_URL: postgresql://aria_user:aria_password@localhost:5432/core_db
+          CMS_DATABASE_URL: postgresql://aria_user:aria_password@localhost:5432/cms_db
+          CORRESPONDENCE_DATABASE_URL: postgresql://aria_user:aria_password@localhost:5432/correspondence_db
+          HR_DATABASE_URL: postgresql://aria_user:aria_password@localhost:5432/hr_db
+          COMMERCE_DATABASE_URL: postgresql://aria_user:aria_password@localhost:5432/commerce_db
+          PRODUCTION_DATABASE_URL: postgresql://aria_user:aria_password@localhost:5432/production_db
+          FINANCE_DATABASE_URL: postgresql://aria_user:aria_password@localhost:5432/finance_db
+          OBSERVABILITY_DATABASE_URL: postgresql://aria_user:aria_password@localhost:5432/observability_db
+
+      - name: Seed test data
+        run: npm run db:seed --workspace=apps/api
+        env:
+          CORE_DATABASE_URL: postgresql://aria_user:aria_password@localhost:5432/core_db
+          CMS_DATABASE_URL: postgresql://aria_user:aria_password@localhost:5432/cms_db
+          CORRESPONDENCE_DATABASE_URL: postgresql://aria_user:aria_password@localhost:5432/correspondence_db
+          HR_DATABASE_URL: postgresql://aria_user:aria_password@localhost:5432/hr_db
+          COMMERCE_DATABASE_URL: postgresql://aria_user:aria_password@localhost:5432/commerce_db
+          PRODUCTION_DATABASE_URL: postgresql://aria_user:aria_password@localhost:5432/production_db
+          FINANCE_DATABASE_URL: postgresql://aria_user:aria_password@localhost:5432/finance_db
+          OBSERVABILITY_DATABASE_URL: postgresql://aria_user:aria_password@localhost:5432/observability_db
+          # Stage 5.1 seed contract guard: only this CI harness may seed, and
+          # only against the E2E databases/hosts declared by this workflow.
+          E2E_SEED_OPT_IN: '1'
+          E2E_SEED_ALLOWED_HOSTS: localhost
+          E2E_SEED_ALLOWED_DBS: core_db,cms_db,correspondence_db,hr_db,commerce_db,production_db,finance_db,observability_db
+
+      # The E2E suite boots the real NestJS application (setup.ts), polls
+      # health/readiness, and drives the Financial Check Issuance lifecycle
+      # through real HTTP requests. The runtime .env.e2e is generated here from
+      # the step environment below (CI service containers only; no tracked file).
+      # Phase FINALIZE (CI hardening): MinIO readiness is asserted before the
+      # suite runs, mirroring the postgres/redis health checks above. The minio
+      # service's internal 9000 is published on the runner's 9000, so the API
+      # under test reaches it at localhost:9000 (the health endpoint proves it).
+      - name: Wait for MinIO readiness
+        run: |
+          for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+            if curl -fsS http://localhost:9000/minio/health/live >/dev/null 2>&1; then
+              echo "MinIO is ready (attempt $i)"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "MinIO failed to become ready" >&2
+          exit 1
+      - name: Run E2E suite
+        run: |
+          trap 'rm -f .env.e2e' EXIT
+          node -e "const fs=require('fs');const keys=['CORE_DATABASE_URL','CMS_DATABASE_URL','CORRESPONDENCE_DATABASE_URL','HR_DATABASE_URL','COMMERCE_DATABASE_URL','PRODUCTION_DATABASE_URL','FINANCE_DATABASE_URL','OBSERVABILITY_DATABASE_URL','REDIS_URL','JWT_SECRET','JWT_EXPIRATION_HOURS','JWT_REFRESH_SECRET','JWT_REFRESH_EXPIRATION_DAYS','API_BASE_URL','API_PORT','LOG_LEVEL','MINIO_HOST','MINIO_PORT','MINIO_BUCKET','MINIO_ACCESS_KEY','MINIO_SECRET_KEY','MINIO_REGION'];const missing=keys.filter(k=>!process.env[k]);if(missing.length){console.error('Missing required CI variables: '+missing.join(', '));process.exit(1);}fs.writeFileSync('.env.e2e',keys.map(k=>k+'='+process.env[k]).join('\n')+'\n',{mode:0o600});console.log('Generated .env.e2e with '+keys.length+' keys (values not printed)');"
+          npx jest --config ./jest-e2e.json --runInBand test/financial-check-issuance.e2e-spec.ts
+        working-directory: apps/api
+        env:
+          NODE_ENV: test
+          CI: "true"
+          CORE_DATABASE_URL: postgresql://aria_user:aria_password@localhost:5432/core_db
+          CMS_DATABASE_URL: postgresql://aria_user:aria_password@localhost:5432/cms_db
+          CORRESPONDENCE_DATABASE_URL: postgresql://aria_user:aria_password@localhost:5432/correspondence_db
+          HR_DATABASE_URL: postgresql://aria_user:aria_password@localhost:5432/hr_db
+          COMMERCE_DATABASE_URL: postgresql://aria_user:aria_password@localhost:5432/commerce_db
+          PRODUCTION_DATABASE_URL: postgresql://aria_user:aria_password@localhost:5432/production_db
+          FINANCE_DATABASE_URL: postgresql://aria_user:aria_password@localhost:5432/finance_db
+          OBSERVABILITY_DATABASE_URL: postgresql://aria_user:aria_password@localhost:5432/observability_db
+          REDIS_URL: redis://localhost:6379
+          JWT_SECRET: ci-test-secret-key-for-e2e
+          JWT_EXPIRATION_HOURS: "24"
+          JWT_REFRESH_SECRET: ci-test-refresh-secret-key
+          JWT_REFRESH_EXPIRATION_DAYS: "7"
+          API_BASE_URL: http://localhost:3001
+          API_PORT: "3001"
+          LOG_LEVEL: warn
+          # Phase FINALIZE (CI hardening): object storage for the attachment
+          # lifecycle. Disposable CI-only values; the provider dials
+          # MINIO_HOST/MINIO_PORT (not MINIO_ENDPOINT) and self-creates the
+          # bucket via ensureBucket, so no mc/bucket step is needed.
+          MINIO_HOST: localhost
+          MINIO_PORT: "9000"
+          MINIO_BUCKET: aria-erp
+          MINIO_ACCESS_KEY: minioadmin
+          MINIO_SECRET_KEY: minioadmin
+          MINIO_REGION: us-east-1
+          OBSERVABILITY_ENABLED: "true"
+          OBSERVABILITY_FLUSH_INTERVAL_MS: "250"
+          OBSERVABILITY_BATCH_SIZE: "50"
+          OBSERVABILITY_QUEUE_MAX: "1000"
+          OBSERVABILITY_WRITE_TIMEOUT_MS: "5000"
+          RATE_LIMIT_MAX_ATTEMPTS: "10000"
+          RATE_LIMIT_WINDOW_SECONDS: "900"
+          # Stage 5.1: the e2e global-setup re-runs db:seed; the seed guard
+          # needs the harness opt-ins in this step's environment too.
+          E2E_SEED_OPT_IN: '1'
+          E2E_SEED_ALLOWED_HOSTS: localhost
+          E2E_SEED_ALLOWED_DBS: core_db,cms_db,correspondence_db,hr_db,commerce_db,production_db,finance_db,observability_db

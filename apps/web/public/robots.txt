@@ -1,0 +1,9 @@
+User-agent: *
+Disallow: /api/
+Disallow: /admin/
+Disallow: /portal/
+Disallow: /partners-portal/
+Allow: /
+
+Sitemap: https://aria-erp.com/sitemap.xml
+Host: https://aria-erp.com

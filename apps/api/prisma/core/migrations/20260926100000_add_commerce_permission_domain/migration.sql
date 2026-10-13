@@ -1,0 +1,21 @@
+-- Phase C1 step J: register the COMMERCE domain member on PermissionDomain.
+--
+-- WHY THIS IS ITS OWN MIGRATION (and why the seed is a separate, later one):
+-- PostgreSQL 12+ allows `ALTER TYPE ... ADD VALUE` inside a transaction, but the
+-- new value CANNOT BE USED until the transaction that added it commits (SQLSTATE
+-- 55P04, "unsafe use of new value"). This repository has already paid for learning
+-- that once — the first version of Phase 50 put the ALTER and the permission INSERTs
+-- in ONE migration and failed on every deployment with 55P04 — which is why both
+-- 20260912120500_add_correspondence_permission_domain and
+-- 20260916100000_add_hr_permission_domain are standalone files, and why this one is
+-- too: the enum member is added HERE, committed by this migration, and consumed by
+-- the INSERTs in 20260926100100_seed_commerce_permission_grants.
+--
+-- The `COMMERCE` member itself is declared by C1 §10: Commerce-specific permissions
+-- live in Core's permission catalogue, and a business domain keeps its own domain tag
+-- rather than hiding under ADMIN — the same reasoning the CORRESPONDENCE comment
+-- records as the first business-domain member.
+--
+-- Idempotent: IF NOT EXISTS makes a re-run a no-op.
+
+ALTER TYPE "PermissionDomain" ADD VALUE IF NOT EXISTS 'COMMERCE';

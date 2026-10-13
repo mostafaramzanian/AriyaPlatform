@@ -1,0 +1,625 @@
+// Phase F1 — FINANCIAL FOUNDATION: the Financial datasource's own Prisma project.
+//
+// WHY THIS FILE EXISTS
+// --------------------
+// `Financial` owns `finance_db`, reached only through `FINANCE_DATABASE_URL`. This file
+// is that owner's independent Prisma project: independent datasource, independent
+// generator, independent schema, independent generated client target
+// (`src/generated/financial-client`) and independent migration history
+// (`prisma/financial/migrations/`).
+//
+// The sequence is the one `prisma/production/schema.prisma` records and the one
+// Commerce, HR, Correspondence and Production went through (ADR-0005 "Persistence source
+// of truth"): the datasource joins `runtime-datasources.ts` as a declared owner, the
+// schema and migrations land, the generated client lands, and the module's own Prisma
+// module/service binds `FINANCE_PRISMA_CLIENT` — which is what makes `finance_db`
+// reachable at all.
+//
+// NAMING NOTE (F1 decision): the physical database is `finance_db` (the phase brief's
+// explicit logical name, DoD §35), while the OWNER/datasource/env var follow the repo's
+// `<owner>_DATABASE_URL` convention: `FINANCE_DATABASE_URL`. Every other owner pairs its
+// env var with its database concept the same way (`PRODUCTION_DATABASE_URL` →
+// `production_db`).
+//
+// THE BOUNDARY THIS FILE DRAWS
+// ----------------------------
+// Financial owns its database and NOTHING else. In particular:
+//
+//   * There is NO cross-database foreign key. `tenantId`, `requesterUserId`,
+//     `projectManagerUserId`, `projectReference`, `orderReference` and
+//     `decidedByUserId` are PLAIN STRING columns holding OPAQUE values — PostgreSQL
+//     cannot express a FK across databases, and Financial must not try to: identity is
+//     reached through the platform user-directory contract, never through a join.
+//   * Financial does NOT duplicate authoritative state. No User, no Tenant, no Role, no
+//     Permission, no Project, no Purchase Order, no Bank, no Cheque account. The project
+//     and order references are opaque references, not second copies of another module's
+//     tables.
+//   * Commerce, Production, Core, HR and Correspondence Prisma clients are NEVER
+//     imported here, and this datasource block points at the Finance URL only. The
+//     architecture boundary spec and this module's own isolation suite assert all of it.
+//
+// WHAT THIS PROJECT MODELS TODAY
+// ------------------------------
+//   * Phase F1: `CheckRequest` (states 0/1/2/3/50) + `CheckAttachment` (section 2).
+//   * Phase CHECK-ISSUATION: the five STAGE tables — `CheckAllocation`,
+//     `CheckDocumentReview`, `CheckExecutiveApproval`, `CheckIssue`, `CheckDelivery` —
+//     and the `processKey` / `processVersion` pin on `CheckRequest`. The stage-3 amount
+//     and balance columns are SOURCE (MablagheCheck / MandeMojoodi, task 140-163); there
+//     is still NO budget, NO accounting journal and NO ledger.
+//   * STILL NOT MODELLED, permanently without new evidence: cheque-instrument identity
+//     (number, serial, bank, account, IBAN, Sayad, due date, signatory — Preflight §10
+//     is `NOT ESTABLISHED`), a `nextState` column (the routing hint belongs to the
+//     transition table, not the row), and any purchase/project table (`orderReference`
+//     and `projectReference` stay opaque strings; Preflight §18).
+//   * `CheckHistory` — the platform audit trail remains the history; no local clone.
+//   * STILL NO uniqueness rule beyond the tenant-first key: the source has none (no
+//     one-open-request-per-order rule — Preflight §6.2), and inventing one would be a
+//     business rule no source proved.
+
+generator client {
+  provider = "prisma-client-js"
+  output   = "../../src/generated/financial-client"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("FINANCE_DATABASE_URL")
+}
+
+// ============================================================================
+// CLOSED VOCABULARIES — the source's static lists, as enums
+// ============================================================================
+
+/// The source's `c_NoeaSodoorCheck` control, whose `Lookup_StaticValues` was exactly
+/// `خرید;تنخواه;حقوق`. A closed enum because the legacy column was a closed list: a
+/// free string would let a value the source could never produce be stored.
+///
+/// WHY ENGLISH CODE POINTS WITH PERSIAN LABELS: the same rule `BomStatus` and
+/// `ManagerOpinion` state — the wire carries a stable domain code and the screen
+/// renders the source's own Persian word (`خرید` / `تنخواه` / `حقوق`), so no response
+/// ever carries a display string and no translation can rename a stored fact.
+enum CheckIssueType {
+  /// خرید — a purchase cheque.
+  PURCHASE
+  /// تنخواه — petty cash.
+  PETTY_CASH
+  /// حقوق — salary.
+  SALARY
+}
+
+/// The source's `c_NoaeKharid` control: `پروژه ای;غیر پروژه ای`. NULLABLE, because the
+/// source hides and clears it for `حقوق` (V7): "no purchase type" is a real state of a
+/// salary request, not an oversight.
+enum CheckPurchaseType {
+  /// پروژه ای — project-related; requires project reference + project manager (V3/V5).
+  PROJECT
+  /// غیر پروژه ای — non-project.
+  NON_PROJECT
+}
+
+/// The source's manager decision `c_B_NazarModir`: `بله;خیر;نیازمند اصلاح است`
+/// (Preflight §8.2 — the control's value list is the contract; the task script's
+/// `تایید` comparison is a legacy inconsistency and NOT the vocabulary).
+///
+/// NULL until the manager acts. The Persian labels live beside the domain vocabulary
+/// in `check-request-status.ts`, never in the schema.
+enum ManagerDecision {
+  /// بله — approve; the row lands in state 3 (allocation).
+  APPROVE
+  /// خیر — reject; the row lands in state 50 (terminal).
+  REJECT
+  /// نیازمند اصلاح است — request correction; the row returns to state 1.
+  REQUEST_CORRECTION
+}
+
+/// The source's `c_NazarDarkhastKonande`: `تایید و ادامه;لغو کامل گردش درخواست`
+/// (Preflight §8.2). Stored as the requester's opinion; the CANCEL branch's ACTION
+/// (requester-initiated termination → 50) is `U12` — NOT ESTABLISHED in F1, so the
+/// value is recordable but drives no transition of its own.
+enum RequesterOpinion {
+  /// تایید و ادامه — the source's default.
+  CONTINUE
+  /// لغو کامل گردش درخواست — cancel the whole flow (action deferred, U12).
+  CANCEL
+}
+
+/// The source's `c_NoeaSanad` document list (Preflight §9.2), verbatim — the eleven
+/// values the attachment upload grid offered for request-stage documents. The source
+/// separated some values with `; ` and some with `;`; trimming separates no value from
+/// its own text.
+///
+/// REQUIRED ON UPLOAD — the source's `pf.UploadValues` cancelled any upload whose
+/// `c_NoeaSanad` was empty with «نوع سند انتخاب گردد.». That is a metadata requirement
+/// on the ACT of attaching, NOT a requirement that any document exist: Preflight §9.3
+/// established that no attachment is blocking for any state transition in F1.
+enum CheckDocumentType {
+  /// دستور پرداخت
+  DASTOOR_PARDAKHT
+  /// پیش فاکتور
+  PISH_FACTOR
+  /// گواهی ارزش افزوده
+  GOVAHI_EZAFAT
+  /// کارت ملی تامین کننده
+  KART_MELLI_TAMIN_KONANDE
+  /// صورتجلسه
+  SOORATGHALME
+  /// صورتجلسه کمیسیون معاملات
+  SOORATGHALME_KOMISION
+  /// صورتجلسه فاز بندی قرارداد
+  SOORATGHALME_FAZ_BANDI
+  /// قرارداد
+  GARARDAD
+  /// فاکتور مهردار
+  FACTOOR_MAHAR
+  /// ترجمه فاکتور انگلیسی
+  ENGLISH_FACTOR_TRANSLATION
+  /// سایر
+  OTHER
+}
+
+// ============================================================================
+// CheckRequest — the aggregate root (F1: states 0 / 1 / 2 / 3-landing / 50)
+// ============================================================================
+
+/// «درخواست صدور چک» — the check request, exactly as far as F1 goes.
+///
+/// WHY `status` IS AN INT AND NOT A STRING ENUM
+/// ---------------------------------------------
+/// The source's stage ordinal IS a number (`c_status` / `cr_status`: `0,1,2,…,7,50`),
+/// and the F1 phase brief names every state by that ordinal (State 0 / 1 / 2 / 50, the
+/// approve landing on 3). Storing the ordinal keeps the row, the API, the audit trail
+/// and the source reading as ONE vocabulary. The closed set is enforced where every
+/// lifecycle rule lives — `check-request-status.ts` — because Prisma (v5) cannot
+/// express a CHECK constraint, and a hand-written CHECK inside the migration would be
+/// drift the next `migrate diff` reports. The column is never client-writable (the
+/// DTO refuses a `status`), and the repository only ever writes one of the five
+/// ordinals through the transition helpers. The NAMES for each ordinal (`DRAFT`,
+/// `SUBMITTED`, `MANAGER_REVIEW`, `APPROVED`, `TERMINATED`) live in
+/// `check-request-status.ts` beside the transition table.
+///
+/// THE STATES F1 IMPLEMENTS — and nothing else:
+///   0 DRAFT           — requester composing; editable.
+///   1 SUBMITTED       — submitted / returned-for-correction; requester re-owns it
+///                       (editable) and it re-enters review through `submit`.
+///   2 MANAGER_REVIEW  — awaiting the manager's decision; only decision acts apply.
+///   3 APPROVED        — the approve landing. A DEFERRED downstream marker in F1:
+///                       allocation / document review / issuance logic does NOT exist.
+///   50 TERMINATED     — terminal: manager «خیر» (and, in later phases, the other
+///                       termination reasons the source shares).
+///
+/// States 4..7 are deliberately NOT representable: no column, no route, no transition
+/// writes them, and the domain transition table refuses them.
+model CheckRequest {
+  id       String @id @default(uuid()) @db.Uuid
+  /// TEXT, like every `tenantId` in this repository. Populated ONLY from the resolved
+  /// actor; it is the isolation key and appears FIRST on the unique key and indexes.
+  tenantId String @map("tenant_id") @db.Text
+
+  /// SERVER-GENERATED title (`c_Title` is `IsCalculated` + read-only in the source).
+  /// Built from the row's own type facts — see `buildCheckRequestTitle`. The client
+  /// cannot state one (the DTO has no `title`, so a wire `title` is refused).
+  /// The source's project branch appends the project NAME; F1 cannot (no Project
+  /// contract exists — Preflight §18), so that suffix is omitted rather than faked.
+  title String @db.VarChar(200)
+
+  /// `c_NoeaSodoorCheck` — required at every transition out of draft (V1).
+  checkIssueType CheckIssueType @map("check_issue_type")
+
+  /// `c_NoaeKharid` — NULL for salary (cleared, V7) and before an explicit choice.
+  /// For خرید it is required by the source's save action (V2); for تنخواه the source
+  /// does NOT require it, but when it is `PROJECT` the project rules apply (V3/V5).
+  purchaseType CheckPurchaseType? @map("purchase_type")
+
+  /// `c_IdShomareSefaresh` — OPAQUE order reference. Required for خرید (V4), cleared
+  /// for تنخواه and حقوق (V7). NEVER resolved against Commerce in F1: no adapter, no
+  /// network call, no mock (Future Purchase contract, Preflight §18.1).
+  orderReference String? @map("order_reference") @db.VarChar(128)
+
+  /// The selected «لیست پروژه ها» row — OPAQUE. Required when `purchaseType =
+  /// PROJECT` (V3). Never resolved to a project NAME (no Project contract exists).
+  projectReference String? @map("project_reference") @db.VarChar(128)
+
+  /// The selected project manager (`c_ModireProject` → `c_UserModirProject`), an
+  /// OPAQUE platform user id. Required when `purchaseType = PROJECT` (V5) and checked
+  /// for tenant membership before it is stored. It is a ROUTING REFERENCE, not an
+  /// authorization snapshot: F1's decision authority is the `financial.check.approve`
+  /// permission plus the self-approval rule (the legacy hard-coded person names and
+  /// title-derived authority must not be reproduced — Preflight §19, U3).
+  projectManagerUserId String? @map("project_manager_user_id") @db.Text
+
+  /// `c_DarkhastKonande` — FORCED from the authenticated actor on create
+  /// (`requesterUserId = actor`, never a wire field), and never writable afterwards:
+  /// the DTO has no such field, so a forged `requesterUserId` is refused at the pipe.
+  requesterUserId String @map("requester_user_id") @db.Text
+
+  /// `c_TarikhDarkhast` — SERVER-GENERATED current date; not an input (the source
+  /// defaults it to today and offers no editor). An instant, stored timestamptz,
+  /// following the repo's `new Date()` convention.
+  requestDate DateTime @default(now()) @map("request_date") @db.Timestamptz(6)
+
+  /// `c_NazarDarkhastKonande` — the requester's opinion, defaulting to the source's
+  /// «تایید و ادامه». Editable while the requester owns the row (states 0 and 1).
+  /// The CANCEL value records an opinion; its ACTION is U12 and deferred in F1.
+  requesterOpinion RequesterOpinion @default(CONTINUE) @map("requester_opinion")
+
+  /// The stage ordinal — see the model header for the closed set {0..8, 50},
+  /// enforced by the domain transition table (the column is never a wire input).
+  status Int @default(0)
+
+  /// The process this row is PINNED to (brief §5). Written at create from the service's
+  /// own constants — never a wire field — and never rewritten: the wizard,
+  /// available-actions and every transition resolve the PINNED version's definition, so
+  /// publishing a new version cannot change what a running request means. The default
+  /// keeps F1-era rows (none modelled v0) valid without a backfill guess.
+  processKey String @default("financial.check-issuance") @map("process_key") @db.VarChar(64)
+  processVersion Int @default(1) @map("process_version")
+
+  /// `c_B_NazarModir` — NULL until the manager acts (state 2 only).
+  managerDecision ManagerDecision? @map("manager_decision")
+
+  /// `c_TozihatModir` — the manager's comment. OPTIONAL: the source does not enforce
+  /// one (Preflight §8.1 "comment not enforced in source").
+  managerComment String? @map("manager_comment") @db.VarChar(2000)
+
+  /// When the row entered manager review (state 1 → 2), first submission or after a
+  /// correction: the evidence that a decision was made against THIS submission.
+  submittedAt DateTime? @map("submitted_at") @db.Timestamptz(6)
+
+  /// When the manager acted.
+  decidedAt DateTime? @map("decided_at") @db.Timestamptz(6)
+
+  /// WHO acted on the decision — an opaque platform id, beside `managerDecision` for
+  /// the same reason BOM keeps `decidedByUserId` beside `managerOpinion`.
+  decidedByUserId String? @map("decided_by_user_id") @db.Text
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  /// The request-stage attachments (source «پیوست ها», `Section = 2`). The relation
+  /// exists so the child's FK can target the COMPOSITE key `(tenantId, id)` below —
+  /// making "an attachment can never point at another tenant's check request" a
+  /// database fact rather than a service-layer promise. NOT cascade: attachment
+  /// evidence must not disappear with a stray delete.
+  attachments CheckAttachment[]
+
+  /// The five stage records (Phase CHECK-ISSUATION). Each is OPTIONAL and ONE-TO-ONE:
+  /// a stage row exists only after its stage's action ran, and its composite unique
+  /// `(tenantId, checkRequestId)` is what makes "one allocation per request" a database
+  /// fact. `onDelete: Restrict` for the same reason the attachment states: stage
+  /// evidence must not disappear with a stray delete.
+  allocation CheckAllocation?
+  documentReview CheckDocumentReview?
+  executiveApproval CheckExecutiveApproval?
+  issue CheckIssue?
+  delivery CheckDelivery?
+
+  /// The tenant-first key shape every owned table in this repository carries; also the
+  /// composite FK target for `CheckAttachment`.
+  @@unique([tenantId, id], map: "CheckRequest_tenantId_id_key")
+  /// "this tenant's requests, by lifecycle, most recently touched first" — the
+  /// register read, and the manager's review read. Tenant-first, never status alone.
+  @@index([tenantId, status, updatedAt], map: "CheckRequest_tenantId_status_updatedAt_idx")
+  /// "the requests THIS person raised" — the requester's own register read.
+  @@index([tenantId, requesterUserId, status], map: "CheckRequest_tenantId_requesterUserId_status_idx")
+  @@map("CheckRequest")
+}
+
+// ============================================================================
+// CheckAttachment — request-stage documents (source «پیوست ها», Section = 02)
+// ============================================================================
+
+/// ONE row per uploaded document, keyed to its request exactly like the source list
+/// (`IdSodoorCheck` + `Section`).
+///
+/// OWNED BY FINANCIAL. Metadata lives here; the BYTES live behind the platform's
+/// `IStorageProvider` (MinIO) under an opaque `storageKey`. There is deliberately NO
+/// cross-context storage record: Financial's row is the only thing that names the
+/// object, and the key never leaves the server (downloads resolve to a short-lived URL
+/// through the storage port).
+///
+/// PHASE CHECK-ISSUATION EXTENDS THE SECTION VOCABULARY TO ITS FULL SOURCE SET:
+///   * section 2 — request documents (F1), with the eleven-value type picker;
+///   * section 6 — the cheque image, managed in state 6;
+///   * section 7 — the delivery receipt, managed in state 7.
+/// The section↔state mapping is CONFIGURATION (`check-issuance.definition.ts`), not a
+/// rule here: the column stores the source's ordinal and nothing branches on it in
+/// persistence.
+///
+/// `documentType` IS NULLABLE, and that is the source's own shape: the «نوع سند» gate
+/// existed on the request grid (section 2) only — the section-6/7 grids carried no type
+/// picker, so requiring a type there would invent a vocabulary. The upload SERVICE still
+/// requires a type wherever the section's configuration declares one.
+model CheckAttachment {
+  id       String @id @default(uuid()) @db.Uuid
+  /// TEXT; also the leading FK column of the composite constraint below.
+  tenantId String @map("tenant_id") @db.Text
+
+  /// The request this document belongs to. With `tenantId` it references
+  /// `CheckRequest(tenant_id, id)` INSIDE `finance_db` — a real, same-database FK.
+  checkRequestId String @map("check_request_id") @db.Uuid
+
+  /// THE SAME-DATABASE, TENANT-COMPOSITE FK. `onDelete: Restrict`: F1 has no request
+  /// delete route, and if one ever arrived the database would refuse to orphan
+  /// evidence rather than silently removing it.
+  checkRequest CheckRequest @relation(fields: [tenantId, checkRequestId], references: [tenantId, id], onDelete: Restrict, onUpdate: Cascade)
+
+  /// The source's `Section` value: 2 = request documents, 6 = cheque image, 7 = delivery
+  /// receipt — the closed set the process configuration declares; the SERVICE refuses a
+  /// section no step manages.
+  section Int @default(2)
+
+  /// The source's `NoeaSanad` — required by the UPLOAD act wherever the section's
+  /// configuration carries a type vocabulary (section 2's eleven values), and NULL for
+  /// sections whose grid had no picker (6/7). Nullability is the schema's statement of
+  /// that asymmetry; the service applies it per section.
+  documentType CheckDocumentType? @map("document_type")
+
+  /// The source's attachment `Tozihat` — optional free text.
+  description String? @db.VarChar(1000)
+
+  /// Opaque object key in the platform's storage. NEVER leaves the server; downloads
+  /// go through `IStorageProvider.getUrl` with server-held name/type.
+  storageKey String @map("storage_key") @db.VarChar(512)
+
+  /// Sanitized file name, held server-side so a signed URL's headers cannot be
+  /// steered by a requester (same rule as 49F/50).
+  fileName String @map("file_name") @db.VarChar(255)
+
+  /// The MIME type recorded at upload; part of the signed-URL options.
+  mimeType String @map("mime_type") @db.VarChar(128)
+
+  /// Byte size as uploaded — the row's own copy of the cap check (10 MiB).
+  size Int
+
+  /// The uploader — an opaque platform user id of THIS tenant.
+  createdBy String @map("created_by") @db.Text
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  /// Tenant-first key shape, same as every owned table.
+  @@unique([tenantId, id], map: "CheckAttachment_tenantId_id_key")
+  /// "the documents on THIS request, oldest first" — the list read the detail screen
+  /// performs; tenant-first so a cross-tenant scan is not expressible.
+  @@index([tenantId, checkRequestId, createdAt], map: "CheckAttachment_tenantId_checkRequestId_createdAt_idx")
+  @@map("CheckAttachment")
+}
+
+// ============================================================================
+// The five STAGE records (Phase CHECK-ISSUATION)
+//
+// Each table holds ONE row per request per stage — created by the single conditional
+// transition that ENTERS the next state (repository pattern: decision + stage data +
+// status in one transaction), with a composite `(tenantId, checkRequestId)` unique and
+// a same-database, tenant-composite FK. History of REPEATED stages (a correction that
+// sends the row back through allocation or document review) lives in the platform audit
+// trail, which remains the ONE history (Preflight §12.3); these rows are the CURRENT
+// stage record, rewritten on re-entry.
+// ============================================================================
+
+/// The source's `BarasiAsnad` decision (task 165-181): `تایید;اصلاح`. NO reject exists
+/// in the source's review stage, so none is invented here.
+enum DocumentReviewDecision {
+  /// تایید — the documents are accepted; the row advances to state 5.
+  APPROVE
+  /// اصلاح — correction requested; the row returns to state 1 (`StateNext := 1`).
+  CORRECTION
+}
+
+/// The source's `Riyast` decision (task 183-203), MINUS its third value: `تایید;رد`.
+/// The «نیازمند اصلاح» branch is DEFERRED / SOURCE-CONFLICT — the task script writes
+/// `StateNext = 6` while both forms' display rules imply state 3 — so the enum has no
+/// member for it and no transition can record it (brief §20, "no guess").
+enum ExecutiveDecision {
+  /// تایید — approved; the row advances to state 6.
+  APPROVE
+  /// رد — rejected; the row lands in state 50 (terminal).
+  REJECT
+}
+
+/// STAGE 3 — «صدور فرم تخصیص». The six source fields, under their source names, with
+/// the source's own blocking rules (task 140-163): `MahaleTakhsis` and `MablagheCheck`
+/// are required, and `MablagheCheck > MandeMojoodi` is refused when the balance parses.
+/// The source's static `Takhsis = "تایید"` marker is NOT a column: the 3 → 4 transition
+/// IS the confirmation (the same reasoning the schema header gives for having no
+/// `nextState` column — a stored marker nobody branches on).
+model CheckAllocation {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @map("tenant_id") @db.Text
+
+  checkRequestId String @map("check_request_id") @db.Uuid
+  checkRequest   CheckRequest @relation(fields: [tenantId, checkRequestId], references: [tenantId, id], onDelete: Restrict, onUpdate: Cascade)
+
+  /// `MahaleTakhsis` — required («محل تخصیص نمی تواند خالی باشد.»).
+  allocationPlace String @map("allocation_place") @db.VarChar(500)
+
+  /// `MandeMojoodi` — optional; the source compared against it only when parseable.
+  /// `Decimal(18, 0)` follows the preflight's §15 sketch (ریال, no fractions).
+  balance Decimal? @map("balance") @db.Decimal(18, 0)
+
+  /// `TarikhCheck` — optional date, as the source left it.
+  checkDate DateTime? @map("check_date") @db.Date
+
+  /// `SharhCheck` — optional free text.
+  checkDescription String? @map("check_description") @db.VarChar(2000)
+
+  /// `MablagheCheck` — required («مبلغ چک نمی تواند خالی باشد.»), and the left side of
+  /// the source's only money rule («مبلغ چک از مانده موجودی نمی تواند بیشتر باشد.»).
+  checkAmount Decimal @map("check_amount") @db.Decimal(18, 0)
+
+  /// `DarVaghe` — free text, as the source stored it (no payee table exists anywhere).
+  payableTo String? @map("payable_to") @db.VarChar(500)
+
+  /// WHO recorded it — an opaque platform user id (NULL for a machine actor, which the
+  /// audit envelope also permits). The DECISIONS' fuller history stays in the trail.
+  recordedByUserId String? @map("recorded_by_user_id") @db.Text
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@unique([tenantId, id], map: "CheckAllocation_tenantId_id_key")
+  /// ONE allocation per request — the database fact behind "re-entry rewrites".
+  @@unique([tenantId, checkRequestId], map: "CheckAllocation_tenantId_checkRequestId_key")
+  @@map("CheckAllocation")
+}
+
+/// STAGE 4 — «بررسی اسناد». The reviewer's current decision; re-entry (4 → 1 → … → 4)
+/// rewrites the row and the previous decisions stay in the audit trail.
+model CheckDocumentReview {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @map("tenant_id") @db.Text
+
+  checkRequestId String @map("check_request_id") @db.Uuid
+  checkRequest   CheckRequest @relation(fields: [tenantId, checkRequestId], references: [tenantId, id], onDelete: Restrict, onUpdate: Cascade)
+
+  /// `BarasiAsnad` — required by the source's stage script («نظر اسناد مشخص نشده است»).
+  decision DocumentReviewDecision
+
+  /// `Tozihat` — optional free text ("comment not enforced in source", §8.1).
+  comment String? @db.VarChar(2000)
+
+  recordedByUserId String? @map("recorded_by_user_id") @db.Text
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@unique([tenantId, id], map: "CheckDocumentReview_tenantId_id_key")
+  @@unique([tenantId, checkRequestId], map: "CheckDocumentReview_tenantId_checkRequestId_key")
+  @@map("CheckDocumentReview")
+}
+
+/// STAGE 5 — «تایید ریاست». «نیازمند اصلاح» has no member (see `ExecutiveDecision`).
+model CheckExecutiveApproval {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @map("tenant_id") @db.Text
+
+  checkRequestId String @map("check_request_id") @db.Uuid
+  checkRequest   CheckRequest @relation(fields: [tenantId, checkRequestId], references: [tenantId, id], onDelete: Restrict, onUpdate: Cascade)
+
+  /// `Riyast` — required by the source's stage script («نظر ریاست مشخص نشده است»).
+  decision ExecutiveDecision
+
+  /// `TozihatRiyast` (`Tozihat0` in the control id) — optional free text.
+  comment String? @db.VarChar(2000)
+
+  recordedByUserId String? @map("recorded_by_user_id") @db.Text
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@unique([tenantId, id], map: "CheckExecutiveApproval_tenantId_id_key")
+  @@unique([tenantId, checkRequestId], map: "CheckExecutiveApproval_tenantId_checkRequestId_key")
+  @@map("CheckExecutiveApproval")
+}
+
+/// STAGE 6 — «صدور چک کارشناس مالی». The ONLY issuance facts the source proves: the
+/// cheque IMAGE is an attachment row (section 6 — not duplicated here) and the
+/// `TaedCheckSaderShode` confirmation. `issuedCheckConfirmed` records the source's
+/// checkbox as written; the 6 → 7 transition cannot happen without it being true, which
+/// is why the row's existence and `true` coincide — the boolean is kept because the
+/// SOURCE had it, not because variation is expected.
+model CheckIssue {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @map("tenant_id") @db.Text
+
+  checkRequestId String @map("check_request_id") @db.Uuid
+  checkRequest   CheckRequest @relation(fields: [tenantId, checkRequestId], references: [tenantId, id], onDelete: Restrict, onUpdate: Cascade)
+
+  /// `TaedCheckSaderShode` — the source's confirmation checkbox («تایید»).
+  issuedCheckConfirmed Boolean @map("issued_check_confirmed")
+
+  recordedByUserId String? @map("recorded_by_user_id") @db.Text
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@unique([tenantId, id], map: "CheckIssue_tenantId_id_key")
+  @@unique([tenantId, checkRequestId], map: "CheckIssue_tenantId_checkRequestId_key")
+  @@map("CheckIssue")
+}
+
+// ============================================================================
+// AuditOutbox — transactional outbox for durable audit event delivery
+// ============================================================================
+
+/// Phase B2 — AUDIT DURABILITY: the transactional outbox for compliance-critical
+/// audit events.
+///
+/// WHY THIS TABLE EXISTS IN `finance_db`
+/// ------------------------------------
+/// Financial mutations write to `finance_db` through FinancialPrismaService; audit
+/// events must reach `core_db."AuditLog"` through `AUDIT_PORT`. These are TWO
+/// databases, so a cross-database atomic transaction is impossible. Without this
+/// table, a business mutation that succeeds and an audit write that fails leaves
+/// the trail incomplete — the event is simply lost, because the gateway swallows
+/// the error (by design: a trail write must not fail the business response).
+///
+/// The outbox makes the audit write DURABLE: the outbox row is written in the
+/// SAME transaction as the business state mutation, so they commit or roll back
+/// together. A relay service then reads pending outbox rows and writes them
+/// through `AUDIT_PORT`. Once the platform confirms `recorded` or `duplicate`,
+/// the outbox row is deleted. A `conflict` is logged as an alarm and kept.
+///
+/// IDEMPOTENCY: the `auditId` is generated by the caller and stored here; the
+/// platform's `PlatformAuditService` already handles duplicate delivery (§14),
+/// so a relay retry is safe.
+///
+/// THE PATTERN IS CONTEXT-LOCAL. Each bounded context that needs durable audit
+/// adds its own `AuditOutbox` to its own schema. There is no shared outbox table
+/// and no cross-database outbox: that would reintroduce the coupling this table
+/// removes.
+model AuditOutbox {
+  id        String   @id @default(uuid()) @db.Uuid
+  tenantId  String   @map("tenant_id") @db.Text
+
+  /// The producer-owned event identity, matching `AuditEventInput.auditId`.
+  /// Used by the relay to detect duplicates through the platform's idempotency.
+  auditId   String   @map("audit_id") @db.VarChar(64)
+
+  /// The full event payload, serialised as JSON. The relay deserialises it
+  /// into an `AuditEventInput` and passes it through `AUDIT_PORT.record()`.
+  payload   Json
+
+  /// Relay attempts so far. The relay increments this on each failed attempt
+  /// and backs off exponentially. A row whose attempts exceed a threshold is
+  /// logged as an alarm but NOT silently discarded.
+  attempts  Int      @default(0)
+
+  /// When the next relay attempt is allowed. Defaults to now (immediate).
+  nextAt    DateTime @default(now()) @map("next_at") @db.Timestamptz(6)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@unique([auditId], map: "AuditOutbox_auditId_key")
+  @@index([nextAt], map: "AuditOutbox_nextAt_idx")
+  @@index([tenantId], map: "AuditOutbox_tenantId_idx")
+  @@map("AuditOutbox")
+}
+
+/// STAGE 7 — «دریافت رسید تحویل». The receipt IMAGE is an attachment row (section 7);
+/// `deliveryCompleted` records `KhatemeSodoorCheck` («خاتمه صدور چک»), the source's
+/// only completion fact. No deliveredTo / deliveryDate / signature: the source has none
+/// (Preflight §10), and inventing them would fabricate delivery evidence.
+model CheckDelivery {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @map("tenant_id") @db.Text
+
+  checkRequestId String @map("check_request_id") @db.Uuid
+  checkRequest   CheckRequest @relation(fields: [tenantId, checkRequestId], references: [tenantId, id], onDelete: Restrict, onUpdate: Cascade)
+
+  /// `KhatemeSodoorCheck` — the source's completion checkbox.
+  deliveryCompleted Boolean @map("delivery_completed")
+
+  recordedByUserId String? @map("recorded_by_user_id") @db.Text
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@unique([tenantId, id], map: "CheckDelivery_tenantId_id_key")
+  @@unique([tenantId, checkRequestId], map: "CheckDelivery_tenantId_checkRequestId_key")
+  @@map("CheckDelivery")
+}
+
+
+
+
