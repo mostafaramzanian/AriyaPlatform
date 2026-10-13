@@ -135,18 +135,19 @@ jobs:
       # Phase FINALIZE (CI hardening): disposable MinIO for the attachment
       # lifecycle. The financial-check suite uploads real files through the
       # real storage provider (no mocks, no skipped tests), so the gate needs
-      # real object storage. Same pinned image the project's compose uses.
-      # `command` (actions/runner#4276, GA 2026-03) is required because the
-      # image's default CMD only prints CLI help — verified locally — while
-      # compose starts it with the identical `server /data` argument.
+      # real object storage. The upstream `minio/minio` Docker Hub repository
+      # and `quay.io/minio/minio` both deny anonymous pulls; this is the same
+      # upstream MinIO release 2025-07-23T15-54-02Z packaged by Bitnami Legacy
+      # (verified: anonymous pull + `minio --version` + live health probe).
+      # Digest-pinned; no `command` — the Bitnami entrypoint starts the server
+      # itself (`server /data` fails on its non-writable default backend dir).
       minio:
-        image: minio/minio:RELEASE.2025-07-23T15-54-02Z
+        image: bitnamilegacy/minio:2025.7.23@sha256:8935e75fa5d11295c17171e4aa49efe390a1193cd7f12e4d21b92af9ffef09d7
         env:
           MINIO_ROOT_USER: minioadmin
           MINIO_ROOT_PASSWORD: minioadmin
         ports:
           - 9000:9000
-        command: server /data
         options: >-
           --health-cmd "curl -f http://localhost:9000/minio/health/live"
           --health-interval 5s
