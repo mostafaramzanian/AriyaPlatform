@@ -161,6 +161,31 @@ export const COMMERCE_AUDIT_RESOURCE = {
    * same row would split one document's trail in two.
    */
   PURCHASE_COMPLETION_POLICY_VERSION: 'commerce.purchase_completion_policy_version',
+  /**
+   * PHASE GAP-6: one price quotation (`PriceQuotation`) — recording a version and
+   * deciding it. Its own resource because each version is its own row of price
+   * evidence with its own confirmation act: "who confirmed THIS price, when, with
+   * what comment" must be answerable without filtering document acts, and the
+   * decide act addresses the quotation row, not the document.
+   */
+  PRICE_QUOTATION: 'commerce.price_quotation',
+  /**
+   * One supplier directory row (`Supplier`) — creating and updating it. Its own
+   * resource because the supplier is a reusable master register: "who created
+   * this seller, who changed its banking details" must be answerable without
+   * filtering document acts, and the act addresses the supplier row, not any
+   * purchase. Reads are not audited (the module's read rule).
+   */
+  SUPPLIER: 'commerce.supplier',
+  /**
+   * A payment-instruction plan (`PaymentPlan`, دستور پرداخت / رژیم پرداخت) —
+   * a DECISION-bearing row distinct from the append-only `PaymentRecord`
+   * events it orders: creating, approving, superseding, cancelling and
+   * executing a stage are each auditable acts against the plan's own
+   * `resource_id`, while the money event itself stays audited as
+   * `PAYMENT_RECORD` through the payment slice's own trail.
+   */
+  PAYMENT_PLAN: 'commerce.payment_plan',
 } as const;
 
 /**

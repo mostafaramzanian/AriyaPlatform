@@ -172,7 +172,10 @@ export class ReceivingHistoryRepository {
     return unwrapCommerceTransaction(tx).purchaseLine.findMany({
       where: { tenantId, purchaseDocumentId },
       orderBy: [{ lineNumber: 'asc' as const }],
-      select: { id: true, lineNumber: true, quantity: true },
+      // `itemReference` and `unit` ride the same read for Phase W2-B's
+      // posting plan: a stocked line's SKU and unit label are the facts the
+      // `InventoryPosting` row is planned from — read under the same lock.
+      select: { id: true, lineNumber: true, quantity: true, itemReference: true, unit: true },
     });
   }
 

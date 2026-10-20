@@ -122,6 +122,21 @@ const baseSchema = z.object({
   // Required by the combined runtime (AppModule composes `FinancialModule`); Core-only,
   // CMS-only and future-hr mark it `not-used` and never open this connection.
   FINANCE_DATABASE_URL: z.string().optional(),
+
+  // Inventory database (Phase W1 — WAREHOUSE / INVENTORY FOUNDATION; required by
+  // the combined runtime). Migrate with `npm run prisma:migrate:inventory`.
+  //
+  // Inventory / انبارداری owns this database (`inventory_db`), its Prisma project
+  // (prisma/inventory/schema.prisma), its migration history and its generated
+  // client. Optional at the PLATFORM level, exactly like every other module
+  // datasource — a process that does not enable Inventory (Core-only, CMS-only)
+  // must still boot.
+  //
+  // INVENTORY_DATABASE_URL MUST NOT POINT AT core_db, commerce_db, finance_db or
+  // any other owner's database: the stock ledger has a lifecycle independent of
+  // procurement and of finance, and sharing another owner's database would make
+  // this module's "no other owner's Prisma client" boundary check meaningless.
+  INVENTORY_DATABASE_URL: z.string().optional(),
   CMS_PORT: z.string().optional(),
   OBSERVABILITY_DATABASE_URL: z.string().optional(),
 
@@ -131,7 +146,7 @@ const baseSchema = z.object({
   JWT_SECRET: secretSchema,
   JWT_REFRESH_SECRET: secretSchema,
   JWT_EXPIRATION: z.string().default('900'),
-  JWT_REFRESH_EXPIRATION: z.string().default('604800'),
+  JWT_REFRESH_EXPIRATION: z.string().default('32400'),
 
   // ---------------------------------------------------------------------------
   // Phase 51-HR-ARCH-3A: the token contract (ADR-0006 §B/C).
@@ -161,6 +176,13 @@ const baseSchema = z.object({
   JWT_ASYMMETRIC_PRIVATE_KEY: z.preprocess(emptyToUndefined, z.string()).optional(),
   JWT_ASYMMETRIC_ACCESS_TTL_SECONDS: optionalPositiveInt(
     'JWT_ASYMMETRIC_ACCESS_TTL_SECONDS must be a positive whole number of seconds',
+  ),
+  // GAP-6 follow-up (cash/non-cash routing): the deployment's cash ceiling in تومان —
+  // a CONFIRMED quotation total at or below it classifies as CASH, above it as NON_CASH.
+  // Optional; the Commerce quotation service falls back to the documented provisional
+  // default (30,000,000) and reclassifies reads only — nothing stored is rewritten.
+  PURCHASE_CASH_MAX_AMOUNT: optionalPositiveInt(
+    'PURCHASE_CASH_MAX_AMOUNT must be a positive whole number (تومان)',
   ),
   // Phase 52-ARCH-3C: the signing KEY SET and the key that signs. `JWT_SIGNING_KEYS` is a JSON
   // array of `{ kid, publicKey?, privateKey?, activatedAt?, retireAt? }` entries, parsed,

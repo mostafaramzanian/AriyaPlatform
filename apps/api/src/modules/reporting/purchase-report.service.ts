@@ -87,6 +87,41 @@ export class PurchaseReportService {
     return renderReportExport(toPurchaseReportExportDocument(result, query), format);
   }
 
+  /**
+   * PHASE W2-C — the pending-aging report («گزارش تأخیر درخواست‌های خرید در
+   * جریان»): one delegated read over the tenant's in-circulation documents.
+   * The aging origin, buckets and `generatedAt` are computed READER-SIDE on
+   * Commerce's own rows; this layer adds only the tenant scope and the page
+   * window, exactly as `list` does.
+   */
+  async listPendingAging(
+    actor: ReportingActor,
+    query: PurchaseReportTimelineQueryDto
+  ) {
+    if (!actor.tenantId) {
+      throw new ForbiddenException(
+        'Reporting requires a tenant context; this request was not resolved to a tenant.'
+      );
+    }
+    return this.reader.listPendingAging({ tenantId: actor.tenantId }, query);
+  }
+
+  /**
+   * PHASE W2-C — the committed-cost report («بهای تمام‌شده بر اساس مرکز
+   * هزینه»): committed vs paid vs outstanding per cost center and currency, all
+   * computed reader-side on Commerce's own rows — the append-only payment
+   * ledger supplies paid, never a derived column on the document. One delegated
+   * read plus the tenant scope, exactly as `list` does.
+   */
+  async listCostByCenter(actor: ReportingActor) {
+    if (!actor.tenantId) {
+      throw new ForbiddenException(
+        'Reporting requires a tenant context; this request was not resolved to a tenant.'
+      );
+    }
+    return this.reader.listCostByCenter({ tenantId: actor.tenantId });
+  }
+
   /** One report row, or 404 when the id is unknown OR belongs to another tenant. */
   async getOne(actor: ReportingActor, id: string): Promise<CommercePurchaseReportRow> {
     const row = await this.reader.getReportRow({ tenantId: actor.tenantId }, id);

@@ -73,14 +73,47 @@ const REPOSITORY_NAMES = [
   // PHASE C4-R (GAP-3): the completion policy's persistence boundary — one model,
   // `PurchaseCompletionPolicyVersion`, and no cross-slice read at all.
   'completion/purchase-completion-policy.repository.ts',
+  // PHASE W2-B: the integration slice's persistence boundary — `InventoryPosting`,
+  // the durable posting record, and no cross-slice read at all.
+  'integration/inventory-posting.repository.ts',
   'payment/payment-history.repository.ts',
+  // PAYMENT PLAN (دستور پرداخت): the instruction slice's persistence boundary —
+  // `PaymentPlan` + nested `PaymentInstallment`, lifecycle `updateMany` only,
+  // and the document/payment reads its gates need. `PaymentRecord` stays the
+  // payment history's sole writer.
+  'payment-plan/payment-plan.repository.ts',
+  // PHASE W3.2: the aggregated traceability read's persistence boundary —
+  // tenant-scoped reads across receipt, return, payment, plan and posting
+  // rows for ONE document. READ-ONLY by contract (see below): it holds no
+  // write path at all, so it is pinned in READ_ONLY_REPOSITORIES instead of
+  // being forced to grow a write the rule below exists to shape.
+  'purchase/purchase-history.repository.ts',
   'purchase/purchase.repository.ts',
+  // PHASE GAP-6: the price quotation's persistence boundary — `PriceQuotation` /
+  // `QuotationLine` (nested) plus its audit outbox row, and the ONE cross-slice
+  // read every child lifecycle shares (the parent document's status).
+  'quotation/quotation.repository.ts',
   'receiving/receiving-history.repository.ts',
   'returns/return-history.repository.ts',
+  // SUPPLIER MASTER DATA: the supplier directory's persistence boundary —
+  // `Supplier` plus its audit outbox row, and the two cross-slice READ seams
+  // (purchase documents and quotations that name a supplier).
+  'supplier/supplier.repository.ts',
   'workflow/workflow-configuration.repository.ts',
   'workflow/workflow-execution.repository.ts',
   'workflow/workflow-line-routing.repository.ts',
 ];
+
+/**
+ * PHASE W3.2: repositories that hold NO write path at all — pure read
+ * boundaries. The `.updateMany(`/`.create(` requirement below exists to force
+ * conditional writes where writes exist; demanding one from a read-only file
+ * would force it to grow exactly the write its contract forbids. Membership
+ * here is a deliberate edit — a write path appearing in one of these files
+ * without leaving this list is still caught by the write-shape assertion on
+ * the OTHER repositories.
+ */
+const READ_ONLY_REPOSITORIES = ['purchase/purchase-history.repository.ts'];
 
 /** Every TypeScript file in the module, at any depth. */
 function walk(dir: string): string[] {
@@ -296,6 +329,11 @@ describe('C1 step M: the workflow configuration persistence boundary (§5.5–§
     for (const file of repositories) {
       const code = codeOf(readModule(file));
       expect(code).not.toMatch(/\.update\(|\.delete\(/);
+      if (READ_ONLY_REPOSITORIES.includes(name(file))) {
+        // A read boundary asserts the STRONGER shape: no mutating call at all.
+        expect(code).not.toMatch(/\.updateMany\(|\.create\(|\.createMany\(|\.upsert\(|\.deleteMany\(/);
+        continue;
+      }
       expect(code).toMatch(/\.updateMany\(|\.create\(/);
     }
 
@@ -308,6 +346,32 @@ describe('C1 step M: the workflow configuration persistence boundary (§5.5–§
     // tenant-scoped reads — `listReportPage`, `countReportByMethod`, `findReportRow` —
     // each taking `tenantId` first (checked by C below) and none of them a write. The
     // pin grows with them, by name: a fourth would be a second deliberate edit.
+    //
+    // PHASE W4-B / W4-C (lock-order unification, `docs/reports/PHASE-W4-DECISIONS.md` §1):
+    // NINE names arrive or leave, and the change is DELIBERATE on both edges:
+    //
+    //   outgoing — `findCompensation`. It was the read half of the withdrawn
+    //     "at most one compensation per payment" rule. W4-B replaced that rule with
+    //     REQUESTED/partial refunds under a cumulative cap, so the single-compensation
+    //     probe has no caller left anywhere in the module: the compensation path reads
+    //     `lockDocumentForPayment` → `lockPaymentForCompensation` →
+    //     `findPaymentForCompensation` → `sumCompensations` (payment-history.service.ts
+    //     `compensateIn`). A repository method with no call site is not kept "just in
+    //     case" — the pin records the surface that EXISTS.
+    //
+    //   incoming — `lockDocumentForPayment`, `lockPaymentForCompensation` and
+    //     `sumCompensations`. Two issue `SELECT … FOR UPDATE` and one an aggregate, all
+    //     inside the CALLER's unit of work, so a return refund and a manual compensation
+    //     serialize on the SAME first lock (PurchaseDocument FOR UPDATE → PaymentRecord
+    //     FOR UPDATE → aggregates → INSERT). That ordering is what makes the refundable
+    //     capacity unraceable: without the payment lock two concurrent partial refunds
+    //     could both read the same remaining capacity.
+    //
+    // Each new method takes `tenantId` first (checked by C below), each is confined to
+    // the caller's `tx`, and NONE of them is a write — no `update`, no `delete`, no
+    // second INSERT. The append-only promise this file's header makes is unchanged:
+    // `append` remains the only statement here that can add a row. Any further silent
+    // addition — or re-addition — still fails this test, deliberately.
     const paymentRepository = repositories.find(
       (file) => name(file) === 'payment/payment-history.repository.ts'
     );
@@ -320,12 +384,14 @@ describe('C1 step M: the workflow configuration persistence boundary (§5.5–§
       [
         'append',
         'countReportByMethod',
-        'findCompensation',
         'findDocumentForPayment',
         'findPaymentForCompensation',
         'findReportRow',
         'listReportPage',
+        'lockDocumentForPayment',
+        'lockPaymentForCompensation',
         'readPaymentPage',
+        'sumCompensations',
       ].sort()
     );
   });

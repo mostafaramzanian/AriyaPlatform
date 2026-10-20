@@ -1,5 +1,5 @@
 import { inflateRawSync } from 'node:zlib';
-import type { SuperAgent as SuperagentClient, Response as SuperagentResponse } from 'superagent';
+import type { Response as SuperagentResponse } from 'superagent';
 
 /**
  * Phase REPORTING-VISUALIZATION-EXPORT — binary export assertions, shared by the four
@@ -93,13 +93,31 @@ export function responseBuffer(res: {
  * `get` chained with the binary-forcing `buffer`/`parse` keeps the OOXML
  * bytes intact through `responseBuffer` below.
  */
-export type ExportFileAgent = Pick<SuperagentClient, 'get' | 'post'>;
+/**
+ * supertest's `Test` (what `makeRequest()` returns) narrows superagent's `get`
+ * signature, so `Pick<SuperagentClient, 'get'>` does not accept it. A structural
+ * shape of exactly what `getExportFile` chains is assignable from both agents.
+ */
+interface ExportFileRequestLike {
+  set(field: string, value: string): this;
+  buffer(flag: boolean): this;
+  parse(
+    parser: (
+      res: SuperagentResponse,
+      callback: (error: Error | null, body?: Buffer) => void
+    ) => void
+  ): this;
+}
 
-export function getExportFile(
-  request: ExportFileAgent,
+export type ExportFileAgent = {
+  get(url: string): ExportFileRequestLike;
+};
+
+export function getExportFile<R extends ExportFileRequestLike>(
+  request: { get(url: string): R },
   url: string,
   token: string
-) {
+): R {
   return request
     .get(url)
     .set('Authorization', `Bearer ${token}`)

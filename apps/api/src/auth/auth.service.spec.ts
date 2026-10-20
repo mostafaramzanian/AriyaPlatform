@@ -2,13 +2,14 @@ import * as bcrypt from 'bcryptjs';
 import { Test, TestingModule } from '@nestjs/testing';
 import { UnauthorizedException, BadRequestException, ForbiddenException } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
-import { AuthService } from './auth.service';
+import { AuthService, MAX_PASSWORD_RESET_ATTEMPTS } from './auth.service';
 import { UsersService } from '../users/users.service';
 import { RefreshTokenService } from './refresh-token.service';
 import { NotificationPublisher } from '../notifications/notification.publisher';
 import { TokenHashService } from './services/token-hash.service';
 import { SessionService } from './services/session.service';
 import { PrismaService } from '../database/prisma.service';
+import { EmailService } from '../notifications/email/email.service';
 import { AuditService } from '../common/audit.service';
 import { TokenIssuer } from '../platform/auth/token-issuer';
 import { TokenPolicy } from '../platform/auth/token-policy';
@@ -92,6 +93,23 @@ describe('AuthService', () => {
             hashToken: jest.fn().mockReturnValue('hashed-token'),
             getExpirationTime: jest.fn().mockReturnValue(new Date(Date.now() + 3600000)),
             validateToken: jest.fn().mockReturnValue(true),
+            // PHASE PASSWORD-RESET-CODE: the code the flow hands to the user, and the digest
+            // it stores. Both doubles are deterministic so assertions can name them.
+            generateNumericCode: jest.fn().mockReturnValue('123456'),
+            hashPasswordResetCode: jest.fn(
+              (code: string, userId: string) => `code-hash:${code}:${userId}`,
+            ),
+          },
+        },
+        {
+          /**
+           * PHASE PASSWORD-RESET-CODE: the mail seam. It is injected (never read from the
+           * environment here) so a test can assert exactly what the user would receive —
+           * including that the CODE is in the body.
+           */
+          provide: EmailService,
+          useValue: {
+            sendMail: jest.fn().mockResolvedValue(null),
           },
         },
         {
@@ -138,8 +156,10 @@ describe('AuthService', () => {
             passwordReset: {
               create: jest.fn(),
               findUnique: jest.fn(),
+              findFirst: jest.fn(),
               findMany: jest.fn(),
               update: jest.fn(),
+              updateMany: jest.fn(),
             },
           },
         },
@@ -397,63 +417,252 @@ describe('AuthService', () => {
     });
   });
 
-  describe('resetPassword', () => {
-    it('should update password, mark token used, revoke refresh tokens and invalidate JWTs', async () => {
-      const user = { ...mockUser, tokenVersion: 2 };
-      (prisma.passwordReset.findUnique as jest.Mock).mockResolvedValue({
-        id: 'reset-1',
-        userId: user.id,
-        token: 'hashed-token',
-        used: false,
-        expiresAt: new Date(Date.now() + 10000),
-        user,
-      });
-      (prisma.user.update as jest.Mock).mockResolvedValue({ ...user, tokenVersion: 3 });
+  describe('requestPasswordReset', () => {
+    let emailService: EmailService;
 
-      const result = await service.resetPassword('plain-token', 'NewPass123!');
+    beforeEach(() => {
+      emailService = moduleRef.get<EmailService>(EmailService);
+      (usersService.findByEmail as jest.Mock).mockResolvedValue(mockUser);
+      (prisma.passwordReset.findFirst as jest.Mock).mockResolvedValue(null);
+      (prisma.passwordReset.updateMany as jest.Mock).mockResolvedValue({ count: 0 });
+      (prisma.passwordReset.create as jest.Mock).mockResolvedValue({ id: 'reset-new' });
+    });
+
+    it('stores a SALTED HASH of a six-digit code and emails that code in subject AND body', async () => {
+      const result = await service.requestPasswordReset(mockUser.email);
 
       expect(result).toBe(true);
-      expect(prisma.user.update).toHaveBeenCalledWith(
+      const created = (prisma.passwordReset.create as jest.Mock).mock.calls[0][0].data;
+      expect(created.codeHash).toBe(`code-hash:123456:${mockUser.id}`);
+      expect(created.codeHash).not.toBe('123456');
+      expect(created.attempts).toBe(0);
+      expect(created.used).toBe(false);
+      expect((created.expiresAt as Date).getTime()).toBeGreaterThan(Date.now());
+
+      const [to, subject, html, text] = (emailService.sendMail as jest.Mock).mock.calls[0];
+      expect(to).toBe(mockUser.email);
+      expect(subject).toContain('123456');
+      expect(html).toContain('1 2 3 4 5 6');
+      expect(text).toContain('123456');
+      // The message states the lifetime and the "ignore it if it wasn't you" rule.
+      expect(text).toContain('10');
+      expect(text).toContain('نادیده');
+    });
+
+    it('never puts the code on the event broker, and audits the issue', async () => {
+      const publisher = moduleRef.get(NotificationPublisher);
+
+      await service.requestPasswordReset(mockUser.email);
+
+      const [eventType, payload] = (publisher.publish as jest.Mock).mock.calls[0];
+      expect(eventType).toBe('auth.password.reset.requested');
+      expect(JSON.stringify(payload)).not.toContain('123456');
+      expect(auditService.log).toHaveBeenCalledWith(
+        expect.objectContaining({ action: 'password_reset_requested', success: true }),
+      );
+    });
+
+    it('retires the previous live code, so only ONE code can ever work', async () => {
+      await service.requestPasswordReset(mockUser.email);
+
+      expect(prisma.passwordReset.updateMany).toHaveBeenCalledWith({
+        where: { userId: mockUser.id, used: false },
+        data: { used: true },
+      });
+    });
+
+    it('does NOT replace a code issued inside the cooldown (a double click cannot void it)', async () => {
+      (prisma.passwordReset.findFirst as jest.Mock).mockResolvedValue({
+        id: 'reset-live',
+        userId: mockUser.id,
+        createdAt: new Date(Date.now() - 5 * 1000),
+        expiresAt: new Date(Date.now() + 9 * 60 * 1000),
+        used: false,
+      });
+
+      const result = await service.requestPasswordReset(mockUser.email);
+
+      expect(result).toBe(true);
+      expect(prisma.passwordReset.create).not.toHaveBeenCalled();
+      expect(prisma.passwordReset.updateMany).not.toHaveBeenCalled();
+      expect(emailService.sendMail).not.toHaveBeenCalled();
+    });
+
+    it('issues a NEW code once the cooldown has passed', async () => {
+      (prisma.passwordReset.findFirst as jest.Mock).mockResolvedValue({
+        id: 'reset-live',
+        userId: mockUser.id,
+        createdAt: new Date(Date.now() - 5 * 60 * 1000),
+        expiresAt: new Date(Date.now() + 5 * 60 * 1000),
+        used: false,
+      });
+
+      await service.requestPasswordReset(mockUser.email);
+
+      expect(prisma.passwordReset.create).toHaveBeenCalledTimes(1);
+      expect(emailService.sendMail).toHaveBeenCalledTimes(1);
+    });
+
+    it('answers the same for an unknown address, and sends nothing', async () => {
+      (usersService.findByEmail as jest.Mock).mockResolvedValue(null);
+
+      await expect(service.requestPasswordReset('nobody@example.com')).resolves.toBe(true);
+      expect(prisma.passwordReset.create).not.toHaveBeenCalled();
+      expect(emailService.sendMail).not.toHaveBeenCalled();
+    });
+
+    it('does not fail the request when SMTP is down, and records the dispatch failure', async () => {
+      (emailService.sendMail as jest.Mock).mockRejectedValue(new Error('connect ECONNREFUSED'));
+
+      await expect(service.requestPasswordReset(mockUser.email)).resolves.toBe(true);
+      expect(auditService.log).toHaveBeenCalledWith(
         expect.objectContaining({
-          where: { id: user.id },
-          data: expect.objectContaining({ passwordHash: expect.any(String) }),
+          action: 'password_reset_failed',
+          success: false,
+          reason: 'reset_email_dispatch_failed',
         }),
       );
+    });
+  });
+
+  describe('resetPassword', () => {
+    /** The one live row the reset path reads, with the digest the mocked service produces. */
+    const pendingRow = (overrides: Record<string, unknown> = {}) => ({
+      id: 'reset-1',
+      userId: mockUser.id,
+      codeHash: `code-hash:123456:${mockUser.id}`,
+      attempts: 0,
+      used: false,
+      createdAt: new Date(Date.now() - 60 * 1000),
+      expiresAt: new Date(Date.now() + 10 * 60 * 1000),
+      ...overrides,
+    });
+
+    beforeEach(() => {
+      (usersService.findByEmail as jest.Mock).mockResolvedValue(mockUser);
+      (prisma.passwordReset.findFirst as jest.Mock).mockResolvedValue(pendingRow());
+      (prisma.passwordReset.update as jest.Mock).mockResolvedValue({});
+      (prisma.user.update as jest.Mock).mockResolvedValue({ ...mockUser, tokenVersion: 3 });
+    });
+
+    it('accepts the emailed code: updates the password, burns the row and ends every session', async () => {
+      const result = await service.resetPassword(mockUser.email, '123456', 'NewPass123!');
+
+      expect(result).toBe(true);
+      const stored = (prisma.user.update as jest.Mock).mock.calls[0][0].data.passwordHash;
+      expect(stored).not.toContain('NewPass123!');
+      expect(stored.startsWith('$2')).toBe(true);
+
       expect(prisma.passwordReset.update).toHaveBeenCalledWith({
         where: { id: 'reset-1' },
         data: { used: true },
       });
-      expect(refreshService.revokeAllForUser).toHaveBeenCalledWith(user.id);
+      expect(refreshService.revokeAllForUser).toHaveBeenCalledWith(mockUser.id);
       expect(prisma.user.update).toHaveBeenCalledWith(
         expect.objectContaining({
-          where: { id: user.id },
+          where: { id: mockUser.id },
           data: { tokenVersion: { increment: 1 } },
         }),
       );
-      expect(auditService.log).toHaveBeenCalledWith(expect.objectContaining({ action: 'password_reset_success', success: true }));
-    });
-
-    it('should throw BadRequestException for invalid token', async () => {
-      (prisma.passwordReset.findUnique as jest.Mock).mockResolvedValue(null);
-
-      await expect(service.resetPassword('bad-token', 'NewPass123!')).rejects.toThrow(
-        BadRequestException,
+      expect(auditService.log).toHaveBeenCalledWith(
+        expect.objectContaining({ action: 'password_reset_success', success: true }),
       );
-      expect(auditService.log).toHaveBeenCalledWith(expect.objectContaining({ action: 'password_reset_failed', success: false }));
     });
 
-    it('should throw BadRequestException for used token', async () => {
-      (prisma.passwordReset.findUnique as jest.Mock).mockResolvedValue({
-        id: 'reset-used',
-        userId: mockUser.id,
-        token: 'hashed-token',
-        used: true,
-        expiresAt: new Date(Date.now() + 10000),
-        user: mockUser,
-      });
+    it('refuses a WRONG code with the generic sentence and counts the attempt', async () => {
+      await expect(
+        service.resetPassword(mockUser.email, '000000', 'NewPass123!'),
+      ).rejects.toThrow(BadRequestException);
 
-      await expect(service.resetPassword('plain-token', 'NewPass123!')).rejects.toThrow(
-        BadRequestException,
+      expect(prisma.passwordReset.update).toHaveBeenCalledWith({
+        where: { id: 'reset-1' },
+        data: { attempts: 1, used: false },
+      });
+      expect(prisma.user.update).not.toHaveBeenCalled();
+      expect(auditService.log).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: 'password_reset_failed',
+          reason: 'invalid_code',
+          success: false,
+        }),
+      );
+    });
+
+    it('BURNS the row on the last allowed wrong attempt, so guessing must start over', async () => {
+      (prisma.passwordReset.findFirst as jest.Mock).mockResolvedValue(
+        pendingRow({ attempts: MAX_PASSWORD_RESET_ATTEMPTS - 1 }),
+      );
+
+      await expect(
+        service.resetPassword(mockUser.email, '000000', 'NewPass123!'),
+      ).rejects.toThrow(BadRequestException);
+
+      expect(prisma.passwordReset.update).toHaveBeenCalledWith({
+        where: { id: 'reset-1' },
+        data: { attempts: MAX_PASSWORD_RESET_ATTEMPTS, used: true },
+      });
+      expect(auditService.log).toHaveBeenCalledWith(
+        expect.objectContaining({ reason: 'code_burned_after_attempt_cap', success: false }),
+      );
+    });
+
+    it('refuses a row already at the cap, without comparing anything', async () => {
+      (prisma.passwordReset.findFirst as jest.Mock).mockResolvedValue(
+        pendingRow({ attempts: MAX_PASSWORD_RESET_ATTEMPTS }),
+      );
+
+      await expect(
+        service.resetPassword(mockUser.email, '123456', 'NewPass123!'),
+      ).rejects.toThrow(BadRequestException);
+
+      expect(prisma.passwordReset.update).not.toHaveBeenCalled();
+      expect(prisma.user.update).not.toHaveBeenCalled();
+      expect(auditService.log).toHaveBeenCalledWith(
+        expect.objectContaining({ reason: 'code_attempt_cap_reached', success: false }),
+      );
+    });
+
+    it('refuses an EXPIRED code and tells the operator why', async () => {
+      (prisma.passwordReset.findFirst as jest.Mock).mockResolvedValue(
+        pendingRow({ expiresAt: new Date(Date.now() - 1000) }),
+      );
+
+      await expect(
+        service.resetPassword(mockUser.email, '123456', 'NewPass123!'),
+      ).rejects.toThrow(BadRequestException);
+
+      expect(prisma.user.update).not.toHaveBeenCalled();
+      expect(auditService.log).toHaveBeenCalledWith(
+        expect.objectContaining({ reason: 'code_expired', success: false }),
+      );
+    });
+
+    it('refuses when no live code exists — a used or never-issued row', async () => {
+      (prisma.passwordReset.findFirst as jest.Mock).mockResolvedValue(null);
+
+      await expect(
+        service.resetPassword(mockUser.email, '123456', 'NewPass123!'),
+      ).rejects.toThrow(BadRequestException);
+
+      expect(auditService.log).toHaveBeenCalledWith(
+        expect.objectContaining({ reason: 'no_live_code', success: false }),
+      );
+    });
+
+    it('answers an unknown address exactly like a wrong code — no account oracle', async () => {
+      (usersService.findByEmail as jest.Mock).mockResolvedValue(null);
+      const unknown = await service
+        .resetPassword('nobody@example.com', '123456', 'NewPass123!')
+        .catch((err: Error) => err.message);
+
+      (usersService.findByEmail as jest.Mock).mockResolvedValue(mockUser);
+      const wrongCode = await service
+        .resetPassword(mockUser.email, '000000', 'NewPass123!')
+        .catch((err: Error) => err.message);
+
+      expect(unknown).toBe(wrongCode);
+      expect(auditService.log).toHaveBeenCalledWith(
+        expect.objectContaining({ reason: 'unknown_account', success: false }),
       );
     });
   });
@@ -490,4 +699,52 @@ describe('AuthService', () => {
       await expect(service.verifyEmail('bad-token')).rejects.toThrow(BadRequestException);
     });
   });
+/**
+ * TARGETED-REMEDIATION (P2): `incrementTokenVersion` is the revocation act, and it must
+ * ALSO publish `platform.revocation@v1` so the deny-set hears within the TTL window.
+ * The publish is asserted on the publisher double — what the contract demands is
+ * "the exact vocabulary on the right routing key", not a broker.
+ */
+describe('incrementTokenVersion — the platform.revocation@v1 emission', () => {
+  it('publishes the revocation event AFTER the version bump, with the committed ver', async () => {
+    const publisher = moduleRef.get(NotificationPublisher);
+    (prisma.user.update as jest.Mock).mockResolvedValue({
+      tokenVersion: 8,
+      tenantId: 'tenant-1',
+    });
+
+    const result = await service.incrementTokenVersion('user-1');
+
+    expect(result).toBe(8);
+    expect(prisma.user.update).toHaveBeenCalledWith({
+      where: { id: 'user-1' },
+      data: { tokenVersion: { increment: 1 } },
+      select: { tokenVersion: true, tenantId: true },
+    });
+    expect(publisher.publish).toHaveBeenCalledWith(
+      'platform.revocation',
+      expect.objectContaining({
+        contract: 'platform.revocation@v1',
+        userId: 'user-1',
+        ver: 8,
+        tid: 'tenant-1',
+      })
+    );
+  });
+
+  it('emits NO event for a tenant-less user — the contract cannot name it', async () => {
+    const publisher = moduleRef.get(NotificationPublisher);
+    (prisma.user.update as jest.Mock).mockResolvedValue({
+      tokenVersion: 3,
+      tenantId: null,
+    });
+
+    await service.incrementTokenVersion('user-orphan');
+
+    expect(publisher.publish).not.toHaveBeenCalledWith(
+      'platform.revocation',
+      expect.anything()
+    );
+  });
+});
 });

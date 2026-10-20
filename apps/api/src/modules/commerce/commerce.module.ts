@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common';
 import { NotificationModule } from '../../notifications/notification.module';
 import { RbacModule } from '../../auth/rbac/rbac.module';
+import { StorageModule } from '../../storage/storage.module';
 import { PlatformAuditModule } from '../../platform/audit/platform-audit.module';
 import { PlatformEntitlementModule } from '../../platform/entitlement/platform-entitlement.module';
 import { ModuleEntitlementGuard } from '../../platform/entitlement/module-entitlement.guard';
@@ -24,6 +25,8 @@ import { PurchaseController } from './purchase/purchase.controller';
 import { PurchaseRepository } from './purchase/purchase.repository';
 import { PurchaseService } from './purchase/purchase.service';
 import { PurchaseTimelineService } from './purchase/purchase-timeline.service';
+import { PurchaseHistoryService } from './purchase/purchase-history.service';
+import { PurchaseHistoryRepository } from './purchase/purchase-history.repository';
 import { PurchaseCompletionPolicyController } from './completion/purchase-completion-policy.controller';
 import { PurchaseCompletionPolicyRepository } from './completion/purchase-completion-policy.repository';
 import { PurchaseCompletionPolicyService } from './completion/purchase-completion-policy.service';
@@ -31,12 +34,22 @@ import { PurchaseCompletionService } from './completion/purchase-completion.serv
 import { PaymentHistoryController } from './payment/payment-history.controller';
 import { PaymentHistoryRepository } from './payment/payment-history.repository';
 import { PaymentHistoryService } from './payment/payment-history.service';
+import { PaymentPlanController } from './payment-plan/payment-plan.controller';
+import { PaymentPlanRepository } from './payment-plan/payment-plan.repository';
+import { PaymentPlanService } from './payment-plan/payment-plan.service';
 import { ReceivingHistoryController } from './receiving/receiving-history.controller';
 import { ReceivingHistoryRepository } from './receiving/receiving-history.repository';
 import { ReceivingHistoryService } from './receiving/receiving-history.service';
 import { ReturnHistoryController } from './returns/return-history.controller';
 import { ReturnHistoryRepository } from './returns/return-history.repository';
 import { ReturnHistoryService } from './returns/return-history.service';
+import { InventoryModule } from '../inventory/inventory.module';
+import { InventoryPostingFacade } from '../inventory/integration/inventory-posting.facade';
+import { INVENTORY_POSTING_PORT } from './integration/inventory-posting.port';
+import { InventoryPostingRepository } from './integration/inventory-posting.repository';
+import { CommerceOrderReferenceFacade } from './integration/purchase-order-reference.facade';
+import { InventoryIntegrationService } from './integration/inventory-integration.service';
+import { InventoryPostingController } from './integration/inventory-posting.controller';
 import { WorkflowConfigurationController } from './workflow/workflow-configuration.controller';
 import { WorkflowConfigurationRepository } from './workflow/workflow-configuration.repository';
 import { WorkflowConfigurationService } from './workflow/workflow-configuration.service';
@@ -49,6 +62,12 @@ import { WorkflowLineRoutingController } from './workflow/workflow-line-routing.
 import { WorkflowExecutionController } from './workflow/workflow-execution.controller';
 import { PendingDecisionsController } from './pending/pending-decisions.controller';
 import { PendingDecisionsService } from './pending/pending-decisions.service';
+import { QuotationController } from './quotation/quotation.controller';
+import { QuotationRepository } from './quotation/quotation.repository';
+import { QuotationService } from './quotation/quotation.service';
+import { SupplierController } from './supplier/supplier.controller';
+import { SupplierRepository } from './supplier/supplier.repository';
+import { SupplierService } from './supplier/supplier.service';
 
 /**
  * Phase C1: Commerce — the procurement bounded context — as an INDEPENDENT business
@@ -104,12 +123,23 @@ import { PendingDecisionsService } from './pending/pending-decisions.service';
  * its port — never a direct reach into another module's database, and never a
  * duplicate of a platform capability.
  *
- * NO QUEUE, NO STORAGE, NO UPLOAD (gate I19). C1's boundary is synchronous
- * domain work with one exception: `CommerceAuditOutboxRelayService` (Phase B2.3)
- * uses `setInterval` to poll the local `AuditOutbox` table and deliver durable
- * audit events through `AUDIT_PORT`. This relay is the same pattern Financial
- * adopted in Phase B2, context-local. Nothing else here is time-triggered and
- * nothing uploads a file.
+ * NO QUEUE (gate I19), AND A BOUNDARY THAT MOVED ON PURPOSE (3.3).
+ * C1's boundary is synchronous domain work with one exception: 
+ * `CommerceAuditOutboxRelayService` (Phase B2.3) uses `setInterval` to poll the local
+ * `AuditOutbox` table and deliver durable audit events through `AUDIT_PORT`. This relay
+ * is the same pattern Financial adopted in Phase B2, context-local. Nothing here is
+ * time-triggered and no queue, worker or scheduler exists.
+ *
+ * STORAGE / UPLOAD ARRIVED WITH ITS SINGLE CONSUMER (GAP-6 follow-up 3.3, explicitly
+ * owner-authorized): the procurement workflow requires the scanned quotation document to
+ * be a REAL uploaded artifact, not a reference string, so the earlier "NO STORAGE, NO
+ * UPLOAD" clause was revised deliberately — not bypassed. The revision's exact shape:
+ * `StorageModule` is imported here, `IStorageProvider` is injected into exactly ONE
+ * provider (`QuotationService`), and the only routes are
+ * `POST/GET commerce/price-quotations/:id/attachment` — object-first writes with
+ * cleanup on a failed row, short-lived signed download URLs, the storage key never on
+ * the wire. Adding a second consumer requires the same deliberate documentation and
+ * gate update; nothing else in Commerce may reach storage.
  *
  * NOT YET IN THIS SHELL BEFORE STEP L: controllers, services and repositories arrive
  * with the domain steps behind this file, and step L is the first of them. The purchase
@@ -136,7 +166,11 @@ import { PendingDecisionsService } from './pending/pending-decisions.service';
  * module's declared boundary surface under §I7–§I9: identity reads, audit writes and
  * event emission leave Commerce only here. HR exports `HrIdentityGateway` and
  * `HrAuditGateway` for the same reason; Commerce additionally exports
- * `CommerceNotificationGateway` because §I9 names it a boundary in its own right.
+ * `CommerceNotificationGateway` because §I9 names it a boundary in its own right,
+ * and — PHASE W2-C — `CommerceOrderReferenceFacade`, the narrow resolution seam
+ * the neutral `purchase-order-reference` bridge module consumes for Financial's
+ * check-request validation. It is a facade, not a repository or service, so the
+ * export still publishes no Commerce data path.
  * Structural DI is what makes an exported gateway a meaningful claim rather than a
  * formality: any file in this module can write `@Inject(USER_DIRECTORY)` and still
  * type-check, so the assertion that these three are the ONLY consumers is a test
@@ -149,6 +183,13 @@ import { PendingDecisionsService } from './pending/pending-decisions.service';
     PlatformAuditModule,
     PlatformEntitlementModule,
     NotificationModule,
+    // GAP-6 follow-up 3.3 (owner-authorized I19 boundary revision): the platform's
+    // object-storage seam, reached EXACTLY the way Financial/Correspondence reach it
+    // (StorageModule → 'IStorageProvider' → MinioProvider) and consumed by exactly
+    // ONE provider — QuotationService's attachment upload/download — never
+    // re-exported, never imported by a repository or gateway. The module header
+    // records why the boundary moved and what still holds.
+    StorageModule,
     PureRuleEngineModule,
     // PHASE C9 (GAP-5): the platform's GLOBAL SEARCH SOURCE seam (P-SEARCH-SOURCE). It is
     // imported for exactly ONE consumer — `CommerceSearchSourceService`, the module's
@@ -164,12 +205,20 @@ import { PendingDecisionsService } from './pending/pending-decisions.service';
     // imports `RbacModule` for its own `hr.*` permission gates; nothing here reads RBAC
     // tables or resolves roles itself.
     RbacModule,
+    // PHASE W2-B (owner-mandated purchase↔inventory integration): Inventory's
+    // module is imported for exactly ONE export — `InventoryPostingFacade`,
+    // the narrow posting surface bound to `INVENTORY_POSTING_PORT` below.
+    // The direction is one-way (Commerce asks, Inventory owns its database),
+    // and importing the MODULE — never its Prisma service or repositories —
+    // is what keeps every stock effect inside the inventory-owned boundary.
+    InventoryModule,
   ],
   controllers: [
     PurchaseController,
     WorkflowConfigurationController,
     CommercialController,
     PaymentHistoryController,
+    PaymentPlanController,
     // Step R's receiving routes: the same `commerce/purchase-documents` path,
     // because a receipt has no meaning apart from the document it receives
     // against. Three routes, no fourth — no PATCH/PUT/DELETE exists (R7).
@@ -201,6 +250,21 @@ import { PendingDecisionsService } from './pending/pending-decisions.service';
     // (`POST commerce/purchase-documents/:id/close`) belongs to the document collection and
     // lives on `PurchaseController`, which delegates to the completion service below.
     PurchaseCompletionPolicyController,
+    // PHASE GAP-6: the PRICE QUOTATION routes — list a document's quotation trail,
+    // record one version, decide the pending one. Registered the same way and for the
+    // same reason as every other controller: the routes are Commerce's own surface and
+    // the service they delegate to is provided below, so no second Nest module exists
+    // for one bounded context's price-evidence loop.
+    QuotationController,
+    // SUPPLIER MASTER DATA: the directory's seven routes under
+    // `commerce/suppliers` — reads under `commerce.read`, the two writes and the
+    // SENSITIVE BANKING projection under `commerce.supplier.manage` (the seventh
+    // Commerce permission, seeded by core migration
+    // 20261017140100_seed_commerce_supplier_permission).
+    SupplierController,
+    // PHASE W2-B: the integration's operational surface — the posting queue
+    // read and the retry act (two routes, under `commerce/inventory-postings`).
+    InventoryPostingController,
   ],
   providers: [
     ModuleEntitlementGuard,
@@ -264,6 +328,14 @@ import { PendingDecisionsService } from './pending/pending-decisions.service';
     // only the audit gateway for §I8's one row per write, and Q8 publishes no event.
     PaymentHistoryRepository,
     PaymentHistoryService,
+    // The payment-instruction slice (دستور پرداخت / رژیم پرداخت): the
+    // repository is PROVIDED and NOT exported, like every Commerce repository,
+    // and the service orchestrates plan/stage transitions plus execution —
+    // which appends through the SAME `PaymentRecord` table the payment
+    // history owns, inside one unit of work, so an installment and its money
+    // event can never commit apart.
+    PaymentPlanRepository,
+    PaymentPlanService,
     // Step R's receiving-history slice, registered the same way and for the same
     // reasons: the repository is PROVIDED and NOT exported (nothing outside this
     // bounded context issues a query against `commerce_db`), and the service above
@@ -307,6 +379,26 @@ import { PendingDecisionsService } from './pending/pending-decisions.service';
     PurchaseCompletionPolicyRepository,
     PurchaseCompletionPolicyService,
     PurchaseCompletionService,
+    // PHASE GAP-6: the price-quotation slice, registered like every other Commerce
+    // slice. `QuotationRepository` is PROVIDED and NOT exported (it owns
+    // `PriceQuotation` / `QuotationLine` and reads the parent document only — the
+    // payment/receiving cross-slice READ seam), and `QuotationService` is this
+    // module's own application surface behind the three `price-quotations` routes.
+    // Quotations are a CHILD lifecycle: this module's only new writes are the two
+    // quotation tables and the audit outbox; no other lifecycle is touched.
+    QuotationRepository,
+    QuotationService,
+    // SUPPLIER MASTER DATA: `SupplierRepository` is PROVIDED and NOT exported (it
+    // owns `Supplier` alone, plus the two cross-slice READ seams — purchase
+    // documents and quotations that NAME a supplier — which observe but never
+    // write the other slices' models). `SupplierService` is this module's own
+    // application surface behind the seven `commerce/suppliers` routes.
+    // `QuotationService` also consumes `SupplierRepository` (the application-layer
+    // cross-slice convention `commercial-lifecycle.service.ts` establishes with
+    // `PurchaseRepository`) to validate a quotation's optional `supplierId`
+    // against the tenant's own directory rows.
+    SupplierRepository,
+    SupplierService,
     // PHASE C7 (GAP-7): the purchase audit-timeline read, registered like every other
     // Commerce service — its dependencies (PurchaseRepository and the audit gateway,
     // both provided above) are already in this composition root, so no import and no
@@ -314,12 +406,37 @@ import { PendingDecisionsService } from './pending/pending-decisions.service';
     // own application surface, reached through `PurchaseController`, and nothing
     // outside the bounded context holds a reference to the audit read.
     PurchaseTimelineService,
+    // PHASE W3.2: the aggregated traceability read — repository + service,
+    // read-only over Commerce rows plus the platform audit port.
+    PurchaseHistoryRepository,
+    PurchaseHistoryService,
     // Phase B2.3: the Commerce audit outbox relay — drains `AuditOutbox` rows and
     // delivers them through `AUDIT_PORT` to `core_db."AuditLog"`. Uses `setInterval`
     // (the ONE exception to C1's "no timer" boundary — same pattern as Financial B2).
     CommerceAuditOutboxRelayService,
+    // PHASE W2-B: the Commerce→Inventory integration slice. The repository is
+    // the sole writer of `InventoryPosting` (the durable at-least-once record);
+    // the service plans postings inside the receipt/return units of work and
+    // attempts them post-commit through the port — bound here to Inventory's
+    // exported facade, so the ONLY way Commerce reaches stock is the
+    // inventory-owned provider. `useExisting` — no adapter class to drift.
+    InventoryPostingRepository,
+    InventoryIntegrationService,
+    { provide: INVENTORY_POSTING_PORT, useExisting: InventoryPostingFacade },
+    // PHASE W2-C: the order-reference resolution Financial's check-request
+    // consumes through `PurchaseOrderReferencePort`. Provided AND exported —
+    // the ONLY non-gateway export — so the neutral bridge module
+    // (`modules/purchase-order-reference/`) can bind it without Financial ever
+    // importing a Commerce file itself.
+    CommerceOrderReferenceFacade,
   ],
-  // Unchanged by step L: the exported surface is the three gateways and nothing else.
-  exports: [CommerceIdentityGateway, CommerceAuditGateway, CommerceNotificationGateway],
+  // The exported surface is the three gateways PLUS the one W2-C facade the
+  // bridge module binds; repositories, services and clients stay internal.
+  exports: [
+    CommerceIdentityGateway,
+    CommerceAuditGateway,
+    CommerceNotificationGateway,
+    CommerceOrderReferenceFacade,
+  ],
 })
 export class CommerceModule {}

@@ -78,6 +78,8 @@ export interface BomHeaderListQuery {
   take: number;
   status?: BomStatus;
   search?: string;
+  /** Exact match on the opaque `projectRef` column (Phase PRODUCTION-REGISTER-REDESIGN). */
+  projectRef?: string;
   /**
    * Phase KPI-RUNTIME: half-open instant window on `decidedAt` — ISO 8601 strings. The SAME
    * filter the report contract names (`ProductionReportQuery.decidedFrom/decidedTo`), stated
@@ -97,7 +99,7 @@ export interface BomHeaderListQuery {
  */
 export type BomHeaderFilter = Pick<
   BomHeaderListQuery,
-  'status' | 'search' | 'decidedFrom' | 'decidedTo'
+  'status' | 'search' | 'projectRef' | 'decidedFrom' | 'decidedTo'
 >;
 
 /** A header row PLUS its item count, as the reporting reads receive it. */
@@ -174,7 +176,19 @@ export class BomHeaderRepository {
     const where: Prisma.BomHeaderWhereInput = { tenantId };
 
     if (query.status) where.status = query.status;
-    if (query.search) where.title = { contains: query.search };
+    if (query.projectRef) where.projectRef = query.projectRef;
+    if (query.search) {
+      // Phase PRODUCTION-REGISTER-REDESIGN: the omni search matches the title AND the two
+      // opaque reference columns (`projectRef`, `productTreeRef`) — the fields the register
+      // displays under «عنوان یا شناسه / BOM Code / Project». Still a `contains` read
+      // filter, not an authorization decision: the tenant predicate narrows the rows long
+      // before the text clause runs.
+      where.OR = [
+        { title: { contains: query.search } },
+        { projectRef: { contains: query.search } },
+        { productTreeRef: { contains: query.search } },
+      ];
+    }
     if (query.decidedFrom !== undefined || query.decidedTo !== undefined) {
       // Phase KPI-RUNTIME: the half-open `[from, to)` window the report contract declares —
       // `gte` on the lower bound, `lt` on the upper. Half-open on purpose: a closed upper
@@ -263,6 +277,73 @@ export class BomHeaderRepository {
     });
 
     return new Map(groups.map((group) => [group.status, group._count._all]));
+  }
+
+  /**
+   * Phase PRODUCTION-REGISTER-REDESIGN: the register summary — the bounded aggregations
+   * the redesigned `/admin/production` KPI strip and project dropdown are built from.
+   *
+   * Every statement carries `tenantId`; each is a bounded `count`/`groupBy`, never a row
+   * scan:
+   *   * `statusCounts` — one `groupBy` over the tenant's headers (unfiltered: the strip
+   *     must not shrink to whatever filters happen to be applied, so it deliberately does
+   *     NOT reuse `buildListWhere`'s optional clauses);
+   *   * `activeItems` — the item rows under the tenant's APPROVED headers («کل اقلام
+   *     فعال BOM»: an item is "active" exactly when its header is approved, which is the
+   *     only lifecycle fact the schema states);
+   *   * `inFlightChanges` — the tenant's change requests still inside the lifecycle
+   *     (DRAFT or SUBMITTED; decided ones have left);
+   *   * `projectRefs` — the DISTINCT opaque refs the tenant actually stores, so the
+   *     project dropdown offers real values rather than invented options;
+   *   * `productTreeRefs` — the same distinct treatment for the product-tree ref, so the
+   *     author form's WBS select and the register filter share one honest option source.
+   */
+  async registerSummary(tenantId: string): Promise<{
+    total: number;
+    statusCounts: Map<string, number>;
+    activeItems: number;
+    inFlightChanges: number;
+    projectRefs: string[];
+    productTreeRefs: string[];
+  }> {
+    const [statusGroups, activeItems, projectGroups, treeGroups, inFlightChanges] =
+      await Promise.all([
+      this.prisma.bomHeader.groupBy({
+        by: ['status'],
+        where: { tenantId },
+        _count: { _all: true },
+      }),
+      this.prisma.bomItem.count({
+        where: { tenantId, bom: { status: 'APPROVED' } },
+      }),
+      this.prisma.bomHeader.groupBy({
+        by: ['projectRef'],
+        where: { tenantId },
+        orderBy: { projectRef: 'asc' },
+      }),
+      this.prisma.bomHeader.groupBy({
+        by: ['productTreeRef'],
+        where: { tenantId },
+        orderBy: { productTreeRef: 'asc' },
+      }),
+      this.prisma.bomChangeRequest.count({
+        where: { tenantId, status: { in: ['DRAFT', 'SUBMITTED'] } },
+      }),
+    ]);
+
+    const statusCounts = new Map(
+      statusGroups.map((group) => [group.status, group._count._all])
+    );
+    const total = statusGroups.reduce((sum, group) => sum + group._count._all, 0);
+
+    return {
+      total,
+      statusCounts,
+      activeItems,
+      inFlightChanges,
+      projectRefs: projectGroups.map((group) => group.projectRef),
+      productTreeRefs: treeGroups.map((group) => group.productTreeRef),
+    };
   }
 
   /**

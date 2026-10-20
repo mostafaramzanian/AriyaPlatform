@@ -98,8 +98,17 @@ import { PurchaseController } from '../src/modules/commerce/purchase/purchase.co
 import { PurchaseRepository } from '../src/modules/commerce/purchase/purchase.repository';
 import { PurchaseService } from '../src/modules/commerce/purchase/purchase.service';
 import { PurchaseTimelineService } from '../src/modules/commerce/purchase/purchase-timeline.service';
+import { PurchaseHistoryService } from '../src/modules/commerce/purchase/purchase-history.service';
+import { PurchaseHistoryRepository } from '../src/modules/commerce/purchase/purchase-history.repository';
+import { PaymentPlanRepository } from '../src/modules/commerce/payment-plan/payment-plan.repository';
+import { ReceivingHistoryRepository } from '../src/modules/commerce/receiving/receiving-history.repository';
+import { ReturnHistoryRepository } from '../src/modules/commerce/returns/return-history.repository';
 import { PurchaseCompletionPolicyRepository } from '../src/modules/commerce/completion/purchase-completion-policy.repository';
 import { PurchaseCompletionService } from '../src/modules/commerce/completion/purchase-completion.service';
+import { InventoryPostingRepository } from '../src/modules/commerce/integration/inventory-posting.repository';
+import { InventoryIntegrationService } from '../src/modules/commerce/integration/inventory-integration.service';
+import { INVENTORY_POSTING_PORT } from '../src/modules/commerce/integration/inventory-posting.port';
+import { createFakeInventoryPostingPort } from './fixtures/fake-inventory-posting-port';
 import { CommercialConfigurationRepository } from '../src/modules/commerce/commercial/commercial-configuration.repository';
 import { CommercialLifecycleRepository } from '../src/modules/commerce/commercial/commercial-lifecycle.repository';
 import { CommercialLifecycleService } from '../src/modules/commerce/commercial/commercial-lifecycle.service';
@@ -189,10 +198,12 @@ class ProbeHeaderStrategy {
       claims: null,
     });
   }
-  private success(): void {
+  private success(_arg?: unknown): void {
+      void _arg;
     throw new Error('passport replaces this method before authenticate() runs');
   }
-  private fail(): void {
+  private fail(_arg?: unknown): void {
+      void _arg;
     throw new Error('passport replaces this method before authenticate() runs');
   }
 }
@@ -229,8 +240,19 @@ class ProbeHeaderStrategy {
     PurchaseRepository,
     PurchaseService,
     PurchaseTimelineService,
+    // PHASE W3.2: the aggregated-history route on `PurchaseController` — its
+    // service and read-only repository, plus the plan repository the completion
+    // service consults for outstanding installments.
+    PurchaseHistoryService,
+    PurchaseHistoryRepository,
+    PaymentPlanRepository,
+    ReceivingHistoryRepository,
+    ReturnHistoryRepository,
     PurchaseCompletionPolicyRepository,
     PurchaseCompletionService,
+    InventoryPostingRepository,
+    InventoryIntegrationService,
+    { provide: INVENTORY_POSTING_PORT, useValue: createFakeInventoryPostingPort() },
     WorkflowLineRoutingRepository,
     WorkflowExecutionRepository,
     WorkflowLineRoutingService,
@@ -374,12 +396,17 @@ describe('GAP-8 identity e2e — opaque ids through the REAL directory (requirem
     if (db) {
       // Exact ids first (covers the seeded tenant), then the disposable tenants whole.
       if (createdDocumentIds.length > 0) {
+        // PHASE W3: append-only status events RESTRICT their document — they go first.
+        await db.purchaseStatusEvent.deleteMany({
+          where: { purchaseDocumentId: { in: createdDocumentIds } },
+        });
         await db.purchaseLine.deleteMany({
           where: { purchaseDocumentId: { in: createdDocumentIds } },
         });
         await db.purchaseDocument.deleteMany({ where: { id: { in: createdDocumentIds } } });
       }
       const disposable = [tenantAId, tenantBId];
+      await db.purchaseStatusEvent.deleteMany({ where: { tenantId: { in: disposable } } });
       await db.purchaseLine.deleteMany({ where: { tenantId: { in: disposable } } });
       await db.purchaseDocument.deleteMany({ where: { tenantId: { in: disposable } } });
       await db.purchaseDocumentCounter.deleteMany({ where: { tenantId: { in: disposable } } });

@@ -78,6 +78,14 @@ export const PRODUCTION_PRISMA_CLIENT = Symbol('PRODUCTION_PRISMA_CLIENT');
  */
 export const FINANCE_PRISMA_CLIENT = Symbol('FINANCE_PRISMA_CLIENT');
 
+/**
+ * Phase W1 — WAREHOUSE / INVENTORY FOUNDATION: the same binding seam for the
+ * Inventory Prisma client. `DATASOURCE_PROBES.INVENTORY_DATABASE_URL` joins the
+ * registry the moment `InventoryPrismaModule` binds this token — the same move
+ * `FINANCE_PRISMA_CLIENT` documents above.
+ */
+export const INVENTORY_PRISMA_CLIENT = Symbol('INVENTORY_PRISMA_CLIENT');
+
 export interface PrismaLikeClient {
   $queryRaw: (query: unknown) => Promise<unknown>;
 }

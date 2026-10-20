@@ -186,6 +186,90 @@ export interface CommercePurchaseReportTimelinePage {
 }
 
 /**
+ * PHASE W2-C — the pending-aging row: one IN-CIRCULATION document and the age
+ * of its CURRENT status.
+ *
+ * `statusEnteredAt` is the authoritative state-entry instant — the
+ * `statusChangedAt` column the status statements write, falling back to
+ * `createdAt` for rows that predate the column. It is NEVER `updatedAt`:
+ * that column is rewritten by every edit and would make "how long has this
+ * been waiting for approval" answer "when was anything last touched".
+ *
+ * `ageDays` and `agingBucket` are computed by the reader against ONE
+ * `generatedAt` instant, so a page and its bucket strip describe the same
+ * moment. The buckets are a fixed vocabulary, not per-tenant configuration —
+ * inventing tenant-configurable brackets here would be a policy nobody asked
+ * for.
+ */
+export type CommercePurchaseAgingBucket =
+  | 'DAYS_0_7'
+  | 'DAYS_8_30'
+  | 'DAYS_31_90'
+  | 'OVER_90';
+
+export interface CommercePurchaseAgingRow {
+  id: string;
+  documentNumber: string;
+  /** Always one of DRAFT / SUBMITTED / APPROVED — terminal rows are not pending. */
+  status: string;
+  statusEnteredAt: string;
+  /** Whole days between `statusEnteredAt` and `generatedAt`. Never negative. */
+  ageDays: number;
+  agingBucket: CommercePurchaseAgingBucket;
+  totalAmount: string | null;
+  currency: string | null;
+  createdAt: string;
+}
+
+/** The pending-aging answer: the page PLUS per-bucket counts over the WHOLE pending set. */
+export interface CommercePurchaseAgingPage {
+  items: CommercePurchaseAgingRow[];
+  total: number;
+  page: number;
+  pageSize: number;
+  byBucket: Record<CommercePurchaseAgingBucket, number>;
+  /** The single instant every `ageDays`/`agingBucket` was computed against. */
+  generatedAt: string;
+}
+
+/**
+ * PHASE W2-C — the committed-cost row: one `costCenter` × `currency` bucket and
+ * the three money facts that can be stated HONESTLY from Commerce's own tables.
+ *
+ * WHY `costCenter` AND NOT A PROJECT: `PurchaseDocument` owns no project column
+ * and no Project entity exists in Ariya — Financial's `projectReference` is an
+ * opaque string from the external project list (Preflight §18). Inventing a
+ * project join here would fabricate a relationship the bounded context never
+ * stored. `costCenter` is the document's own stated charge target («مرکز
+ * هزینه»), the only authoritative grouping this schema holds; when a real
+ * project link lands this report gains it, not before.
+ *
+ * THE THREE NUMBERS, each a distinct fact so nothing is double-counted:
+ *   * `committedAmount` — Σ `totalAmount` over NON-CANCELLED documents. A
+ *     cancelled request committed nothing.
+ *   * `paidAmount` — the NET of the append-only payment ledger (compensations
+ *     are negative rows, so Σ `amount` is already the honest paid figure).
+ *   * `outstandingAmount` — `committed − paid` in exact `Decimal(18,4)`; can be
+ *     negative when a cancellation followed real payments.
+ *
+ * Money stays a STRING in the storage domain — never a JavaScript number.
+ */
+export interface CommercePurchaseCostRow {
+  costCenter: string;
+  currency: string | null;
+  documentCount: number;
+  committedAmount: string;
+  paidAmount: string;
+  outstandingAmount: string;
+}
+
+/** The cost answer: the full set of buckets plus the instant it was computed at. */
+export interface CommercePurchaseCostReport {
+  items: CommercePurchaseCostRow[];
+  generatedAt: string;
+}
+
+/**
  * The narrow read contract. Every method takes the server-resolved scope FIRST — there
  * is no shape of this port that reads another tenant's rows.
  */
@@ -207,4 +291,20 @@ export interface CommercePurchaseReportingReader {
     documentId: string,
     query: { page?: number; pageSize?: number }
   ): Promise<CommercePurchaseReportTimelinePage>;
+  /**
+   * PHASE W2-C — «گزارش تأخیر درخواست‌های خرید در جریان»: the tenant's
+   * non-terminal documents aged by their CURRENT-status entry instant, oldest
+   * first, with per-bucket counts over the whole pending population.
+   */
+  listPendingAging(
+    scope: CommerceReportingScope,
+    query: { page?: number; pageSize?: number }
+  ): Promise<CommercePurchaseAgingPage>;
+  /**
+   * PHASE W2-C — «بهای تمام‌شده بر اساس مرکز هزینه»: committed vs paid vs
+   * outstanding per cost center, from the document's own charge target and the
+   * append-only payment ledger. Currency is part of the bucket key: amounts in
+   * different currencies are never summed together.
+   */
+  listCostByCenter(scope: CommerceReportingScope): Promise<CommercePurchaseCostReport>;
 }

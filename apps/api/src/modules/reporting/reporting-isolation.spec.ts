@@ -601,7 +601,10 @@ describe('REPORTING-CONTEXT: architecture isolation', () => {
         ['payment-history-report.controller.ts', 'COMMERCE_READ', 4],
         ['production-bom-change-report.controller.ts', 'PRODUCTION_BOM_READ', 5],
         ['production-report.controller.ts', 'PRODUCTION_BOM_READ', 5],
-        ['purchase-report.controller.ts', 'COMMERCE_READ', 5],
+        // PHASE W2-C: the sixth route is `GET …/aging` and the seventh is
+        // `GET …/cost` — pending aging and committed cost, under the same
+        // `commerce.read` remit.
+        ['purchase-report.controller.ts', 'COMMERCE_READ', 7],
         // PHASE REPORTING-COMMERCE-RETURN-LIFECYCLE: the ninth controller carries FIVE —
         // list, both exports, one row, one timeline — because the return audit trail is
         // bound to the RETURN row, so the timeline answers this row's own history.
@@ -747,6 +750,19 @@ describe('REPORTING-CONTEXT: architecture isolation', () => {
       // looks for route and handler shapes, not the substring, and `xlsx`/`docx` are
       // spelled in the routes while the word `excel`/`csv`/`pdf` stays refused: a
       // format this phase does not render must not appear as an affordance.)
+      // W2-C added ONE route to the purchase report alone: `GET aging` — the
+      // pending-purchase aging report. Every other surface keeps its five reads.
+      const expectedHandlers: Record<string, string[]> = {
+        'purchase-report.controller.ts': [
+          'aging',
+          'cost',
+          'exportdocx',
+          'exportxlsx',
+          'getone',
+          'gettimeline',
+          'list',
+        ].sort(),
+      };
       for (const name of [
         'check-request-report.controller.ts',
         'hr-leave-report.controller.ts',
@@ -774,18 +790,24 @@ describe('REPORTING-CONTEXT: architecture isolation', () => {
             present: false,
           });
         }
-        // Exactly the five read handlers, by name — list, both formats, one row, timeline.
+        // Exactly the pinned read handlers, by name — list, both formats, one
+        // row, timeline; purchase-report additionally exposes `aging` (W2-C),
+        // declared before `:id` so it can never be swallowed as a document id.
         const handlers = [
           ...new Set([...controller.matchAll(/async\s+(\w+)\s*\(/g)].map((m) => m[1])),
         ].sort();
+        const expected = expectedHandlers[name] ?? [
+          'exportdocx',
+          'exportxlsx',
+          'getone',
+          'gettimeline',
+          'list',
+        ].sort();
         expect({ name, count: (controller.match(/@get\(/g) ?? []).length }).toEqual({
           name,
-          count: 5,
+          count: expected.length,
         });
-        expect({ name, handlers }).toEqual({
-          name,
-          handlers: ['exportdocx', 'exportxlsx', 'getone', 'gettimeline', 'list'].sort(),
-        });
+        expect({ name, handlers }).toEqual({ name, handlers: expected });
         // The two format routes exist under the repository's trailing-verb convention.
         for (const route of ["@get('export/xlsx')", "@get('export/docx')"]) {
           expect({ name, route, present: controller.includes(route.toLowerCase()) }).toEqual({

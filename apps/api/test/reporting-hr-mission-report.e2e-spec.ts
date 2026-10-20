@@ -49,6 +49,7 @@ import {
   responseBuffer,
 } from './reporting-export.fixtures';
 import { PrismaService as CorePrismaService } from '../src/database/prisma.service';
+import { ensureHrReportingTestProvisioning } from './fixtures/hr-provisioning';
 import { HrPrismaService } from '../src/modules/hr/database/hr-prisma.service';
 
 type SupertestResponse = import('supertest').Response;
@@ -228,7 +229,7 @@ describe('Reporting - HR Mission Request Report (seventh vertical slice)', () =>
   const reportUrl = (suffix = '') => `${API_PREFIX}/reporting/hr/mission-requests${suffix}`;
   const envelope = <T,>(body: { data?: T } | T): T =>
     (body as { data?: T }).data ?? (body as T);
-  const idsOf = (body) => envelope(body).items.map((item) => item.id);
+  const idsOf = (body: unknown) => ((envelope(body as { items?: unknown }).items ?? []) as { id: string }[]).map((item) => item.id);
 
   /** The run's own tenant-A scope — the person embeds the run id. */
   const scopeQuery = () => `employeeId=${employeeIdA}`;
@@ -479,6 +480,14 @@ describe('Reporting - HR Mission Request Report (seventh vertical slice)', () =>
 
   beforeAll(async () => {
     await waitForReadiness();
+
+    // Test-only provisioning for THIS tenant, and it MUST run BEFORE any login: login resolves
+    // the caller's permission claim through the PermissionSource port (which caches its answer),
+    // so a grant written after the first token is minted leaves every later request carrying a
+    // permission-empty identity — and every HR write below would answer 403 instead of 201.
+    // Shapes mirrored, nothing else touched: fixtures/hr-provisioning.ts.
+    await ensureHrReportingTestProvisioning(getCoreDb(), ['tenant-test-1']);
+
     const roleId = await findAdminRoleId();
 
     const seeded = await login('admin@localhost', PASSWORDS.seededAdmin);
@@ -642,21 +651,29 @@ describe('Reporting - HR Mission Request Report (seventh vertical slice)', () =>
 
 
   /**
-   * PRE-EXISTING REGISTER DRIFT — phase-external, proven here, not fixed here.
-   * The static family `GET /hr/missions/{approval-definitions, option-groups,
-   * policy-versions}` is declared AFTER `@Get(':id')` (mission.controller.ts:68,
-   * 194-246, 292-307), so Express matches the static word as `:id` and the
-   * `ParseUUIDPipe` refuses it with 400. This spec's catalogue helper reaches the
-   * SAME rows through the unshadowed POST sibling + `missionOptionGroup/
-   * missionOption` reads, and the report itself never reads the register's
-   * static lists.
+   * THE REGISTER'S STATIC GETs — reachable, and deliberately so.
+   *
+   * This test used to assert 400 for all three static paths, documenting a real shadowing
+   * defect: `@Get(':id')` was declared BEFORE the static family, Express matched
+   * `approval-definitions` as `:id`, and `ParseUUIDPipe` refused it with 400. That defect is
+   * FIXED in the register itself — `@Get(':id')` now sits LAST, with the reason written into the
+   * controller (`mission.controller.ts:338-345`, "DECLARED LAST ON PURPOSE"), after
+   * `option-groups` (185), `approval-definitions` (236) and `policy-versions` (283).
+   *
+   * Measured on the isolated cluster, once this suite's own tenant-A entitlement was
+   * provisioned: every one of the three static paths answers 200. (Before that provisioning
+   * every call here was a 403 from `RolesGuard`, so the assertion could not see the route order
+   * at all — which is why the stale expectation survived.) The expectation below is therefore
+   * updated to the product's CURRENT, intended behaviour; the drift this spec documented is
+   * closed in the product, not waived here. The report itself still never reads the register's
+   * static lists — this test remains report-external documentation of the register's surface.
    */
-  it('documents the register’s shadowed static GETs (pre-existing — report-external)', async () => {
+  it('reaches the register’s static GETs — the :id shadowing this spec documented is gone', async () => {
     for (const path of ['approval-definitions', 'option-groups', 'policy-versions']) {
       const res: SupertestResponse = await api()
         .get(`${API_PREFIX}/hr/missions/${path}`)
         .set('Authorization', `Bearer ${admin.token}`);
-      expect({ path, status: res.status }).toEqual({ path, status: 400 });
+      expect({ path, status: res.status }).toEqual({ path, status: 200 });
     }
   });
 
@@ -1034,7 +1051,7 @@ describe('Reporting - HR Mission Request Report (seventh vertical slice)', () =>
       .set('Authorization', `Bearer ${admin.token}`)
       .expect(200);
     expect(created.body.total).toBeGreaterThanOrEqual(1);
-    expect(created.body.items.map((item) => item.action)).toEqual(
+    expect(created.body.items.map((item: { action: string }) => item.action)).toEqual(
       expect.arrayContaining(['create'])
     );
 
@@ -1044,7 +1061,7 @@ describe('Reporting - HR Mission Request Report (seventh vertical slice)', () =>
       .get(reportUrl(`/${cancelledId}/timeline`))
       .set('Authorization', `Bearer ${admin.token}`)
       .expect(200);
-    const actions = cancelled.body.items.map((item) => item.action);
+    const actions = cancelled.body.items.map((item: { action: string }) => item.action);
     expect(actions).toEqual(expect.arrayContaining(['create', 'cancel']));
 
     // The policy-gated fixtures were written directly, so their timeline is an
@@ -1219,7 +1236,7 @@ describe('Reporting - HR Mission Request Report (seventh vertical slice)', () =>
     ]);
     expect(sheet.data).toHaveLength(8);
     expect(sheet.data.map((row) => row[0]).sort()).toEqual(
-      listed.items.map((item) => item.employeeCode).sort()
+      listed.items.map((item: { employeeCode: string }) => item.employeeCode).sort()
     );
     // Every state word the SEVEN-member lifecycle declares appears in the
     // exported status column (index 9) — the eight rows cover all seven.

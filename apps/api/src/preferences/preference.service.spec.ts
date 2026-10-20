@@ -65,6 +65,8 @@ describe('PreferenceService', () => {
     textScale: 125,
     motion: 'REDUCED',
     sidebarCollapsed: true,
+    navFavoritesEnabled: true,
+    navRecentEnabled: true,
     navFavorites: [] as string[],
     navRecent: [] as string[],
     dashboardLayout: null as unknown,
@@ -145,6 +147,9 @@ describe('PreferenceService', () => {
         textScale: 100,
         motion: PREFERENCE_DEFAULTS.motion,
         sidebarCollapsed: false,
+        // Opt-in personalization: BOTH default to OFF for a user who never chose.
+        navFavoritesEnabled: false,
+        navRecentEnabled: false,
         navFavorites: [],
         navRecent: [],
         customized: false,
@@ -186,6 +191,8 @@ describe('PreferenceService', () => {
         textScale: 125,
         motion: 'REDUCED',
         sidebarCollapsed: true,
+        navFavoritesEnabled: true,
+        navRecentEnabled: true,
         customized: true,
       });
     });
@@ -331,6 +338,18 @@ describe('PreferenceService', () => {
     scoped('refuses an empty patch instead of touching updatedAt for nothing', async () => {
       await expect(service.updateMine(owner, {})).rejects.toThrow(BadRequestException);
       expect(prisma.userPreference.upsert).not.toHaveBeenCalled();
+    });
+
+    scoped('persists each personalization flag independently', async () => {
+      await service.updateMine(owner, { navFavoritesEnabled: true });
+      expect(prisma.userPreference.upsert.mock.calls[0][0].update).toEqual({
+        navFavoritesEnabled: true,
+      });
+
+      await service.updateMine(owner, { navRecentEnabled: false });
+      expect(prisma.userPreference.upsert.mock.calls[1][0].update).toEqual({
+        navRecentEnabled: false,
+      });
     });
 
     scoped('never writes a userId taken from anywhere but the context', async () => {

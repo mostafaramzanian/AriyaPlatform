@@ -486,3 +486,41 @@ describe('BomChangeRequestRepository — the reporting reads (Phase REPORTING-PR
     expect(counts.get('SUBMITTED')).toBe(2);
   });
 });
+
+describe('BomChangeRequestRepository.registerSummary — the register KPI aggregation', () => {
+  it('keeps the tenant in EVERY statement and asks the decision window of decidedAt', async () => {
+    const { repository, prisma } = build();
+    prisma.bomChangeRequest.groupBy.mockResolvedValueOnce([
+      { status: 'DRAFT', _count: { _all: 2 } },
+      { status: 'APPROVED', _count: { _all: 5 } },
+    ]);
+
+    const summary = await repository.registerSummary(TENANT);
+
+    expect(prisma.bomChangeRequest.groupBy).toHaveBeenCalledWith({
+      by: ['status'],
+      where: { tenantId: TENANT },
+      _count: { _all: true },
+    });
+    const approvedCall = prisma.bomChangeRequest.count.mock.calls[0][0];
+    expect(approvedCall.where.tenantId).toBe(TENANT);
+    expect(approvedCall.where.status).toBe('APPROVED');
+    // A rolling 30-day lower bound on the DECISION instant — never a `createdAt` window,
+    // because «approved in the last 30 days» is a question about when the approver acted.
+    expect(approvedCall.where.decidedAt.gte).toBeInstanceOf(Date);
+    expect(approvedCall.where.decidedAt.gte.getTime()).toBeGreaterThan(Date.now() - 31 * 86400000);
+    expect(approvedCall.where.decidedAt.gte.getTime()).toBeLessThanOrEqual(Date.now() - 29 * 86400000);
+    // The rework bucket is REJECTED rows UNION drafts stamped NEEDS_CORRECTION — a status
+    // alone cannot see a request that was sent back, because it sits in DRAFT again.
+    const reworkCall = prisma.bomChangeRequest.count.mock.calls[1][0];
+    expect(reworkCall.where).toEqual({
+      tenantId: TENANT,
+      OR: [
+        { status: 'REJECTED' },
+        { status: 'DRAFT', managerOpinion: 'NEEDS_CORRECTION' },
+      ],
+    });
+    expect(summary.total).toBe(7);
+    expect(summary.statusCounts.get('APPROVED')).toBe(5);
+  });
+});

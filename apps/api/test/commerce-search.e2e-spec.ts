@@ -98,8 +98,15 @@ import { PurchaseCompletionPolicyController } from '../src/modules/commerce/comp
 import { PurchaseCompletionPolicyRepository } from '../src/modules/commerce/completion/purchase-completion-policy.repository';
 import { PurchaseCompletionPolicyService } from '../src/modules/commerce/completion/purchase-completion-policy.service';
 import { PurchaseCompletionService } from '../src/modules/commerce/completion/purchase-completion.service';
+import { InventoryPostingRepository } from '../src/modules/commerce/integration/inventory-posting.repository';
+import { InventoryIntegrationService } from '../src/modules/commerce/integration/inventory-integration.service';
+import { INVENTORY_POSTING_PORT } from '../src/modules/commerce/integration/inventory-posting.port';
+import { createFakeInventoryPostingPort } from './fixtures/fake-inventory-posting-port';
 import { PurchaseService } from '../src/modules/commerce/purchase/purchase.service';
 import { PurchaseTimelineService } from '../src/modules/commerce/purchase/purchase-timeline.service';
+import { PurchaseHistoryService } from '../src/modules/commerce/purchase/purchase-history.service';
+import { PurchaseHistoryRepository } from '../src/modules/commerce/purchase/purchase-history.repository';
+import { PaymentPlanRepository } from '../src/modules/commerce/payment-plan/payment-plan.repository';
 import { PurchaseRepository } from '../src/modules/commerce/purchase/purchase.repository';
 import { PaymentHistoryController } from '../src/modules/commerce/payment/payment-history.controller';
 import { PaymentHistoryService } from '../src/modules/commerce/payment/payment-history.service';
@@ -229,10 +236,12 @@ class ProbeHeaderStrategy {
       claims: null,
     });
   }
-  private success(): void {
+  private success(_arg?: unknown): void {
+      void _arg;
     throw new Error('passport replaces this method before authenticate() runs');
   }
-  private fail(): void {
+  private fail(_arg?: unknown): void {
+      void _arg;
     throw new Error('passport replaces this method before authenticate() runs');
   }
 }
@@ -324,7 +333,7 @@ describe('PHASE C8 (GAP-5) — Commerce search over real HTTP', () => {
     // collision C8-D needs to prove search cannot cross it.
     expect(docsA[0].documentNumber).toMatch(/^PR-\d{4}-\d{5}$/);
     expect(docsB[0].documentNumber).toBe(docsA[0].documentNumber);
-    expect(docsA.map((d) => d.documentNumber)).toHaveLength(new Set(docsA.map((d) => d.documentNumber)).size);
+    expect(docsA.map((d: { documentNumber: string }) => d.documentNumber)).toHaveLength(new Set(docsA.map((d: { documentNumber: string }) => d.documentNumber)).size);
   });
 
   it('fixtures: creates the commercial and workflow configuration rows in both tenants', async () => {
@@ -439,7 +448,7 @@ describe('PHASE C8 (GAP-5) — Commerce search over real HTTP', () => {
       .get(`${api}/purchase-documents?search=${encodeURIComponent(target.documentNumber)}`)
       .set(authed(userA1))
       .expect(200);
-    expect(exact.body.items.map((row) => row.id)).toEqual([target.id]);
+    expect(exact.body.items.map((row: { id: string }) => row.id)).toEqual([target.id]);
     expect(exact.body.total).toBe(1);
 
     // `mode: 'insensitive'` is the only transformation the shipped semantics guarantee, so
@@ -450,7 +459,7 @@ describe('PHASE C8 (GAP-5) — Commerce search over real HTTP', () => {
       )
       .set(authed(userA1))
       .expect(200);
-    expect(lowered.body.items.map((row) => row.id)).toEqual([target.id]);
+    expect(lowered.body.items.map((row: { id: string }) => row.id)).toEqual([target.id]);
     expect(lowered.body.total).toBe(1);
   });
 
@@ -463,7 +472,7 @@ describe('PHASE C8 (GAP-5) — Commerce search over real HTTP', () => {
       .expect(200);
 
     expect(res.body.items).toHaveLength(docsA.length);
-    expect(new Set(res.body.items.map((row) => row.id)).size).toBe(docsA.length);
+    expect(new Set(res.body.items.map((row: { id: string }) => row.id)).size).toBe(docsA.length);
     expect(res.body.total).toBe(docsA.length);
 
     // The total is the DATABASE's count under the same predicate — a server fact, not a
@@ -498,14 +507,14 @@ describe('PHASE C8 (GAP-5) — Commerce search over real HTTP', () => {
       .get(`${api}/purchase-documents?search=${encodeURIComponent(shared)}`)
       .set(authed(userA1))
       .expect(200);
-    expect(asA.body.items.map((row) => row.id)).toEqual([docsA[0].id]);
+    expect(asA.body.items.map((row: { id: string }) => row.id)).toEqual([docsA[0].id]);
     expect(asA.body.total).toBe(1);
 
     const asB = await http()
       .get(`${api}/purchase-documents?search=${encodeURIComponent(shared)}`)
       .set(authed(userB1))
       .expect(200);
-    expect(asB.body.items.map((row) => row.id)).toEqual([docsB[0].id]);
+    expect(asB.body.items.map((row: { id: string }) => row.id)).toEqual([docsB[0].id]);
     expect(asB.body.total).toBe(1);
 
     // Tenant B's SECOND number is ALSO minted inside tenant A's own series (A created five
@@ -526,8 +535,8 @@ describe('PHASE C8 (GAP-5) — Commerce search over real HTTP', () => {
       .get(`${api}/purchase-documents?search=${encodeURIComponent(overlap)}`)
       .set(authed(userA1))
       .expect(200);
-    expect(overlapAsA.body.items.map((row) => row.id)).toEqual([docsA[1].id]);
-    expect(overlapAsA.body.items.map((row) => row.id)).not.toContain(docsB[1].id);
+    expect(overlapAsA.body.items.map((row: { id: string }) => row.id)).toEqual([docsA[1].id]);
+    expect(overlapAsA.body.items.map((row: { id: string }) => row.id)).not.toContain(docsB[1].id);
     // `total` is ONE, not two: the tenant predicate is part of the COUNT as well.
     expect(overlapAsA.body.total).toBe(1);
   });
@@ -556,7 +565,7 @@ describe('PHASE C8 (GAP-5) — Commerce search over real HTTP', () => {
       .get(`${api}/purchase-documents${q}`)
       .set(authed(userReadOnly))
       .expect(200);
-    expect(reader.body.items.map((row) => row.id)).toEqual([docsA[0].id]);
+    expect(reader.body.items.map((row: { id: string }) => row.id)).toEqual([docsA[0].id]);
   });
 
   it('C8-F: pages a filtered result set — no duplicate, no loss, stable order, bounded total', async () => {
@@ -574,12 +583,12 @@ describe('PHASE C8 (GAP-5) — Commerce search over real HTTP', () => {
       ...one.body.items,
       ...two.body.items,
       ...three.body.items,
-    ].map((row) => row.id);
+    ].map((row: { id: string }) => row.id);
 
     // No duplicate, no loss: the three pages partition the five matching documents.
     expect(seen).toHaveLength(docsA.length);
     expect(new Set(seen).size).toBe(docsA.length);
-    expect([...new Set(seen)].sort()).toEqual(docsA.map((d) => d.id).sort());
+    expect([...new Set(seen)].sort()).toEqual(docsA.map((d: { id: string }) => d.id).sort());
 
     // The window is echoed and the total is the FILTERED total on every page — including
     // the page past the end, which is empty rather than an error.
@@ -596,10 +605,10 @@ describe('PHASE C8 (GAP-5) — Commerce search over real HTTP', () => {
     // Deterministic order: re-reading a page returns the identical sequence, and the order
     // itself is `createdAt desc` (ties broken by `id asc`, so pages cannot shuffle).
     const again = await pageOf(1);
-    expect(again.body.items.map((row) => row.id)).toEqual(
-      one.body.items.map((row) => row.id)
+    expect(again.body.items.map((row: { id: string }) => row.id)).toEqual(
+      one.body.items.map((row: { id: string }) => row.id)
     );
-    const times = one.body.items.map((row) => new Date(row.createdAt).getTime());
+    const times = one.body.items.map((row: { createdAt: string }) => new Date(row.createdAt).getTime());
     expect(times[0]).toBeGreaterThanOrEqual(times[1]);
   });
 
@@ -683,7 +692,7 @@ describe('PHASE C8 (GAP-5) — Commerce search over real HTTP', () => {
     // the database under the same predicate.
     const shared = await asA('c8-').expect(200);
     expect(shared.body.total).toBe(2);
-    expect(shared.body.items.map((row) => row.code)).toEqual(['C8-ALPHA', 'C8-BETA']);
+    expect(shared.body.items.map((row: { code: string }) => row.code)).toEqual(['C8-ALPHA', 'C8-BETA']);
     const expected = await db.commercialGroup.count({
       where: {
         tenantId: tenantAId,
@@ -763,12 +772,12 @@ describe('PHASE C8 (GAP-5) — Commerce search over real HTTP', () => {
     // The version's own label, upper-cased in the query — the stored label is `c8-v-one`.
     const one = await versionsOf(defA, 'C8-V-ONE', userA1).expect(200);
     expect(one.body.total).toBe(1);
-    expect(one.body.items.map((row) => row.id)).toEqual([verA1]);
+    expect(one.body.items.map((row: { id: string }) => row.id)).toEqual([verA1]);
 
     // A partial label shared by both of this definition's versions.
     const two = await versionsOf(defA, 'c8-v-', userA1).expect(200);
     expect(two.body.total).toBe(2);
-    expect(new Set(two.body.items.map((row) => row.id))).toEqual(new Set([verA1, verA2]));
+    expect(new Set(two.body.items.map((row: { id: string }) => row.id))).toEqual(new Set([verA1, verA2]));
 
     // No match.
     const none = await versionsOf(defA, 'c8-v-nine', userA1).expect(200);
@@ -780,7 +789,7 @@ describe('PHASE C8 (GAP-5) — Commerce search over real HTTP', () => {
     const bVersion = await db.workflowDefinitionVersion.findFirstOrThrow({
       where: { tenantId: tenantBId, versionLabel: 'c8-v-one' },
     });
-    expect(one.body.items.map((row) => row.id)).not.toContain(bVersion.id);
+    expect(one.body.items.map((row: { id: string }) => row.id)).not.toContain(bVersion.id);
 
     // And A's definition is not addressable from B at all — a foreign scope is a 404, never
     // a wider list.
@@ -837,6 +846,10 @@ describe('PHASE C8 (GAP-5) — Commerce search over real HTTP', () => {
     // ON the document row and are ON DELETE RESTRICT — a document keeps the versions it
     // pinned alive until the document itself is gone, and the groups wait for the versions
     // that name them.
+    // PHASE W3: append-only status events RESTRICT their document — they go first.
+    deleted.purchaseStatusEvent = (
+      await db.purchaseStatusEvent.deleteMany({ where })
+    ).count;
     deleted.purchaseLine = (await db.purchaseLine.deleteMany({ where })).count;
     deleted.purchaseDocument = (await db.purchaseDocument.deleteMany({ where })).count;
     deleted.workflowLineRoutingVersion = (
@@ -896,9 +909,18 @@ describe('PHASE C8 (GAP-5) — Commerce search over real HTTP', () => {
     PurchaseRepository,
     PurchaseService,
     PurchaseTimelineService,
+    // PHASE W3.2: the aggregated-history route on `PurchaseController` — its
+    // service and read-only repository, plus the plan repository the completion
+    // service consults for outstanding installments.
+    PurchaseHistoryService,
+    PurchaseHistoryRepository,
+    PaymentPlanRepository,
     PurchaseCompletionPolicyRepository,
     PurchaseCompletionPolicyService,
     PurchaseCompletionService,
+    InventoryPostingRepository,
+    InventoryIntegrationService,
+    { provide: INVENTORY_POSTING_PORT, useValue: createFakeInventoryPostingPort() },
     PaymentHistoryRepository,
     PaymentHistoryService,
     ReceivingHistoryRepository,

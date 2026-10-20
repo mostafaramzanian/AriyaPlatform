@@ -99,8 +99,15 @@ import { PurchaseController } from '../src/modules/commerce/purchase/purchase.co
 import { PurchaseCompletionPolicyRepository } from '../src/modules/commerce/completion/purchase-completion-policy.repository';
 import { PurchaseCompletionPolicyService } from '../src/modules/commerce/completion/purchase-completion-policy.service';
 import { PurchaseCompletionService } from '../src/modules/commerce/completion/purchase-completion.service';
+import { InventoryPostingRepository } from '../src/modules/commerce/integration/inventory-posting.repository';
+import { InventoryIntegrationService } from '../src/modules/commerce/integration/inventory-integration.service';
+import { INVENTORY_POSTING_PORT } from '../src/modules/commerce/integration/inventory-posting.port';
+import { createFakeInventoryPostingPort } from './fixtures/fake-inventory-posting-port';
 import { PurchaseService } from '../src/modules/commerce/purchase/purchase.service';
 import { PurchaseTimelineService } from '../src/modules/commerce/purchase/purchase-timeline.service';
+import { PurchaseHistoryService } from '../src/modules/commerce/purchase/purchase-history.service';
+import { PurchaseHistoryRepository } from '../src/modules/commerce/purchase/purchase-history.repository';
+import { PaymentPlanRepository } from '../src/modules/commerce/payment-plan/payment-plan.repository';
 import { PurchaseRepository } from '../src/modules/commerce/purchase/purchase.repository';
 import { PaymentHistoryService } from '../src/modules/commerce/payment/payment-history.service';
 import { PaymentHistoryRepository } from '../src/modules/commerce/payment/payment-history.repository';
@@ -229,10 +236,12 @@ class ProbeHeaderStrategy {
       claims: null,
     });
   }
-  private success(): void {
+  private success(_arg?: unknown): void {
+      void _arg;
     throw new Error('passport replaces this method before authenticate() runs');
   }
-  private fail(): void {
+  private fail(_arg?: unknown): void {
+      void _arg;
     throw new Error('passport replaces this method before authenticate() runs');
   }
 }
@@ -545,6 +554,10 @@ describe('PHASE C9 (GAP-5) — Commerce in Platform Global Search over real HTTP
     // Purchase documents have no deletion PATH (the schema says so) — this exercises the
     // platform's stale-projection rule against direct drift, which is the removal
     // semantics Commerce actually has: the re-read is the truth.
+    // PHASE W3: append-only status events RESTRICT their document — they go first.
+    await db.purchaseStatusEvent.deleteMany({
+      where: { tenantId: tenantAId, purchaseDocumentId: docA3.id },
+    });
     await db.purchaseLine.deleteMany({
       where: { tenantId: tenantAId, purchaseDocumentId: docA3.id },
     });
@@ -642,6 +655,7 @@ describe('PHASE C9 (GAP-5) — Commerce in Platform Global Search over real HTTP
   afterAll(async () => {
     // Commerce: lines first (RESTRICT), then the documents this suite minted.
     const where = { tenantId: { in: [tenantAId, tenantBId] } };
+    await db.purchaseStatusEvent.deleteMany({ where });
     await db.purchaseLine.deleteMany({ where: { tenantId: { in: [tenantAId, tenantBId] } } });
     const deleted = await db.purchaseDocument.deleteMany({ where });
 
@@ -695,9 +709,18 @@ describe('PHASE C9 (GAP-5) — Commerce in Platform Global Search over real HTTP
     PurchaseRepository,
     PurchaseService,
     PurchaseTimelineService,
+    // PHASE W3.2: the aggregated-history route on `PurchaseController` — its
+    // service and read-only repository, plus the plan repository the completion
+    // service consults for outstanding installments.
+    PurchaseHistoryService,
+    PurchaseHistoryRepository,
+    PaymentPlanRepository,
     PurchaseCompletionPolicyRepository,
     PurchaseCompletionPolicyService,
     PurchaseCompletionService,
+    InventoryPostingRepository,
+    InventoryIntegrationService,
+    { provide: INVENTORY_POSTING_PORT, useValue: createFakeInventoryPostingPort() },
     PaymentHistoryRepository,
     PaymentHistoryService,
     ReceivingHistoryRepository,

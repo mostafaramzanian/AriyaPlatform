@@ -44,6 +44,9 @@ const requirementFor = (runtime: RuntimeId, key: CheckKey): Requirement => {
   for (const service of INFRASTRUCTURE_SERVICES) {
     if (INFRASTRUCTURE_CHECK_KEYS[service] === key) return policy.infrastructure[service];
   }
+  // PHASE W3: the revocation-feed check is always OPTIONAL on every runtime —
+  // ttl-bound-only is a documented degraded posture, never a gate.
+  if (key === 'tokenRevocationFeed') return 'optional';
   throw new Error(`No requirement declared for check "${key}"`);
 };
 
@@ -124,7 +127,7 @@ describe('ReadinessEvaluator', () => {
       const report = evaluatorFor('core').evaluate(baseline('core'));
 
       expect(report.healthy).toBe(true);
-      expect(report.skipped).toBe(6); // cms, correspondence, HR, Commerce, Production and Financial
+      expect(report.skipped).toBe(7); // cms, correspondence, HR, Commerce, Production, Financial and Inventory
       expect(report.statuses.cmsDatabase).toBe('not-used');
       expect(report.checks.cmsDatabase).toBe(true);
       expect(report.statuses.correspondenceDatabase).toBe('not-used');
@@ -254,7 +257,7 @@ describe('ReadinessEvaluator', () => {
       // stop reporting it.
       expect(DATASOURCES.length).toBeGreaterThan(0);
       expect(INFRASTRUCTURE_SERVICES.length).toBeGreaterThan(0);
-      expect(CHECK_KEYS).toHaveLength(DATASOURCES.length + INFRASTRUCTURE_SERVICES.length);
+      expect(CHECK_KEYS).toHaveLength(DATASOURCES.length + INFRASTRUCTURE_SERVICES.length + 1); // +1: tokenRevocationFeed (W3 security check)
     });
 
     it('keeps every requirement in the report identical to the runtime policy', () => {

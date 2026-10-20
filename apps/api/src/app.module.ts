@@ -67,6 +67,7 @@ import { ProductionModule } from './modules/production/production.module';
 // of Core is the platform ports it must not own (identity, audit, entitlement) — never
 // Core's Prisma client, and never another business module's.
 import { FinancialModule } from './modules/financial/financial.module';
+import { InventoryModule } from './modules/inventory/inventory.module';
 // Phase REPORTING-CONTEXT: Reporting — the reporting bounded context — composed HERE
 // exactly like Correspondence, HR, Commerce, Production and Financial, and deliberately
 // NOT in `CoreAppModule` (enforced by `reporting-isolation.spec.ts`): the Core-only
@@ -188,6 +189,7 @@ import { RateLimitMiddleware } from './common/rate-limit.middleware';
     // name it from the datasource policy, so this line and the matrix cannot drift apart
     // silently.
     FinancialModule,
+    InventoryModule,
     // Phase REPORTING-AI-CONSUMER: Reporting joins the COMBINED composition root under
     // the same rule as the bounded contexts above — and one of its own: it declares no
     // providers, controllers or datasource yet, because no Reporting domain contract

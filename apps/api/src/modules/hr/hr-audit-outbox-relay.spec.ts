@@ -9,11 +9,15 @@ import { HrPrismaService } from './database/hr-prisma.service';
  *   - Successful delivery + deletion
  *   - Duplicate delivery + deletion (idempotent)
  *   - Rejection → reschedule (not deletion)
- *   - Conflict → reschedule + logged alarm
+ *   - Conflict → parked IMMEDIATELY (a deterministic identity collision: the
+ *     same auditId with different content can never succeed on a retry)
  *   - Transport error → reschedule with backoff
- *   - Malformed payload → logged, not crashed, not deleted
+ *   - Malformed payload → parked immediately (never dispatched, never left due)
  *   - Backoff is bounded at MAX_BACKOFF_MS
  *   - Tenant identity is preserved in relay delivery
+ *   - Phase B5: each row is CLAIMED (single flight) before dispatch, so two poll
+ *     ticks — or two instances sharing `hr_db` — never publish the same event
+ *     twice; a lost or failed claim skips the row without dispatching
  *   - No Core Prisma access
  */
 
@@ -49,10 +53,14 @@ function buildRelay() {
   const updated: { id: string; data: Record<string, unknown> }[] = [];
   let findResult: unknown[] = [];
   let recordResult: Record<string, unknown> = { status: 'recorded' };
+  // Phase B5: the single-flight claim's verdict. Default = this caller won.
+  let claimResult: { count: number } = { count: 1 };
 
   const prisma = {
     auditOutbox: {
       findMany: jest.fn(async () => findResult),
+      // Phase B5: the atomic claim. Modelled as the relay uses it — a count.
+      updateMany: jest.fn(async () => claimResult),
       delete: jest.fn(async ({ where }: { where: { id: string } }) => {
         deleted.push(where.id);
       }),
@@ -85,6 +93,7 @@ function buildRelay() {
     updated,
     setFindResult: (rows: unknown[]) => { findResult = rows; },
     setRecordResult: (r: Record<string, unknown>) => { recordResult = r; },
+    setClaimResult: (r: { count: number }) => { claimResult = r; },
   };
 }
 
@@ -158,7 +167,47 @@ describe('HrAuditOutboxRelayService', () => {
     ctx.setFindResult([makeRow({ payload: null })]);
     await ctx.service.relay();
 
-    // No record call, no deletion, no reschedule
+    // No record call, no deletion — but the row is PARKED (~24h), not left
+    // due for the next poll tick.
+    expect(ctx.auditPort.record).not.toHaveBeenCalled();
+    expect(ctx.deleted).toEqual([]);
+    expect(ctx.updated).toHaveLength(1);
+    const parkedAt = ctx.updated[0].data.nextAt as Date;
+    expect(parkedAt.getTime() - Date.now()).toBeGreaterThanOrEqual(86_000_000);
+  });
+
+  it('parks a conflict IMMEDIATELY — an integrity incident is never hot-looped', async () => {
+    const ctx = buildRelay();
+    ctx.setRecordResult({ status: 'conflict', code: 'DIGEST_MISMATCH' });
+    ctx.setFindResult([makeRow()]);
+    await ctx.service.relay();
+
+    expect(ctx.deleted).toEqual([]);
+    expect(ctx.updated).toHaveLength(1);
+    // Phase B5: this row parked on its 100th attempt before — a conflict is
+    // deterministic, so retrying it 100 times was pure poison. Park on attempt 1.
+    expect(ctx.updated[0].data.attempts).toBe(1);
+    const nextAt = ctx.updated[0].data.nextAt as Date;
+    expect(nextAt.getTime() - Date.now()).toBeGreaterThanOrEqual(86_000_000);
+  });
+
+  it('claims the row before dispatching — a lost claim means no dispatch', async () => {
+    const ctx = buildRelay();
+    ctx.setFindResult([makeRow()]);
+    ctx.setClaimResult({ count: 0 });
+    await ctx.service.relay();
+
+    expect(ctx.auditPort.record).not.toHaveBeenCalled();
+    expect(ctx.deleted).toEqual([]);
+    expect(ctx.updated).toEqual([]);
+  });
+
+  it('a failed claim is logged and leaves the row for the next tick', async () => {
+    const ctx = buildRelay();
+    ctx.setFindResult([makeRow()]);
+    ctx.prisma.auditOutbox.updateMany.mockRejectedValueOnce(new Error('db gone'));
+    await ctx.service.relay();
+
     expect(ctx.auditPort.record).not.toHaveBeenCalled();
     expect(ctx.deleted).toEqual([]);
     expect(ctx.updated).toEqual([]);
@@ -167,7 +216,7 @@ describe('HrAuditOutboxRelayService', () => {
   it('bounds backoff at MAX_BACKOFF_MS (5 minutes)', async () => {
     const ctx = buildRelay();
     ctx.setRecordResult({ status: 'rejected', code: 'INVALID' });
-    ctx.setFindResult([makeRow({ attempts: 100 })]);
+    ctx.setFindResult([makeRow({ attempts: 50 })]);
     await ctx.service.relay();
 
     expect(ctx.updated).toHaveLength(1);
@@ -176,7 +225,20 @@ describe('HrAuditOutboxRelayService', () => {
     const actualBackoff = nextAt.getTime() - Date.now();
     // Should not exceed max backoff + a small tolerance
     expect(actualBackoff).toBeLessThanOrEqual(maxMs + 5000);
-    expect(ctx.updated[0].data.attempts).toBe(101);
+    expect(ctx.updated[0].data.attempts).toBe(51);
+  });
+
+  it('parks a deterministic rejection after 100 attempts — next retry is a day away', async () => {
+    const ctx = buildRelay();
+    ctx.setRecordResult({ status: 'rejected', code: 'INVALID' });
+    ctx.setFindResult([makeRow({ attempts: 99 })]);
+    await ctx.service.relay();
+
+    expect(ctx.updated).toHaveLength(1);
+    const nextAt = ctx.updated[0].data.nextAt as Date;
+    // Parked rows are kept (never deleted) but retried only once a day.
+    expect(ctx.updated[0].data.attempts).toBe(100);
+    expect(nextAt.getTime() - Date.now()).toBeGreaterThanOrEqual(86_000_000);
   });
 
   it('processes multiple rows in order', async () => {

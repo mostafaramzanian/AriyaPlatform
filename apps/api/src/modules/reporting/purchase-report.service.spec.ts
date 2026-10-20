@@ -61,6 +61,15 @@ function readerWith(
         rows.find((row) => row.id === documentId && scope.tenantId === 'tenant-a') ?? null
     ),
     getReportTimeline: jest.fn(async () => timeline),
+    listPendingAging: jest.fn(async () => ({
+      items: [],
+      total: 0,
+      page: 1,
+      pageSize: 20,
+      byBucket: { DAYS_0_7: 0, DAYS_8_30: 0, DAYS_31_90: 0, OVER_90: 0 },
+      generatedAt: '2026-02-01T00:00:00.000Z',
+    })),
+    listCostByCenter: jest.fn(async () => ({ items: [], generatedAt: '2026-02-01T00:00:00.000Z' })),
   };
   return { reader, calls };
 }
@@ -165,6 +174,8 @@ describe('PurchaseReportService — the second Reporting business capability', (
       getReportTimeline: jest.fn(async () => {
         throw Object.assign(new Error('down'), { code: 'AUDIT_READ_FAILED' });
       }),
+      listPendingAging: jest.fn(),
+      listCostByCenter: jest.fn(),
     };
     const service = new PurchaseReportService(failing);
 
@@ -243,7 +254,16 @@ describe('PurchaseReportService — the second Reporting business capability', (
     const names = Object.getOwnPropertyNames(PurchaseReportService.prototype).filter(
       (name) => name !== 'constructor'
     );
-    expect(names.sort()).toEqual(['exportReport', 'getOne', 'getTimeline', 'list'].sort());
+    expect(names.sort()).toEqual(
+      [
+        'exportReport',
+        'getOne',
+        'getTimeline',
+        'list',
+        'listCostByCenter',
+        'listPendingAging',
+      ].sort()
+    );
   });
 
   it('fails closed without a tenant — the actor, never a default', async () => {

@@ -6,6 +6,7 @@ import { DatasourceHealthProbe } from './datasource-health.probe';
 import { createDatasourceProbeProviders } from './datasource-probe.registry';
 import { InfrastructureHealthProbe } from './infrastructure-health.probe';
 import { ReadinessEvaluator } from './readiness.evaluator';
+import { RevocationFeedProbe } from './revocation-feed.probe';
 
 /**
  * Phase ARCH-1.3: the ONLY place that binds a concrete runtime to the health graph.
@@ -31,6 +32,9 @@ export function createHealthProviders(runtime: RuntimeId): Provider[] {
     HealthService,
     DatasourceHealthProbe,
     InfrastructureHealthProbe,
+    // PHASE W3: reports the token-revocation feed posture on every runtime;
+    // where no token seam is bound the probe reports `not-configured`.
+    RevocationFeedProbe,
     ReadinessEvaluator,
     { provide: RUNTIME_ID, useValue: runtime },
     createDatasourceProbeProviders(runtime),

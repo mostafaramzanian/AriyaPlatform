@@ -111,14 +111,24 @@ function buildService() {
     }),
   };
   const directory = { findTenantMember: jest.fn().mockResolvedValue({ id: 'member' }) };
+  // W2-C: the order-reference port — resolves every stated reference by default;
+  // individual tests override `resolve` to exercise the rejection path.
+  const orderReferences: { resolve: jest.Mock } = {
+    resolve: jest.fn(async (_tenantId: string, orderReference: string) => ({
+      orderReference,
+      projectReference: null,
+      displayName: orderReference,
+    })),
+  };
 
   const service = new CheckRequestService(
     repository as unknown as CheckRequestRepository,
     attachments as unknown as CheckAttachmentRepository,
     audit as unknown as FinancialAuditGateway,
-    directory as unknown as UserDirectoryContract
+    directory as unknown as UserDirectoryContract,
+    orderReferences
   );
-  return { service, repository, attachments, audit, directory };
+  return { service, repository, attachments, audit, directory, orderReferences };
 }
 
 describe('Phase F1 — CheckRequestService.create', () => {
@@ -195,6 +205,36 @@ describe('Phase F1 — CheckRequestService.create', () => {
       row({ ...data, tenantId })
     );
     await expect(service.create(actor(), { checkIssueType: 'PETTY_CASH' })).resolves.toBeTruthy();
+  });
+
+  it('rejects a PURCHASE order reference that resolves to nothing — typed code, nothing written (W2-C)', async () => {
+    const { service, repository, orderReferences } = buildService();
+    orderReferences.resolve.mockResolvedValue(null);
+
+    const error = await service
+      .create(actor(), {
+        checkIssueType: 'PURCHASE',
+        purchaseType: 'NON_PROJECT',
+        orderReference: 'PR-0000-foreign',
+      })
+      .catch((e) => e);
+
+    expect(error).toBeInstanceOf(BadRequestException);
+    expect(error.getResponse().code).toBe(CHECK_REQUEST_ERROR_CODES.ORDER_REFERENCE_UNKNOWN);
+    expect(orderReferences.resolve).toHaveBeenCalledWith(TENANT, 'PR-0000-foreign');
+    expect(repository.create).not.toHaveBeenCalled();
+  });
+
+  it('does NOT consult the order port for non-PURCHASE types or an absent reference', async () => {
+    const { service, repository, orderReferences } = buildService();
+    repository.create.mockImplementation(async (tenantId: string, data: Record<string, unknown>) =>
+      row({ ...data, tenantId })
+    );
+
+    await service.create(actor(), { checkIssueType: 'PETTY_CASH' });
+    await service.create(actor(), { checkIssueType: 'SALARY' });
+
+    expect(orderReferences.resolve).not.toHaveBeenCalled();
   });
 
   it('clears for حقوق: orderReference, purchaseType and projectReference (V7)', async () => {

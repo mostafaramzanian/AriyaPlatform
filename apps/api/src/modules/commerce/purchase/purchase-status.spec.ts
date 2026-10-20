@@ -75,7 +75,7 @@ describe('Phase C1 Step L — the commercial transition table', () => {
     );
   });
 
-  it('permits exactly §3-F’s three edges and refuses the other 33 pairs', () => {
+  it('permits exactly §3-F’s three edges plus the reopen edge, and refuses the rest', () => {
     const legal = PURCHASE_DOCUMENT_STATUSES.flatMap((from) =>
       PURCHASE_DOCUMENT_STATUSES.filter((to) => canTransitionPurchaseDocument(from, to)).map(
         (to) => `${from}->${to}`
@@ -83,11 +83,17 @@ describe('Phase C1 Step L — the commercial transition table', () => {
     );
 
     // `DRAFT → SUBMITTED` is step L's, the two `SUBMITTED → …` edges are step P's
-    // (§3-F) and are written ONLY by the commercial projection writer. Sorted, because
-    // the assertion is about the SET of edges and flatMap order is an implementation
-    // detail of the table's declaration.
+    // (§3-F) and are written ONLY by the commercial projection writer, and
+    // `REJECTED → DRAFT` is the reopen act's — the document returns to the one
+    // editable status and every rejection stays on the settled instance.
+    // Sorted, because the assertion is about the SET of edges.
     expect([...legal].sort()).toEqual(
-      ['DRAFT->SUBMITTED', 'SUBMITTED->APPROVED', 'SUBMITTED->REJECTED'].sort()
+      [
+        'DRAFT->SUBMITTED',
+        'REJECTED->DRAFT',
+        'SUBMITTED->APPROVED',
+        'SUBMITTED->REJECTED',
+      ].sort()
     );
   });
 

@@ -55,12 +55,20 @@ export interface PurchaseOrderReferenceResolution {
 /**
  * The one question a future phase may ask.
  *
- * `resolve` is tenant-scoped by CONSTRUCTION: the implementation the future phase writes
- * will read the tenant from the same request context every other platform port uses, so
- * this signature cannot be asked for another tenant's order. It is async because any
- * real implementation is, and returning `null` — not throwing — is reserved for "this
- * tenant has no such order", mirroring `UserDirectoryContract.findTenantMember`.
+ * `resolve` is tenant-scoped by PARAMETER: the calling service holds the request
+ * actor and passes `tenantId` explicitly, so this signature cannot be asked for
+ * another tenant's order and needs no ambient context. It is async because any
+ * real implementation is, and returning `null` — not throwing — is reserved for
+ * "this tenant has no such order", mirroring `UserDirectoryContract.findTenantMember`.
+ *
+ * PHASE W2-C: the port is now BOUND — the neutral bridge module
+ * `modules/purchase-order-reference/` provides it against Commerce's exported
+ * `CommerceOrderReferenceFacade`, and `CheckRequestService` injects it to
+ * validate `orderReference` at create and update time.
  */
 export interface PurchaseOrderReferencePort {
-  resolve(orderReference: string): Promise<PurchaseOrderReferenceResolution | null>;
+  resolve(
+    tenantId: string,
+    orderReference: string
+  ): Promise<PurchaseOrderReferenceResolution | null>;
 }

@@ -94,6 +94,7 @@ function storedDocument(
     requesterId: 'u1',
     supplierId: null,
     currency: null,
+    costCenter: null,
     status: 'DRAFT',
     subtotalAmount: '25.0000',
     taxAmount: '1.2500',
@@ -140,8 +141,12 @@ type RepositoryDouble = {
     | 'createDocument'
     | 'findDocumentById'
     | 'listDocumentPage'
+    | 'countByStatus'
+    | 'findSpendSince'
+    | 'findCostCenters'
     | 'updateEditableDocument'
-    | 'markDocumentSubmittedIn']: jest.Mock;
+    | 'markDocumentSubmittedIn'
+    | 'reopenDocumentIn']: jest.Mock;
 };
 type IdentityDouble = {
   [K in 'assertMember' | 'profilesFor']: jest.Mock;
@@ -170,8 +175,12 @@ function build() {
     createDocument: jest.fn(),
     findDocumentById: jest.fn(),
     listDocumentPage: jest.fn(),
+    countByStatus: jest.fn(),
+    findSpendSince: jest.fn(),
+    findCostCenters: jest.fn(),
     updateEditableDocument: jest.fn(),
     markDocumentSubmittedIn: jest.fn(),
+    reopenDocumentIn: jest.fn(),
   };
 
   const identity: IdentityDouble = {
@@ -247,8 +256,12 @@ function build() {
   repository.createDocument.mockResolvedValue(storedDocument());
   repository.findDocumentById.mockResolvedValue(null);
   repository.listDocumentPage.mockResolvedValue([[], 0]);
+  repository.countByStatus.mockResolvedValue(new Map());
+  repository.findSpendSince.mockResolvedValue([]);
+  repository.findCostCenters.mockResolvedValue([]);
   repository.updateEditableDocument.mockResolvedValue(null);
   repository.markDocumentSubmittedIn.mockResolvedValue(null);
+  repository.reopenDocumentIn.mockResolvedValue(null);
   identity.assertMember.mockResolvedValue(undefined);
   identity.profilesFor.mockResolvedValue(
     new Map([['u1', { id: 'u1', displayName: 'Requester' }]])
@@ -263,6 +276,7 @@ function build() {
     listDocumentPage: repository.listDocumentPage.mock.calls,
     updateEditableDocument: repository.updateEditableDocument.mock.calls,
     markDocumentSubmittedIn: repository.markDocumentSubmittedIn.mock.calls,
+    reopenDocumentIn: repository.reopenDocumentIn.mock.calls,
     assertMember: identity.assertMember.mock.calls,
     profilesFor: identity.profilesFor.mock.calls,
     audit: audit.record.mock.calls,
@@ -858,9 +872,10 @@ describe('Phase C1 Step L — PurchaseService.submit', () => {
 
     const submitted = await service.submit(actor, 'd1');
 
-    // Phase B2.3: 4th arg is the outbox payload.
+    // Phase B2.3 + W3: 4th arg is the acting user (status-event provenance),
+    // 5th is the outbox payload.
     expect(calls.markDocumentSubmittedIn).toEqual([
-      ['t1', expect.anything(), 'd1', expect.objectContaining({ tenantId: 't1' })],
+      ['t1', expect.anything(), 'd1', 'u1', expect.objectContaining({ tenantId: 't1' })],
     ]);
     // `editable` flips with the status through the same function the update guard uses,
     // so the document a client renders is the document its next PATCH will be refused on.
@@ -1042,3 +1057,167 @@ describe('Phase C1 Step L — PurchaseService.submit', () => {
     });
   });
 });
+
+describe('PurchaseService.summary — the home surface aggregate read', () => {
+  it('scopes the spend window to the acting tenant and zero-fills an empty register', async () => {
+    const { service, repository } = build();
+
+    const summary = await service.summary(actor);
+
+    // Tenant-first, like every other read in this repository.
+    expect(repository.findSpendSince.mock.calls[0][0]).toBe('t1');
+    expect(repository.countByStatus.mock.calls[0][0]).toBe('t1');
+    expect(summary).toMatchObject({
+      total: 0,
+      submitted: 0,
+      monthTotal: '0',
+      previousMonthTotal: '0',
+    });
+    // The sparkline contract: exactly 30 daily buckets, ending today.
+    expect(summary.daily).toHaveLength(30);
+  });
+
+  it('sums only live documents inside the Jalali-month windows', async () => {
+    const { service, repository } = build();
+    const now = new Date();
+    const old = new Date(now.getTime() - 400 * 86_400_000); // far before any window
+
+    repository.countByStatus.mockResolvedValue(
+      new Map([
+        ['DRAFT', 2],
+        ['SUBMITTED', 1],
+      ] as Array<[string, number]>)
+    );
+    repository.findSpendSince.mockResolvedValue([
+      // This month, live — counted.
+      { createdAt: now, totalAmount: '100.0000', status: 'APPROVED' },
+      // This month, CANCELLED — never spends.
+      { createdAt: now, totalAmount: '999.0000', status: 'CANCELLED' },
+      // This month, unpriced — contributes nothing.
+      { createdAt: now, totalAmount: null, status: 'DRAFT' },
+      // Before every window — only reachable if the since bound were ignored.
+      { createdAt: old, totalAmount: '50.0000', status: 'APPROVED' },
+    ]);
+
+    const summary = await service.summary(actor);
+
+    expect(summary.total).toBe(3);
+    expect(summary.submitted).toBe(1);
+    expect(summary.monthTotal).toBe('100.0000');
+    expect(summary.previousMonthTotal).toBe('0');
+    // Today's bucket carries the live amount; no other day does.
+    expect(summary.daily.at(-1)).toBe(100);
+    expect(summary.daily.slice(0, -1).every((v) => v === 0)).toBe(true);
+  });
+
+  it('reports per-status counts, the in-circulation total and distinct cost centers', async () => {
+    const { service, repository } = build();
+    repository.countByStatus.mockResolvedValue(
+      new Map([
+        ['DRAFT', 26],
+        ['SUBMITTED', 14],
+        ['APPROVED', 7],
+        ['REJECTED', 1],
+      ] as Array<[string, number]>)
+    );
+    repository.findCostCenters.mockResolvedValue(['انبار مرکزی', 'دفتر مرکزی تهران']);
+    repository.findSpendSince.mockResolvedValue([
+      { createdAt: new Date(), totalAmount: '30.0000', status: 'APPROVED' },
+      { createdAt: new Date(), totalAmount: '20.0000', status: 'SUBMITTED' },
+      // Cancelled never spends — in-circulation excludes it exactly like the months.
+      { createdAt: new Date(), totalAmount: '999.0000', status: 'CANCELLED' },
+      { createdAt: new Date(), totalAmount: null, status: 'DRAFT' },
+    ]);
+
+    const summary = await service.summary(actor);
+
+    expect(summary.statusCounts).toEqual({ DRAFT: 26, SUBMITTED: 14, APPROVED: 7, REJECTED: 1 });
+    expect(summary.inCirculationTotal).toBe('50.0000');
+    expect(summary.costCenters).toEqual(['انبار مرکزی', 'دفتر مرکزی تهران']);
+  });
+
+  it('projects costCenter through the wire serialization', async () => {
+    const { service, repository } = build();
+    repository.findDocumentById.mockResolvedValue(
+      storedDocument({ costCenter: 'دفتر مرکزی تهران' })
+    );
+
+    const document = await service.getOne(actor, 'd1');
+
+    expect(document.costCenter).toBe('دفتر مرکزی تهران');
+  });
+
+  it('passes a stated costCenter into the create write', async () => {
+    const { service, repository } = build();
+
+    await service.create(actor, {
+      requesterId: 'u1',
+      costCenter: 'معاونت فناوری',
+      lines: [{ lineType: 'STANDARD', quantity: 1, unit: 'kg' }],
+    } as Parameters<typeof service.create>[1]);
+
+    expect(repository.createDocument.mock.calls[0][1].costCenter).toBe('معاونت فناوری');
+  });
+});
+
+describe('REACTIVATION (GAP-6 follow-up) — PurchaseService.reopen', () => {
+  it('404s an unknown document and never reaches the repository write', async () => {
+    const { service, repository } = build();
+    repository.findDocumentById.mockResolvedValue(null);
+
+    await expect(service.reopen(actor, 'missing')).rejects.toThrow(NotFoundException);
+    expect(repository.reopenDocumentIn).not.toHaveBeenCalled();
+  });
+
+  it('refuses any status but REJECTED with the status named, writing nothing', async () => {
+    for (const status of ['DRAFT', 'SUBMITTED', 'APPROVED', 'CANCELLED', 'CLOSED'] as const) {
+      const { service, repository, unitOfWork } = build();
+      repository.findDocumentById.mockResolvedValue(storedDocument({ status }));
+
+      await expect(service.reopen(actor, 'd1')).rejects.toThrow(ConflictException);
+      expect(repository.reopenDocumentIn).not.toHaveBeenCalled();
+      expect(unitOfWork.run).not.toHaveBeenCalled();
+    }
+  });
+
+  it('moves REJECTED → DRAFT once, through the conditional write, with the reopen audit row', async () => {
+    const { service, repository, calls } = build();
+    repository.findDocumentById.mockResolvedValue(storedDocument({ status: 'REJECTED' }));
+    repository.reopenDocumentIn.mockResolvedValue(storedDocument({ status: 'DRAFT' }));
+
+    const result = await service.reopen(actor, 'd1');
+
+    // The outbox row records the act before the unit of work, with BOTH statuses.
+    expect(calls.auditOutbox).toEqual([
+      [
+        actor,
+        expect.objectContaining({
+          action: PURCHASE_AUDIT_ACTION.REOPEN,
+          resource: COMMERCE_AUDIT_RESOURCE.PURCHASE_DOCUMENT,
+          resourceId: 'd1',
+          oldValue: { status: 'REJECTED' },
+          newValue: { status: 'DRAFT' },
+        }),
+      ],
+    ]);
+    // Tenant-first, inside the unit of work, carrying the outbox — one act.
+    expect(calls.reopenDocumentIn[0][0]).toBe('t1');
+    expect(calls.reopenDocumentIn[0][1]).toEqual({});
+    expect(calls.reopenDocumentIn[0][3]).toBe('u1');
+    expect(calls.reopenDocumentIn[0][4]).toEqual(
+      expect.objectContaining({ auditId: 'outbox-audit-id' })
+    );
+    // The answer is the document as every other route projects it — no tenant on the wire.
+    expect(result).toMatchObject({ id: 'd1', status: 'DRAFT', documentNumber: 'PR-1405-00001' });
+    expect(result).not.toHaveProperty('tenantId');
+  });
+
+  it('answers 409 when the conditional write matches nothing — a lost reopen race is never success', async () => {
+    const { service, repository } = build();
+    repository.findDocumentById.mockResolvedValue(storedDocument({ status: 'REJECTED' }));
+    repository.reopenDocumentIn.mockResolvedValue(null);
+
+    await expect(service.reopen(actor, 'd1')).rejects.toThrow(ConflictException);
+  });
+});
+

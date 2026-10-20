@@ -26,11 +26,12 @@ describe('PurchaseReportController — three reads, one remit, no writes', () =>
   const rolesOf = (handler: string): string[] | undefined =>
     Reflect.getMetadata('roles', proto[handler]);
 
-  it('exposes exactly the five report reads — list, both export formats, one row, one timeline', () => {
+  it('exposes exactly the seven report reads — list, both formats, aging, cost, one row, one timeline', () => {
     // REPORTING-VISUALIZATION-EXPORT added `export/xlsx` + `export/docx`: two more GETs
     // over the SAME DTO and remit — never a verb, never a second permission.
+    // PHASE W2-C added `aging` and `cost` under the identical remit.
     expect(handlers().sort()).toEqual(
-      ['exportDocx', 'exportXlsx', 'getOne', 'getTimeline', 'list'].sort()
+      ['aging', 'cost', 'exportDocx', 'exportXlsx', 'getOne', 'getTimeline', 'list'].sort()
     );
     for (const handler of handlers()) {
       expect(methodOf(handler)).toBe(RequestMethod.GET);

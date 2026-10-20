@@ -34,6 +34,7 @@ import {
 } from './reporting-export.fixtures';
 import { PrismaService as CorePrismaService } from '../src/database/prisma.service';
 import { FinancialPrismaService } from '../src/modules/financial/database/financial-prisma.service';
+import { AuditOutboxRelayService } from '../src/modules/financial/audit-outbox-relay.service';
 
 type SupertestResponse = import('supertest').Response;
 
@@ -295,8 +296,8 @@ describe('Reporting — Check Request Status & Flow Report (first vertical slice
       .set('Authorization', `Bearer ${admin.token}`)
       .expect(200);
 
-    const draftIds = envelope(drafts.body).items.map((item) => item.id);
-    const submittedIds = envelope(submitted.body).items.map((item) => item.id);
+    const draftIds = envelope(drafts.body).items.map((item: { id: string }) => item.id);
+    const submittedIds = envelope(submitted.body).items.map((item: { id: string }) => item.id);
 
     expect(draftIds).toContain(draftId);
     expect(draftIds).not.toContain(submittedId);
@@ -314,7 +315,7 @@ describe('Reporting — Check Request Status & Flow Report (first vertical slice
 
     const body = envelope(res.body);
     for (const item of body.items) expect(item.title).toContain('تنخواه');
-    const ids = body.items.map((item) => item.id);
+    const ids = body.items.map((item: { id: string }) => item.id);
     expect(ids).toEqual(expect.arrayContaining([draftId, submittedId]));
   });
 
@@ -335,7 +336,7 @@ describe('Reporting — Check Request Status & Flow Report (first vertical slice
       .get(`${reportUrl()}?status=0&pageSize=100`)
       .set('Authorization', `Bearer ${admin.token}`)
       .expect(200);
-    const ids = envelope(list.body).items.map((item) => item.id);
+    const ids = envelope(list.body).items.map((item: { id: string }) => item.id);
     expect(ids).not.toContain(tenantBRowId);
 
     // A foreign id behaves EXACTLY like a missing one: 404, not 403.
@@ -385,6 +386,16 @@ describe('Reporting — Check Request Status & Flow Report (first vertical slice
   });
 
   it('serves the selected request’s authoritative timeline — and only for it', async () => {
+    // The audit outbox is the platform's intentional async durability design: each financial
+    // mutation commits its audit intent with the business row, and AuditOutboxRelayService
+    // delivers it to core_db."AuditLog" on a 10s poll — whose own contract documents a direct
+    // call from tests (financial-check-issuance.e2e-spec.ts reads its timeline the same way).
+    // The whole suite lifecycle fits inside one relay window, and the two events this test
+    // asserts are NOT symmetric: `create` is written synchronously through AUDIT_PORT, while the
+    // `submit` transition's row is still an unclaimed outbox row. So drain the outbox
+    // deterministically before reading. Production code and every assertion below are unchanged.
+    await getApp().get(AuditOutboxRelayService).relay();
+
     const res: SupertestResponse = await api()
       .get(reportUrl(`/${submittedId}/timeline`))
       .set('Authorization', `Bearer ${admin.token}`)
@@ -392,7 +403,7 @@ describe('Reporting — Check Request Status & Flow Report (first vertical slice
 
     expect(Array.isArray(res.body.items)).toBe(true);
     expect(res.body.total).toBeGreaterThanOrEqual(2); // create + submit were audited
-    const actions = res.body.items.map((item) => item.action);
+    const actions = res.body.items.map((item: { action: string }) => item.action);
     expect(actions).toEqual(expect.arrayContaining(['create', 'submit']));
     // The timeline projection never carries raw envelope internals.
     for (const item of res.body.items) {
@@ -450,7 +461,7 @@ describe('Reporting — Check Request Status & Flow Report (first vertical slice
     expect(sheet.header).toEqual(['عنوان', 'نوع چک', 'وضعیت', 'تصمیم مدیر', 'تاریخ درخواست']);
     expect(sheet.data).toHaveLength(listed.items.length);
     // Every row the list returned is in the file — by title, in the same order.
-    expect(sheet.data.map((row) => row[0])).toEqual(listed.items.map((item) => item.title));
+    expect(sheet.data.map((row) => row[0])).toEqual(listed.items.map((item: { title: string }) => item.title));
     // The file states the applied filter rather than hiding it.
     expect(sheet.firstColumn).toContain('وضعیت');
     // No second population: the scope block agrees with the list total.
@@ -520,7 +531,7 @@ describe('Reporting — Check Request Status & Flow Report (first vertical slice
     const foreignItems = envelope(foreignList.body).items;
     expect(foreignSheet.data).toHaveLength(foreignItems.length);
     expect(foreignSheet.data.map((row) => row[0])).toEqual(
-      foreignItems.map((item) => item.title)
+      foreignItems.map((item: { title: string }) => item.title)
     );
   });
 

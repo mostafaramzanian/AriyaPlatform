@@ -40,12 +40,13 @@ jobs:
       - name: API unit tests
         run: npm run test --workspace=apps/api -- --runInBand
 
-      - name: Contract suites (env validation, architecture, runtime policy)
+      - name: Contract suites (env validation, architecture, runtime policy, CI e2e gate)
         run: >-
           npx jest --runInBand
           src/config/env.validation.spec.ts
           src/architecture-boundaries.spec.ts
           src/runtime-policy.spec.ts
+          src/ci-e2e-contract.spec.ts
         working-directory: apps/api
 
       - name: Prisma schema / migration / generated-client enum drift guard
@@ -178,10 +179,26 @@ jobs:
       # migrations can target them.
       - name: Create owned databases
         run: |
-          for db in core_db cms_db correspondence_db hr_db commerce_db production_db finance_db observability_db; do
+          for db in core_db cms_db correspondence_db hr_db commerce_db production_db finance_db observability_db inventory_db; do
             psql -h localhost -U aria_user -d aria_erp -c "SELECT 'CREATE DATABASE ${db} OWNER aria_user' WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = '${db}')" | grep -q 'CREATE DATABASE' && \
               psql -h localhost -U aria_user -d aria_erp -c "CREATE DATABASE ${db} OWNER aria_user" || true
           done
+        env:
+          PGPASSWORD: aria_password
+
+      # E2E-STAGING-ISOLATION: `test/global-setup.ts` refuses to migrate or seed
+      # unless the cluster it resolved is attested, either by pinning its
+      # PostgreSQL `system_identifier` or by an explicit shared-target opt-in.
+      # The CI postgres is a disposable service container created seconds ago, so
+      # it cannot carry a literal identifier in this file — read it from the
+      # cluster and pin the RUN to that value, which keeps the guard's strong
+      # form (a wrong target fails the gate instead of silently migrating it).
+      - name: Attest the CI PostgreSQL cluster identity
+        run: |
+          ID=$(psql -h localhost -U aria_user -d aria_erp -tAc "SELECT system_identifier FROM pg_control_system()" | tr -d '[:space:]')
+          test -n "$ID" || { echo "Could not read the CI cluster system_identifier" >&2; exit 1; }
+          echo "E2E_PG_EXPECTED_SYSTEM_ID=$ID" >> "$GITHUB_ENV"
+          echo "Attested the disposable CI cluster (system_identifier=${ID})"
         env:
           PGPASSWORD: aria_password
 
@@ -198,6 +215,7 @@ jobs:
           PRODUCTION_DATABASE_URL: postgresql://aria_user:aria_password@localhost:5432/production_db
           FINANCE_DATABASE_URL: postgresql://aria_user:aria_password@localhost:5432/finance_db
           OBSERVABILITY_DATABASE_URL: postgresql://aria_user:aria_password@localhost:5432/observability_db
+          INVENTORY_DATABASE_URL: postgresql://aria_user:aria_password@localhost:5432/inventory_db
 
       - name: Seed test data
         run: npm run db:seed --workspace=apps/api
@@ -210,6 +228,7 @@ jobs:
           PRODUCTION_DATABASE_URL: postgresql://aria_user:aria_password@localhost:5432/production_db
           FINANCE_DATABASE_URL: postgresql://aria_user:aria_password@localhost:5432/finance_db
           OBSERVABILITY_DATABASE_URL: postgresql://aria_user:aria_password@localhost:5432/observability_db
+          INVENTORY_DATABASE_URL: postgresql://aria_user:aria_password@localhost:5432/inventory_db
           # Stage 5.1 seed contract guard: only this CI harness may seed, and
           # only against the E2E databases/hosts declared by this workflow.
           E2E_SEED_OPT_IN: '1'
@@ -218,7 +237,32 @@ jobs:
 
       # The E2E suite boots the real NestJS application (setup.ts), polls
       # health/readiness, and drives the Financial Check Issuance lifecycle
-      # through real HTTP requests. The runtime .env.e2e is generated here from
+      # through real HTTP requests. It now runs the WIRED `test:e2e:ci` script
+      # rather than a spec path repeated here, so the gated spec list has one
+      # source of truth (`apps/api/package.json`) and cannot drift from the
+      # script an operator runs locally. The script gates FOUR specs:
+      #   * `test/seed-conformance.e2e-spec.ts` - the Q1 gate: runs the
+      #     authoritative `db:seed` twice and asserts that the migration-defined
+      #     provisioning is present for the bootstrap tenant, and only it;
+      #   * `test/financial-check-issuance.e2e-spec.ts`;
+      #   * `test/inventory-entitlement.e2e-spec.ts`, which mutates cluster-wide
+      #     role-grant rows and therefore must stay in band;
+      #   * `test/procurement-real-posting.e2e-spec.ts` (Phase R-10) — the ONE
+      #     app-level suite that binds NO double for `INVENTORY_POSTING_PORT`: it
+      #     drives Purchase → receipt → the real Inventory ledger (via the real
+      #     `InventoryPostingFacade`) → Financial's `PURCHASE_ORDER_REFERENCE_PORT`,
+      #     and reads the owner rows back from `commerce_db`, `inventory_db` and
+      #     `finance_db`. It mutates cluster-wide grant rows and the shared
+      #     permission cache, so it must stay in band as well.
+      # Each spec gets its OWN jest process (chained with `&&`), which is a
+      # measured requirement and not a preference: with the three specs sharing
+      # one `--runInBand` process, the HTTP suites that ran after the seed
+      # conformance spec failed on the host->service transport (fast `Can't
+      # reach database server`, or 30s hook timeouts once the connect budget was
+      # widened), while the same specs passed 34/34 when the seed conformance
+      # spec was not in the process and 6/6 when run alone. Nothing about the
+      # timeouts is loosened here.
+      # The runtime .env.e2e is generated here from
       # the step environment below (CI service containers only; no tracked file).
       # Phase FINALIZE (CI hardening): MinIO readiness is asserted before the
       # suite runs, mirroring the postgres/redis health checks above. The minio
@@ -238,8 +282,8 @@ jobs:
       - name: Run E2E suite
         run: |
           trap 'rm -f .env.e2e' EXIT
-          node -e "const fs=require('fs');const keys=['CORE_DATABASE_URL','CMS_DATABASE_URL','CORRESPONDENCE_DATABASE_URL','HR_DATABASE_URL','COMMERCE_DATABASE_URL','PRODUCTION_DATABASE_URL','FINANCE_DATABASE_URL','OBSERVABILITY_DATABASE_URL','REDIS_URL','JWT_SECRET','JWT_EXPIRATION_HOURS','JWT_REFRESH_SECRET','JWT_REFRESH_EXPIRATION_DAYS','API_BASE_URL','API_PORT','LOG_LEVEL','MINIO_HOST','MINIO_PORT','MINIO_BUCKET','MINIO_ACCESS_KEY','MINIO_SECRET_KEY','MINIO_REGION'];const missing=keys.filter(k=>!process.env[k]);if(missing.length){console.error('Missing required CI variables: '+missing.join(', '));process.exit(1);}fs.writeFileSync('.env.e2e',keys.map(k=>k+'='+process.env[k]).join('\n')+'\n',{mode:0o600});console.log('Generated .env.e2e with '+keys.length+' keys (values not printed)');"
-          npx jest --config ./jest-e2e.json --runInBand test/financial-check-issuance.e2e-spec.ts
+          node -e "const fs=require('fs');const keys=['CORE_DATABASE_URL','CMS_DATABASE_URL','CORRESPONDENCE_DATABASE_URL','HR_DATABASE_URL','COMMERCE_DATABASE_URL','PRODUCTION_DATABASE_URL','FINANCE_DATABASE_URL','OBSERVABILITY_DATABASE_URL','INVENTORY_DATABASE_URL','REDIS_URL','JWT_SECRET','JWT_EXPIRATION_HOURS','JWT_REFRESH_SECRET','JWT_REFRESH_EXPIRATION_DAYS','API_BASE_URL','API_PORT','LOG_LEVEL','MINIO_HOST','MINIO_PORT','MINIO_BUCKET','MINIO_ACCESS_KEY','MINIO_SECRET_KEY','MINIO_REGION'];const missing=keys.filter(k=>!process.env[k]);if(missing.length){console.error('Missing required CI variables: '+missing.join(', '));process.exit(1);}fs.writeFileSync('.env.e2e',keys.map(k=>k+'='+process.env[k]).join('\n')+'\n',{mode:0o600});console.log('Generated .env.e2e with '+keys.length+' keys (values not printed)');"
+          npm run test:e2e:ci
         working-directory: apps/api
         env:
           NODE_ENV: test
@@ -252,6 +296,7 @@ jobs:
           PRODUCTION_DATABASE_URL: postgresql://aria_user:aria_password@localhost:5432/production_db
           FINANCE_DATABASE_URL: postgresql://aria_user:aria_password@localhost:5432/finance_db
           OBSERVABILITY_DATABASE_URL: postgresql://aria_user:aria_password@localhost:5432/observability_db
+          INVENTORY_DATABASE_URL: postgresql://aria_user:aria_password@localhost:5432/inventory_db
           REDIS_URL: redis://localhost:6379
           JWT_SECRET: ci-test-secret-key-for-e2e
           JWT_EXPIRATION_HOURS: "24"

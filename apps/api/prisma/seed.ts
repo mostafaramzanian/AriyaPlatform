@@ -1,5 +1,9 @@
 import { PrismaClient } from '../src/generated/core-client';
 import bcrypt from 'bcryptjs';
+import {
+  assertSeedProvisioningComplete,
+  replaySeedOwnedMigrationProvisioning,
+} from './seed-migration-replay';
 
 const prisma = new PrismaClient();
 
@@ -192,6 +196,34 @@ async function main() {
     },
   });
 
+  // ---------------------------------------------------------------------------
+  // Q1: THE PROVISIONING THE MIGRATIONS COULD NOT MAKE.
+  //
+  // WHY IT IS HERE AND NOT IN A MIGRATION. Every `*_seed_*` Core migration grants what it
+  // grants by ENUMERATING rows it does not own: 43 statements read `"Role"` / `"Permission"`
+  // and 11 enumerate `"Tenant"`. Nothing in this repository creates a `"Role"` or a
+  // `"Tenant"` row except this file, and `db:migrate` runs BEFORE `db:seed` on every
+  // documented path — so on a database that has never been seeded, every one of those
+  // `CROSS JOIN`s matched zero rows and the whole family of seed migrations applied as a
+  // NO-OP. A "successful" bootstrap then held 8 grants in total (this file's own BLOG four
+  // for ADMIN and SUPER_ADMIN), no bootstrap-tenant module membership and no feature
+  // entitlement: every gated route answered 403 for the administrator this seed had just
+  // created. The seed is the only actor that runs AFTER the roles and the tenant exist, so
+  // the seed is where the enumeration is completed — with the MIGRATIONS' OWN SQL, read out
+  // of their `migration.sql` files and executed verbatim (`seed-migration-replay.ts`). The
+  // grant set is therefore not duplicated here and cannot drift, and an installation whose
+  // migrations already enumerated its tenants is left exactly as it was: every replayed
+  // statement is `ON CONFLICT ... DO NOTHING`, and the tenant-scoped ones read only the
+  // bootstrap tenant.
+  // ---------------------------------------------------------------------------
+  const provisioning = await replaySeedOwnedMigrationProvisioning(prisma, bootstrapTenant.id);
+  console.log(
+    `Seed provisioning: replayed ${provisioning.statements} migration statement(s) from ` +
+      `${provisioning.migrations.length} migration(s) for tenant "${provisioning.bootstrapTenantId}" ` +
+      `(role grants +${provisioning.grants}, module memberships +${provisioning.memberships}, ` +
+      `feature grants +${provisioning.featureGrants}).`,
+  );
+
   // Ensure a super-admin user exists
   const adminEmail = process.env.E2E_SUPERADMIN_EMAIL || 'admin@localhost';
   const adminPass = process.env.E2E_SUPERADMIN_PASSWORD || 'ChangeMe123!';
@@ -234,6 +266,25 @@ async function main() {
       },
     });
   }
+
+  // ---------------------------------------------------------------------------
+  // Q1, SECOND HALF: THE SEED CERTIFIES WHAT IT JUST PROMISED.
+  //
+  // The replay above is the correction; this is the proof that it took. The expected sets
+  // are re-derived from that same migration SQL (never re-typed, so they cannot drift), and
+  // a missing grant, membership or feature grant FAILS the bootstrap: a fresh install must
+  // not be able to report success while its own administrator cannot authorise anything.
+  // Extra rows are deliberately not this check's business — a live database may carry
+  // permissions an operator granted by hand, and a seed that refuses to run over them would
+  // be wrong. `test/seed-conformance.e2e-spec.ts` asserts both directions.
+  // ---------------------------------------------------------------------------
+  const snapshot = await assertSeedProvisioningComplete(prisma, bootstrapTenant.id);
+  console.log(
+    'Seed provisioning verified: catalogue=' +
+      `${snapshot.catalogue.length}, roles with grants=[${Object.keys(snapshot.grantsByRole).sort().join(', ')}], ` +
+      `bootstrap memberships=[${snapshot.memberships.join(', ')}], ` +
+      `feature grants=[${snapshot.features.join(', ')}].`,
+  );
 
   console.log('Seed complete');
 }

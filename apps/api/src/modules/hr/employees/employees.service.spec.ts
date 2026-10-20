@@ -9,7 +9,8 @@ import type { HrIdentityGateway } from '../hr-identity.gateway';
 import type { HrActor } from '../hr-actor';
 import type { CreateEmployeeDto, UpdateEmployeeDto } from '../dto/employee.dto';
 import { normalizeEmployeeCode } from '../dto/employee.dto';
-import { HR_EMPLOYEE_CODE_PATTERN } from '../hr.constants';
+import { HR_EMPLOYEE_CODE_PATTERN, HR_EMPLOYEE_CODE_PREFIX } from '../hr.constants';
+import { jalaliToday } from '../../../calendar/jalali.util';
 import type { ListEmployeesQueryDto } from '../dto/hr-query.dto';
 import { resolvePageWindow } from '../dto/hr-query.dto';
 
@@ -47,12 +48,14 @@ function harness() {
     findIdByCode: jest.fn(),
     findIdByCodeExcludingId: jest.fn(),
     listPage: jest.fn(),
+    listCodesWithPrefix: jest.fn(),
     createWithFirstInterval: jest.fn(),
     updateFields: jest.fn(),
     setStatus: jest.fn(),
+    directorySummary: jest.fn(),
   };
-  const units = { listLabels: jest.fn() };
-  const positions = { listLabels: jest.fn() };
+  const units = { listLabels: jest.fn(), findIdByCode: jest.fn(), summaryCounts: jest.fn() };
+  const positions = { listLabels: jest.fn(), findIdByCode: jest.fn() };
   const employment = {
     validateIntervalReferences: jest.fn(),
     buildIntervalData: jest.fn(),
@@ -76,6 +79,7 @@ function harness() {
   employees.findById.mockResolvedValue(null);
   employees.findIdByCode.mockResolvedValue(null);
   employees.listPage.mockResolvedValue([[], 0]);
+  employees.listCodesWithPrefix.mockResolvedValue([]);
   employment.validateIntervalReferences.mockResolvedValue(undefined);
   employment.buildIntervalData.mockResolvedValue({});
   employment.currentRecordsByEmployee.mockResolvedValue(new Map());
@@ -325,5 +329,212 @@ describe('EmployeesService — reads and status transitions (51-HR-ARCH-1B)', ()
 
     expect(employment.history).toHaveBeenCalledWith(actor, 'employee-1');
     expect(employees.findById).not.toHaveBeenCalled();
+  });
+});
+
+/*
+ * ui-redesign (employees directory): the new surface — the `linked` filter's
+ * pass-through, the KPI summary, the XLSX export and the bounded bulk import.
+ */
+describe('EmployeesService — directory surface (ui-redesign)', () => {
+  const listQuery = (over: Partial<ListEmployeesQueryDto> = {}): ListEmployeesQueryDto =>
+    ({ ...over }) as ListEmployeesQueryDto;
+
+  it('passes the linked filter through as a boolean, not a string', async () => {
+    const { service, employees } = harness();
+
+    await service.list(actor, listQuery({ linked: 'true' }));
+    expect(employees.listPage).toHaveBeenLastCalledWith(
+      'tenant-1',
+      expect.objectContaining({ linked: true }),
+      expect.anything()
+    );
+
+    await service.list(actor, listQuery({ linked: 'false' }));
+    expect(employees.listPage).toHaveBeenLastCalledWith(
+      'tenant-1',
+      expect.objectContaining({ linked: false }),
+      expect.anything()
+    );
+
+    await service.list(actor, listQuery());
+    expect(employees.listPage).toHaveBeenLastCalledWith(
+      'tenant-1',
+      expect.objectContaining({ linked: undefined }),
+      expect.anything()
+    );
+  });
+
+  it('summary composes directory counts with the organisation catalogue and gap-fills six months', async () => {
+    const { service, employees, units } = harness();
+    employees.directorySummary.mockResolvedValue({
+      total: 5,
+      active: 4,
+      linked: 3,
+      unlinked: 2,
+      withoutOpenInterval: 1,
+      hiredLast90Days: 2,
+      monthlyHires: [{ month: '2026-10', count: 2 }],
+    });
+    units.summaryCounts.mockResolvedValue([9, 7, 11, 10, 5, 4]);
+
+    const summary = await service.summary(actor);
+
+    expect(summary.total).toBe(5);
+    expect(summary.active).toBe(4);
+    expect(summary.linkedAccounts).toBe(3);
+    expect(summary.missingAccounts).toBe(2);
+    expect(summary.withoutAssignment).toBe(1);
+    expect(summary.hiredLast90Days).toBe(2);
+    expect(summary.units).toBe(9);
+    expect(summary.activeUnits).toBe(7);
+    // Six slots, oldest first; only the months the GROUP BY emitted are non-zero.
+    expect(summary.monthlyHires).toHaveLength(6);
+    const [year, month] = (() => {
+      const d = new Date();
+      return [d.getFullYear(), String(d.getMonth() + 1).padStart(2, '0')];
+    })();
+    const lastKey = `${year}-${month}`;
+    expect(summary.monthlyHires[5]).toBe(2);
+    void lastKey;
+  });
+
+  it('exportXlsx produces a real workbook from the same filtered list the screen renders', async () => {
+    const { service, employees, employment } = harness();
+    const since = new Date('2026-01-05T00:00:00Z');
+    employees.listPage.mockResolvedValue([
+      [
+        {
+          id: 'e1',
+          tenantId: 'tenant-1',
+          userId: null,
+          employeeCode: 'E-1',
+          status: 'ACTIVE',
+          createdAt: since,
+          updatedAt: since,
+        },
+      ],
+      1,
+    ]);
+    employment.currentRecordsByEmployee.mockResolvedValue(new Map());
+
+    const file = await service.exportXlsx(actor, listQuery({ status: 'ACTIVE' }));
+
+    expect(employees.listPage).toHaveBeenCalledWith(
+      'tenant-1',
+      expect.objectContaining({ status: 'ACTIVE' }),
+      expect.objectContaining({ take: 2000 })
+    );
+    expect(file.mimeType).toContain('spreadsheetml');
+    // A real .xlsx is a ZIP container: PK magic bytes, and it is non-trivially sized.
+    expect(file.buffer[0]).toBe(0x50);
+    expect(file.buffer[1]).toBe(0x4b);
+    expect(file.buffer.length).toBeGreaterThan(500);
+    expect(file.fileName).toBe('employees.xlsx');
+  });
+
+  it('importRows resolves codes tenant-scoped, runs the real create, and reports per-row failures', async () => {
+    const { service, employees, units, positions, employment } = harness();
+    units.findIdByCode
+      .mockResolvedValueOnce({ id: 'unit-1' })
+      .mockResolvedValueOnce(null);
+    positions.findIdByCode.mockResolvedValue({ id: 'pos-1' });
+    employees.findIdByCode.mockResolvedValue(null);
+    // First row creates fine; second row's unit lookup fails → per-row error, batch continues.
+    employees.createWithFirstInterval.mockResolvedValue({ id: 'e-new', employeeCode: 'E-1' });
+    employees.findById.mockResolvedValue({
+      id: 'e-new',
+      employeeCode: 'E-1',
+      status: 'ACTIVE',
+      userId: null,
+    });
+    employment.history.mockResolvedValue([]);
+    employment.currentRecord.mockResolvedValue(null);
+
+    const report = await service.importRows(actor, [
+      {
+        employeeCode: 'E-1',
+        employmentType: 'FULL_TIME',
+        startDate: '2026-01-01',
+        unitCode: 'HQ',
+        positionCode: 'DEV',
+      },
+      {
+        employeeCode: 'E-2',
+        employmentType: 'FULL_TIME',
+        startDate: '2026-01-01',
+        unitCode: 'NOPE',
+        positionCode: 'DEV',
+      },
+    ] as never[]);
+
+    expect(report.total).toBe(2);
+    expect(report.created).toBe(1);
+    expect(report.failed).toBe(1);
+    expect(report.results[1].ok).toBe(false);
+    expect(report.results[1].message).toContain('واحد سازمانی');
+    expect(units.findIdByCode).toHaveBeenCalledWith('tenant-1', 'HQ');
+    expect(units.findIdByCode).toHaveBeenCalledWith('tenant-1', 'NOPE');
+  });
+});
+
+describe('EmployeesService — suggestEmployeeCode (تولید‌خودکار)', () => {
+  /**
+   * The generator's year comes from the SERVER's calendar, so the expected prefix is
+   * derived through the same production helper rather than re-typed — a hand-written
+   * `EMP-1405-` would go stale at Nowruz and this test would fail for the wrong reason.
+   */
+  const currentPrefix = () => {
+    const { jy } = jalaliToday();
+    return `${HR_EMPLOYEE_CODE_PREFIX}-${jy}-`;
+  };
+
+  it('starts at the floor for a tenant with no codes under the current-year prefix', async () => {
+    const { service, employees } = harness();
+
+    const { employeeCode } = await service.suggestEmployeeCode(actor);
+
+    expect(employees.listCodesWithPrefix).toHaveBeenCalledWith(actor.tenantId, currentPrefix());
+    expect(employeeCode).toBe(`${currentPrefix()}1000`);
+    // The padded shape is the contract the unique index and the screen's LTR display rely on.
+    expect(employeeCode).toMatch(/^EMP-\d{4}-\d{4}$/);
+  });
+
+  it('offers one above the highest numeric sequence, ignoring codes it cannot parse', async () => {
+    const { service, employees } = harness();
+    employees.listCodesWithPrefix.mockResolvedValue([
+      `${currentPrefix()}1000`,
+      `${currentPrefix()}1007`,
+      `${currentPrefix()}1003`,
+      // Hand-authored codes must not drag the sequence backwards or crash the read.
+      `${currentPrefix()}ARCHIVE`,
+      'E-1042',
+    ]);
+
+    const { employeeCode } = await service.suggestEmployeeCode(actor);
+
+    expect(employeeCode).toBe(`${currentPrefix()}1008`);
+  });
+
+  it('never scopes the read across tenants and never reserves the code it suggests', async () => {
+    const { service, employees } = harness();
+
+    await service.suggestEmployeeCode(actor);
+
+    // One tenant argument, one prefix — the repository's own tenant-first rule is the
+    // isolation guarantee; this asserts the caller side of it.
+    expect(employees.listCodesWithPrefix).toHaveBeenCalledTimes(1);
+    expect(employees.listCodesWithPrefix).toHaveBeenCalledWith(actor.tenantId, expect.any(String));
+    // A suggestion is not a write: no insert, no audit row.
+    expect(employees.createWithFirstInterval).not.toHaveBeenCalled();
+  });
+
+  it('honours a sequence above the 4-digit pad without truncating it', async () => {
+    const { service, employees } = harness();
+    employees.listCodesWithPrefix.mockResolvedValue([`${currentPrefix()}12345`]);
+
+    const { employeeCode } = await service.suggestEmployeeCode(actor);
+
+    expect(employeeCode).toBe(`${currentPrefix()}12346`);
   });
 });

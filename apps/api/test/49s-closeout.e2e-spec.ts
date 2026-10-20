@@ -743,23 +743,28 @@ describe('Phase 49S-1 gate closeout', () => {
   // F. Indexed token lookup (reset / verify)
   // ===========================================================================
   describe('F. password reset and email verification indexed lookup', () => {
-    it('password reset stores a SHA-256 hash and rejects reuse', async () => {
-      const plainToken = tokenHashService.generateToken();
-      const hashed = tokenHashService.hashToken(plainToken);
-      const expiresAt = tokenHashService.getExpirationTime(2 * 60);
+    it('password reset stores a SALTED HASH of the emailed CODE and rejects reuse', async () => {
+      const code = tokenHashService.generateNumericCode();
+      const codeHash = tokenHashService.hashPasswordResetCode(code, userId);
+      const expiresAt = tokenHashService.getExpirationTime(10);
 
       await prisma.passwordReset.create({
-        data: { token: hashed, userId, expiresAt, used: false },
+        data: { codeHash, userId, expiresAt, used: false, attempts: 0 },
       });
 
-      const row = await prisma.passwordReset.findUnique({ where: { token: hashed }, include: { user: true } });
+      const row = await prisma.passwordReset.findFirst({ where: { userId, used: false } });
       expect(row).toBeTruthy();
-      expect(row!.token).toBe(hashed);
-      expect(row!.token).not.toBe(plainToken);
+      // The stored value is the digest — never the six digits the user transcribes.
+      expect(row!.codeHash).toBe(codeHash);
+      expect(row!.codeHash).not.toBe(code);
+      expect(row!.attempts).toBe(0);
 
-      await authService.resetPassword(plainToken, 'NewPass@123456');
+      // The CODE is what completes the reset, and the row is single-use.
+      await authService.resetPassword(testEmail, code, 'NewPass@123456');
 
-      await expect(authService.resetPassword(plainToken, 'NewPass@123456')).rejects.toThrow();
+      await expect(
+        authService.resetPassword(testEmail, code, 'NewPass@123456'),
+      ).rejects.toThrow();
     });
 
     it('email verification stores a SHA-256 hash and rejects reuse', async () => {

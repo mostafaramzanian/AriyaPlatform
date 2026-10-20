@@ -88,7 +88,7 @@ describe('BomChangeRequestController', () => {
     it('leaves NO route ungated, and gives each exactly one role', () => {
       const discovered = handlers();
       // Sanity-check the discovery itself: an empty list would pass every assertion below.
-      expect(discovered.length).toBe(12);
+      expect(discovered.length).toBe(13);
 
       for (const name of discovered) {
         expect({ name, roles: rolesOf(name) }).toEqual({ name, roles: expect.any(Array) });
@@ -100,14 +100,14 @@ describe('BomChangeRequestController', () => {
       const used = handlers().map((name) => rolesOf(name)![0]);
 
       // Literal strings, not the constants: a rename in `permissions.ts` has to be noticed
-      // HERE rather than by a 403 in an environment nobody rebuilt. Three reads (list,
-      // detail, timeline), six manages (create, header patch, three detail mutations,
-      // submit), three approves (the decisions).
+      // HERE rather than by a 403 in an environment nobody rebuilt. Four reads (list,
+      // summary, detail, timeline), six manages (create, header patch, three detail
+      // mutations, submit), three approves (the decisions).
       expect([
         used.filter((role) => role === 'production.bom.read').length,
         used.filter((role) => role === 'production.bom.manage').length,
         used.filter((role) => role === 'production.bom.approve').length,
-      ]).toEqual([3, 6, 3]);
+      ]).toEqual([4, 6, 3]);
       expect(new Set(used).size).toBe(3);
       // And they ARE the constants, so the two cannot drift apart silently.
       expect(new Set(used)).toEqual(
@@ -162,6 +162,9 @@ describe('BomChangeRequestController', () => {
      */
     const EXPECTED: Array<[string, number, string, string]> = [
       ['list', RequestMethod.GET, '', 'production.bom.read'],
+      // Phase PRODUCTION-CHANGES-REDESIGN: the register summary, declared before `:id`
+      // so the literal segment is never consumed by the UUID parser.
+      ['getSummary', RequestMethod.GET, 'summary', 'production.bom.read'],
       ['getOne', RequestMethod.GET, ':id', 'production.bom.read'],
       ['getTimeline', RequestMethod.GET, ':id/timeline', 'production.bom.read'],
       ['create', RequestMethod.POST, '', 'production.bom.manage'],
@@ -176,7 +179,7 @@ describe('BomChangeRequestController', () => {
     ];
 
     it('publishes exactly the contract\u2019s verbs, paths and permissions', () => {
-      expect(EXPECTED).toHaveLength(12); // non-vacuity: the brief's own minimum, named.
+      expect(EXPECTED).toHaveLength(13); // non-vacuity: the brief's own minimum, named.
 
       // Nest normalises a path-less route to `'/'`, so both sides are trimmed to their
       // SEGMENTS rather than the comparison depending on that default.

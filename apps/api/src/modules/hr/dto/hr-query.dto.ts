@@ -89,4 +89,13 @@ export class ListEmployeesQueryDto extends HrPageQueryDto {
   @IsOptional()
   @IsUUID('4')
   positionId?: string;
+
+  /*
+   * ui-redesign (employees screen): the «حساب کاربری سامانه» filter. Query strings
+   * arrive as text, so the contract is the literal 'true' / 'false' rather than a
+   * coerced boolean — an ambiguous value is a 400, not a silent guess.
+   */
+  @IsOptional()
+  @IsIn(['true', 'false'])
+  linked?: 'true' | 'false';
 }

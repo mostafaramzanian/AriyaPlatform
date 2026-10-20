@@ -682,11 +682,10 @@ describe('HR module isolation (§6d)', () => {
     const dtoFiles = moduleFiles.filter(
       (file) => name(file).includes('/dto/') && file.endsWith('.dto.ts')
     );
-    // TEN since 55 added `mission.dto.ts` and `mission-approval.dto.ts`, and the count is asserted
-    // EXACTLY so that a new DTO is a deliberate edit to this guard. The eight before 55 are the
-    // ones listed above; Mission now contributes its own request/option/policy bodies and its
-    // approval decision bodies for the same separation-of-concern reasons.
-    expect(dtoFiles).toHaveLength(10);
+    // ELEVEN since the employee bulk-import work added `employee-import.dto.ts` (the import
+    // row shares the optional Core-identity link documented for `employee.dto.ts`), and the
+    // count is asserted EXACTLY so that a new DTO is a deliberate edit to this guard.
+    expect(dtoFiles).toHaveLength(11);
     const dtoViolations: string[] = [];
     for (const file of dtoFiles) {
       const code = codeLines(readModule(file))
@@ -707,6 +706,13 @@ describe('HR module isolation (§6d)', () => {
         // given a login (§16), which is a supported state rather than an error.
         if (!/userId\?:\s*string/.test(code)) {
           dtoViolations.push('employee.dto.ts must carry userId as OPTIONAL');
+        }
+      } else if (label === 'employee-import.dto.ts') {
+        // The bulk-import row mirrors the same OPTIONAL identity link: an imported person
+        // may be bound to an existing account, and the membership check lives in the
+        // service, never on the wire.
+        if (!/userId\?:\s*string/.test(code)) {
+          dtoViolations.push('employee-import.dto.ts must carry userId as OPTIONAL');
         }
       } else if (/\buserId\b/.test(code)) {
         dtoViolations.push(`${label} must not carry an identity link`);

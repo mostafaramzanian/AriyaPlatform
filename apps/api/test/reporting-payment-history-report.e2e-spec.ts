@@ -43,6 +43,7 @@ import {
 } from './reporting-export.fixtures';
 import { PrismaService as CorePrismaService } from '../src/database/prisma.service';
 import { CommercePrismaService } from '../src/modules/commerce/database/commerce-prisma.service';
+import { ensureCommerceProcurementTestProvisioning } from './fixtures/commerce-provisioning';
 
 type SupertestResponse = import('supertest').Response;
 
@@ -280,6 +281,15 @@ describe('Reporting — Commerce Payment History Report (eighth vertical slice)'
     if (!tenantA) throw new Error('[E2E] Seeded tenant tenant-test-1 not found');
     tenantAId = tenantA.id;
 
+    // Test-only provisioning, and it MUST run BEFORE any login: login resolves the
+    // caller's permission claim through the PermissionSource port (which caches its
+    // answer), so a grant written after the first token is minted leaves every later
+    // request carrying a permission-empty identity. The grant/enrolment migrations
+    // cannot supply these rows themselves — they only see what existed at migration
+    // time, while the roles and `tenant-test-1` are created afterwards by `db:seed`.
+    // Shapes mirrored, nothing else touched: fixtures/commerce-provisioning.ts.
+    await ensureCommerceProcurementTestProvisioning(coreDb, [tenantAId]);
+
     const seededAdminRow = await coreDb.user.findUnique({ where: { email: 'admin@localhost' } });
     if (!seededAdminRow) throw new Error('[E2E] Seeded admin user not found');
     admin = {
@@ -429,7 +439,7 @@ describe('Reporting — Commerce Payment History Report (eighth vertical slice)'
     // Three appends against this run's document: CASH, CHECK, and the CHECK's
     // compensation. The report must NOT collapse them into one document row.
     expect(body.total).toBe(3);
-    const ids = body.items.map((item) => item.id);
+    const ids = body.items.map((item: { id: string }) => item.id);
     expect(new Set(ids).size).toBe(3);
     expect(ids).toEqual(
       expect.arrayContaining([cashPaymentId, checkPaymentId, compensationPaymentId])
@@ -441,14 +451,16 @@ describe('Reporting — Commerce Payment History Report (eighth vertical slice)'
     expect(ids[2]).toBe(cashPaymentId);
 
     // The compensation points at the row it reverses; ordinary payments do not.
-    const byId = new Map<string, Record<string, unknown>>(body.items.map((item) => [item.id, item]));
-    expect(byId.get(compensationPaymentId).reversesPaymentId).toBe(checkPaymentId);
-    expect(byId.get(checkPaymentId).reversesPaymentId).toBeNull();
-    expect(byId.get(cashPaymentId).reversesPaymentId).toBeNull();
+    const byId = new Map<string, Record<string, unknown>>(
+      body.items.map((item: Record<string, unknown> & { id: string }) => [item.id, item])
+    );
+    expect(byId.get(compensationPaymentId)?.reversesPaymentId).toBe(checkPaymentId);
+    expect(byId.get(checkPaymentId)?.reversesPaymentId).toBeNull();
+    expect(byId.get(cashPaymentId)?.reversesPaymentId).toBeNull();
 
     // Row-grain honesty: a compensating amount is NEGATIVE, never a rewritten row.
-    expect(Number(byId.get(compensationPaymentId).amount)).toBe(-20);
-    expect(Number(byId.get(cashPaymentId).amount)).toBe(30);
+    expect(Number(byId.get(compensationPaymentId)?.amount)).toBe(-20);
+    expect(Number(byId.get(cashPaymentId)?.amount)).toBe(30);
   });
 
   it('filters by method through the source vocabulary — every result matches', async () => {
@@ -463,8 +475,8 @@ describe('Reporting — Commerce Payment History Report (eighth vertical slice)'
 
     const cashBody = envelope(cash.body);
     const checkBody = envelope(check.body);
-    expect(cashBody.items.map((item) => item.id)).toEqual([cashPaymentId]);
-    expect(checkBody.items.map((item) => item.id).sort()).toEqual(
+    expect(cashBody.items.map((item: { id: string }) => item.id)).toEqual([cashPaymentId]);
+    expect(checkBody.items.map((item: { id: string }) => item.id).sort()).toEqual(
       [checkPaymentId, compensationPaymentId].sort()
     );
     for (const item of cashBody.items) expect(item.method).toBe('CASH');
@@ -494,7 +506,9 @@ describe('Reporting — Commerce Payment History Report (eighth vertical slice)'
       )
       .set('Authorization', `Bearer ${admin.token}`)
       .expect(200);
-    expect(envelope(window.body).items.map((item) => item.id)).toEqual([checkPaymentId]);
+    expect(envelope(window.body).items.map((item: { id: string }) => item.id)).toEqual([
+      checkPaymentId,
+    ]);
 
     // Same-day behaviour: the compensation's day alone.
     const sameDay: SupertestResponse = await api()
@@ -505,7 +519,7 @@ describe('Reporting — Commerce Payment History Report (eighth vertical slice)'
       )
       .set('Authorization', `Bearer ${admin.token}`)
       .expect(200);
-    expect(envelope(sameDay.body).items.map((item) => item.id)).toEqual([
+    expect(envelope(sameDay.body).items.map((item: { id: string }) => item.id)).toEqual([
       compensationPaymentId,
     ]);
 
@@ -539,7 +553,9 @@ describe('Reporting — Commerce Payment History Report (eighth vertical slice)'
       .get(`${reportUrl()}?search=${encodeURIComponent(`INV-${RUN_ID}`)}&pageSize=100`)
       .set('Authorization', `Bearer ${admin.token}`)
       .expect(200);
-    expect(envelope(byRef.body).items.map((item) => item.id)).toEqual([cashPaymentId]);
+    expect(envelope(byRef.body).items.map((item: { id: string }) => item.id)).toEqual([
+      cashPaymentId,
+    ]);
     expect(envelope(byRef.body).items[0].invoiceRef).toBe(`INV-${RUN_ID}`);
 
     // The CHECK payment's external reference — a different column of the same OR.
@@ -547,7 +563,9 @@ describe('Reporting — Commerce Payment History Report (eighth vertical slice)'
       .get(`${reportUrl()}?search=${encodeURIComponent(`EXT-${RUN_ID}`)}&pageSize=100`)
       .set('Authorization', `Bearer ${admin.token}`)
       .expect(200);
-    expect(envelope(byExt.body).items.map((item) => item.id)).toEqual([checkPaymentId]);
+    expect(envelope(byExt.body).items.map((item: { id: string }) => item.id)).toEqual([
+      checkPaymentId,
+    ]);
     expect(envelope(byExt.body).items[0].externalReference).toBe(`EXT-${RUN_ID}`);
 
     // The parent document's number — the same-owner join a tenant-wide register needs.
@@ -556,7 +574,7 @@ describe('Reporting — Commerce Payment History Report (eighth vertical slice)'
       .set('Authorization', `Bearer ${admin.token}`)
       .expect(200);
     const body = envelope(byNumber.body);
-    const ids = body.items.map((item) => item.id);
+    const ids = body.items.map((item: { id: string }) => item.id);
     expect(ids).toEqual(
       expect.arrayContaining([cashPaymentId, checkPaymentId, compensationPaymentId])
     );
@@ -602,7 +620,7 @@ describe('Reporting — Commerce Payment History Report (eighth vertical slice)'
       .get(`${reportUrl()}?pageSize=100`)
       .set('Authorization', `Bearer ${admin.token}`)
       .expect(200);
-    const ids = envelope(list.body).items.map((item) => item.id);
+    const ids = envelope(list.body).items.map((item: { id: string }) => item.id);
     expect(ids).not.toContain(tenantBPaymentId);
 
     // A foreign id behaves EXACTLY like a missing one: 404, not 403.
@@ -700,7 +718,7 @@ describe('Reporting — Commerce Payment History Report (eighth vertical slice)'
       .set('Authorization', `Bearer ${admin.token}`)
       .expect(200);
     const listed = envelope(list.body);
-    expect(listed.items.map((item) => item.id).sort()).toEqual(
+    expect(listed.items.map((item: { id: string }) => item.id).sort()).toEqual(
       [cashPaymentId, checkPaymentId, compensationPaymentId].sort()
     );
 

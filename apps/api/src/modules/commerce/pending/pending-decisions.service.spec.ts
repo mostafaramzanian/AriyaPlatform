@@ -3,6 +3,7 @@ import { PendingDecisionsService } from './pending-decisions.service';
 import { WorkflowExecutionRepository } from '../workflow/workflow-execution.repository';
 import { CommercialLifecycleRepository } from '../commercial/commercial-lifecycle.repository';
 import { PurchaseRepository } from '../purchase/purchase.repository';
+import { CommerceIdentityGateway } from '../commerce-identity.gateway';
 import { CommerceActor } from '../commerce-actor';
 
 /**
@@ -20,8 +21,9 @@ describe('PendingDecisionsService (C2 GAP-1b)', () => {
   let approvals: { listPendingApprovalPage: jest.Mock };
   let purchases: {
     findDocumentIdsByLineIds: jest.Mock;
-    findDocumentNumbersByIds: jest.Mock;
+    findDocumentSummariesByIds: jest.Mock;
   };
+  let identity: { profilesFor: jest.Mock };
   let service: PendingDecisionsService;
 
   const actor: CommerceActor = {
@@ -52,6 +54,21 @@ describe('PendingDecisionsService (C2 GAP-1b)', () => {
     };
   }
 
+  /** A document summary as `findDocumentSummariesByIds` returns it. */
+  function summaryRow(overrides: Record<string, unknown> = {}) {
+    return {
+      id: 'doc-1',
+      documentNumber: 'PO-2026-0001',
+      status: 'SUBMITTED',
+      requesterId: 'u-requester',
+      costCenter: 'دفتر مرکزی',
+      totalAmount: '12500.0000',
+      currency: 'IRR',
+      createdAt: new Date('2026-09-28T08:00:00.000Z'),
+      ...overrides,
+    };
+  }
+
   /** A commercial half-row as `listPendingApprovalPage` returns it. */
   function approvalRow(overrides: Record<string, unknown> = {}) {
     return {
@@ -71,8 +88,9 @@ describe('PendingDecisionsService (C2 GAP-1b)', () => {
     approvals = { listPendingApprovalPage: jest.fn().mockResolvedValue([[], 0]) };
     purchases = {
       findDocumentIdsByLineIds: jest.fn().mockResolvedValue(new Map()),
-      findDocumentNumbersByIds: jest.fn().mockResolvedValue(new Map()),
+      findDocumentSummariesByIds: jest.fn().mockResolvedValue(new Map()),
     };
+    identity = { profilesFor: jest.fn().mockResolvedValue(new Map()) };
 
     const moduleRef = await Test.createTestingModule({
       providers: [
@@ -80,6 +98,7 @@ describe('PendingDecisionsService (C2 GAP-1b)', () => {
         { provide: WorkflowExecutionRepository, useValue: executions },
         { provide: CommercialLifecycleRepository, useValue: approvals },
         { provide: PurchaseRepository, useValue: purchases },
+        { provide: CommerceIdentityGateway, useValue: identity },
       ],
     }).compile();
 
@@ -105,10 +124,10 @@ describe('PendingDecisionsService (C2 GAP-1b)', () => {
   it('merges both kinds newest-first with the sum of both counts as total', async () => {
     executions.listPendingStepPage.mockResolvedValue([[stepRow()], 4]);
     approvals.listPendingApprovalPage.mockResolvedValue([[approvalRow()], 3]);
-    purchases.findDocumentNumbersByIds.mockResolvedValue(
+    purchases.findDocumentSummariesByIds.mockResolvedValue(
       new Map([
-        ['doc-1', 'PO-2026-0001'],
-        ['doc-2', 'PO-2026-0002'],
+        ['doc-1', summaryRow({ id: 'doc-1', documentNumber: 'PO-2026-0001' })],
+        ['doc-2', summaryRow({ id: 'doc-2', documentNumber: 'PO-2026-0002' })],
       ])
     );
 
@@ -141,8 +160,18 @@ describe('PendingDecisionsService (C2 GAP-1b)', () => {
       stepName: 'Manager Approval',
     });
     // Both halves' display joins happened in ONE call each — never one per row.
-    expect(purchases.findDocumentNumbersByIds).toHaveBeenCalledTimes(1);
+    expect(purchases.findDocumentSummariesByIds).toHaveBeenCalledTimes(1);
     expect(purchases.findDocumentIdsByLineIds).toHaveBeenCalledTimes(1);
+    // The task-card projection carries the document's own columns, with the
+    // requester profile resolved in one batch (not per row).
+    expect(identity.profilesFor).toHaveBeenCalledTimes(1);
+    expect(page.items[0].document).toMatchObject({
+      id: 'doc-2',
+      documentNumber: 'PO-2026-0002',
+      requesterId: 'u-requester',
+      costCenter: 'دفتر مرکزی',
+      totalAmount: '12500.0000',
+    });
   });
 
   it('breaks same-instant ties by id so two reads page identically', async () => {
@@ -194,7 +223,9 @@ describe('PendingDecisionsService (C2 GAP-1b)', () => {
       1,
     ]);
     purchases.findDocumentIdsByLineIds.mockResolvedValue(new Map([['line-7', 'doc-42']]));
-    purchases.findDocumentNumbersByIds.mockResolvedValue(new Map([['doc-42', 'PO-2026-0042']]));
+    purchases.findDocumentSummariesByIds.mockResolvedValue(
+      new Map([['doc-42', summaryRow({ id: 'doc-42', documentNumber: 'PO-2026-0042' })]])
+    );
 
     const page = await service.list(actor, { page: 1, pageSize: 10 });
 
@@ -209,10 +240,27 @@ describe('PendingDecisionsService (C2 GAP-1b)', () => {
 
   it('marks an unresolvable document reference as null rather than inventing a scope', async () => {
     executions.listPendingStepPage.mockResolvedValue([[stepRow()], 1]);
-    purchases.findDocumentNumbersByIds.mockResolvedValue(new Map());
+    purchases.findDocumentSummariesByIds.mockResolvedValue(new Map());
 
     const page = await service.list(actor, { page: 1, pageSize: 10 });
 
     expect(page.items[0].documentNumber).toBeNull();
+    expect(page.items[0].document).toBeNull();
+  });
+
+  it('resolves requester profiles in one batch and leaves an unknown requester as null', async () => {
+    executions.listPendingStepPage.mockResolvedValue([[stepRow()], 1]);
+    approvals.listPendingApprovalPage.mockResolvedValue([[], 0]);
+    purchases.findDocumentSummariesByIds.mockResolvedValue(
+      new Map([['doc-1', summaryRow({ requesterId: 'u-x' })]])
+    );
+    identity.profilesFor.mockResolvedValue(
+      new Map([['u-x', { id: 'u-x', firstName: 'سارا', lastName: 'محمدی' }]])
+    );
+
+    const page = await service.list(actor, { page: 1, pageSize: 10 });
+
+    expect(identity.profilesFor).toHaveBeenCalledWith(['u-x']);
+    expect(page.items[0].document?.requester).toMatchObject({ firstName: 'سارا' });
   });
 });

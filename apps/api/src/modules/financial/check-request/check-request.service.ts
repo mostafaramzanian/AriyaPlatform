@@ -52,6 +52,10 @@ import {
 } from './check-request.dto';
 import { CheckAttachmentRepository } from './check-attachment.repository';
 import {
+  PURCHASE_ORDER_REFERENCE_PORT,
+  type PurchaseOrderReferencePort,
+} from '../purchase-order-reference.port';
+import {
   CHECK_ISSUANCE_PROCESS_KEY,
   CHECK_ISSUANCE_PROCESS_VERSION,
   resolveCheckIssuanceDefinition,
@@ -295,7 +299,11 @@ export class CheckRequestService {
     private readonly repository: CheckRequestRepository,
     private readonly attachments: CheckAttachmentRepository,
     private readonly audit: FinancialAuditGateway,
-    @Inject(USER_DIRECTORY) private readonly directory: UserDirectoryContract
+    @Inject(USER_DIRECTORY) private readonly directory: UserDirectoryContract,
+    // PHASE W2-C: bound by the neutral bridge module; an unbound token fails DI
+    // loudly rather than letting a purchase reference sail through unchecked.
+    @Inject(PURCHASE_ORDER_REFERENCE_PORT)
+    private readonly orderReferences: PurchaseOrderReferencePort
   ) {}
 
   /**
@@ -329,6 +337,7 @@ export class CheckRequestService {
     });
 
     this.assertBusinessRules(facts);
+    await this.assertOrderReference(actor.tenantId, facts);
     if (facts.projectManagerUserId) {
       await this.assertTenantMember(
         actor.tenantId,
@@ -450,6 +459,7 @@ export class CheckRequestService {
     });
 
     this.assertBusinessRules(facts);
+    await this.assertOrderReference(actor.tenantId, facts);
     if (dto.projectManagerUserId !== undefined && facts.projectManagerUserId) {
       await this.assertTenantMember(
         actor.tenantId,
@@ -1326,6 +1336,29 @@ export class CheckRequestService {
       throw new BadRequestException({
         code: CHECK_REQUEST_ERROR_CODES.PROJECT_MANAGER_REQUIRED,
         message: 'A project purchase requires a project manager.',
+      });
+    }
+  }
+
+  /**
+   * PHASE W2-C — the stated `orderReference` must resolve to a REAL purchase
+   * order of the acting tenant, through the bound `PurchaseOrderReferencePort`
+   * (Commerce's exported facade, behind the neutral bridge module). A reference
+   * that resolves to nothing — absent order, mistyped number, or ANOTHER
+   * TENANT's order, all indistinguishable by design — is a 400 naming the
+   * field, never a stored pointer into data this tenant cannot see. Runs only
+   * on the `PURCHASE` issue type, the sole type whose facts carry the field.
+   */
+  private async assertOrderReference(
+    tenantId: string,
+    facts: CheckRequestFacts
+  ): Promise<void> {
+    if (facts.checkIssueType !== 'PURCHASE' || !facts.orderReference) return;
+    const resolved = await this.orderReferences.resolve(tenantId, facts.orderReference);
+    if (!resolved) {
+      throw new BadRequestException({
+        code: CHECK_REQUEST_ERROR_CODES.ORDER_REFERENCE_UNKNOWN,
+        message: 'The order reference does not resolve to a purchase order of this tenant.',
       });
     }
   }

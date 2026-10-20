@@ -1,4 +1,5 @@
 import { Injectable } from '@nestjs/common';
+import { Prisma } from '../../../generated/commerce-client';
 import { CommercePrismaService } from '../database/commerce-prisma.service';
 import {
   unwrapCommerceTransaction,
@@ -6,6 +7,15 @@ import {
 } from '../database/commerce-transaction';
 import type { CommerceAuditOutboxPayload } from '../commerce-audit.gateway';
 import { RETURN_STATES, type ReturnState } from './return-lifecycle';
+
+/** The driver P2002 of the refund-link partial unique — translated for the service. */
+export class RefundCompensationClaimedError extends Error {
+  constructor() {
+    super('refund compensation already claimed by another transition');
+  }
+}
+const isUniqueViolation = (error: unknown) =>
+  error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002';
 
 /**
  * Phase C1 Step S (contract §13 "Append-only / repository", §9, §11): the
@@ -81,6 +91,18 @@ export interface TransitionAppendWrite {
   state: ReturnState;
   actorUserId: string | null;
   reason: string | null;
+  /**
+   * PHASE W3.1: on the `REFUNDED` row only, the `PaymentRecord` id the refund
+   * settled — the persisted return→settlement link the closure evaluator reads.
+   * NULL on every other state.
+   */
+  refundedPaymentId?: string | null;
+  /**
+   * PHASE W4-B: on the `REFUNDED` row only, the COMPENSATING `PaymentRecord` id
+   * this refund appended — the exact refund ledger row the closure evaluator
+   * counts. NULL on legacy rows and every other state.
+   */
+  refundCompensationPaymentId?: string | null;
 }
 
 /** The ordering every read in this file states explicitly — never inherited. */
@@ -302,15 +324,27 @@ export class ReturnHistoryRepository {
     outbox?: CommerceAuditOutboxPayload
   ) {
     const client = unwrapCommerceTransaction(tx);
-    const row = await client.returnLifecycleTransition.create({
-      data: {
-        tenantId,
-        returnDocumentId: data.returnDocumentId,
-        state: data.state,
-        actorUserId: data.actorUserId,
-        reason: data.reason,
-      },
-    });
+    let row;
+    try {
+      row = await client.returnLifecycleTransition.create({
+        data: {
+          tenantId,
+          returnDocumentId: data.returnDocumentId,
+          state: data.state,
+          actorUserId: data.actorUserId,
+          reason: data.reason,
+          refundedPaymentId: data.refundedPaymentId ?? null,
+          refundCompensationPaymentId: data.refundCompensationPaymentId ?? null,
+        },
+      });
+    } catch (error) {
+      // W4-D: the partial unique on `refund_compensation_payment_id` — a
+      // compensation row already claimed by another REFUNDED transition is
+      // a 409-able conflict, never a bare 500. The service's unit of work
+      // rolls the whole refund back with it.
+      if (isUniqueViolation(error)) throw new RefundCompensationClaimedError();
+      throw error;
+    }
     if (outbox) {
       await client.auditOutbox.create({ data: outbox });
     }

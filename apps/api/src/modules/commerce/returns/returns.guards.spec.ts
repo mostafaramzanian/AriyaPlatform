@@ -775,9 +775,11 @@ describe('C1 step S guards: the repository surface and the audit vocabulary (J)'
     // `RETURN_FAILURE` member: §10 refuses vague generic answers, and a
     // bare-string refusal would reach the client with no token at all.
     const conflicts = serviceCode.match(/new ConflictException\(/g) ?? [];
-    expect(conflicts).toHaveLength(4);
+    // W4-D: the refund-link double-claim adds a fifth throw site — same
+    // REFUND_COMPENSATION_FAILED member, so the vocabulary itself is unmoved.
+    expect(conflicts).toHaveLength(5);
     const coded = serviceCode.match(/new ConflictException\(\{\s*code: RETURN_FAILURE\./g) ?? [];
-    expect(coded).toHaveLength(4);
+    expect(coded).toHaveLength(5);
     // The members actually thrown — the four reachable refusals. The fifth,
     // `INVALID_ORIGIN`, is reserved-but-unreachable (the scoped 404 answers
     // first — §10's own "when not already 404 by scoping").
@@ -841,6 +843,10 @@ function readService(): string {
  */
 const SERVICE_ALLOWED_IMPORTS = [
   '../payment/payment-history.service',
+  // Phase W2-B: the integration seam — `RECEIVED_BACK` plans the durable
+  // dispatch postings through this service, the SECOND cross-slice service
+  // import the contract allows (the first is Q's payment history).
+  '../integration/inventory-integration.service',
   '../purchase/purchase-money',
   '../database/commerce-transaction',
   '../commerce-actor',

@@ -166,6 +166,9 @@ describe('architecture boundaries', () => {
       // `FinancialPrismaModule`, so `finance_db` joined the set too — the same edit, in
       // the same place, for the same reason.
       'FINANCE_DATABASE_URL',
+      // Phase W2-A (inventory bounded context): the combined runtime hosts
+      // `InventoryModule` and its health probe, so `inventory_db` joined the set.
+      'INVENTORY_DATABASE_URL',
     ]);
     expect(requiredDatasources('future-hr')).toEqual(['CORE_DATABASE_URL', 'HR_DATABASE_URL']);
     expect(RUNTIME_DATASOURCE_MATRIX.combined.datasources.OBSERVABILITY_DATABASE_URL).toBe('optional');
@@ -184,6 +187,9 @@ describe('architecture boundaries', () => {
       'PRODUCTION_DATABASE_URL',
       // Phase F1 — FINANCIAL FOUNDATION: and the same boundary again for Financial.
       'FINANCE_DATABASE_URL',
+      // Phase W2-A: and once more for Inventory — the Core-only runtime keeps
+      // it `not-used`, ships no inventory client and never reaches `inventory_db`.
+      'INVENTORY_DATABASE_URL',
     ]);
   });
 

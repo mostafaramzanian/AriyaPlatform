@@ -209,21 +209,25 @@ describe('Phase F1 — financial isolation', () => {
       expect(violations).toEqual([]);
     });
 
-    it('declares the Purchase port as an INTERFACE ONLY — no adapter, no binding, no caller', () => {
+    it('binds the Purchase port ONLY through the neutral bridge — no adapter or Commerce import inside this module (W2-C)', () => {
       const portFile = join(MODULE_DIR, 'purchase-order-reference.port.ts');
       expect(existsSync(portFile)).toBe(true);
-      // No adapter file exists anywhere under the module.
+      // No adapter file exists anywhere under the module — the implementation is
+      // Commerce's exported facade, bound by `modules/purchase-order-reference/`.
       expect(NON_SPEC.some((f) => /purchase.*adapter/i.test(f))).toBe(false);
-      // Nothing imports the port — an unbound token cannot be injected, so no service
-      // can accidentally depend on a Purchase resolution that does not exist.
+      // The ONLY in-module consumer is the check-request service; the token itself
+      // stays out of this module's composition (the bridge carries the binding).
       const importers = NON_SPEC.filter(
         (file) =>
           file !== portFile &&
           specifiersOf(file).some((s) => s.includes('purchase-order-reference.port'))
       );
-      expect(importers).toEqual([]);
+      expect(importers.map((f) => f.replace(/\\/g, '/').split('/').pop()).sort()).toEqual([
+        'check-request.service.ts',
+      ]);
       const moduleSource = sourceOf(join(MODULE_DIR, 'financial.module.ts'));
       expect(moduleSource).not.toContain('PURCHASE_ORDER_REFERENCE_PORT');
+      expect(moduleSource).toContain('purchase-order-reference.module');
     });
 
     it('imports no Commerce workflow engine and registers exactly the two controllers of the ONE feature', () => {

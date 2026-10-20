@@ -1,6 +1,7 @@
 import { Injectable } from '@nestjs/common';
 import { HrPrismaService } from '../database/hr-prisma.service';
 import type { HrRecordStatus } from '../dto/hr-query.dto';
+import type { OrganizationUnitKind } from '../dto/organization.dto';
 
 /**
  * Phase 51-HR-ARCH-1: the `OrganizationUnit` PERSISTENCE boundary.
@@ -27,6 +28,36 @@ import type { HrRecordStatus } from '../dto/hr-query.dto';
  * driver's `P2002`; deciding that a `P2002` and a 409 are the same fact belongs to the
  * service, which is the layer that can explain it to an API client.
  */
+/**
+ * The headcount projection every unit read shares.
+ *
+ * `headcount` is a LIVE count of ACTIVE EmploymentRecords pointing at the unit —
+ * computed per row by the database (`_count`), never a stored column, so a unit
+ * can never drift from the employment history that actually references it.
+ * `stripCount` unwraps the Prisma `_count` envelope so the wire shape carries a
+ * flat `headcount` and no Prisma internals.
+ */
+const headcountInclude = (tenantId: string) =>
+  ({
+    _count: {
+      select: {
+        employmentRecords: { where: { status: 'ACTIVE' as const, tenantId } },
+        positions: { where: { tenantId } },
+      },
+    },
+  }) as const;
+
+function stripCount<T extends { _count?: { employmentRecords: number; positions: number } }>(
+  row: T
+): Omit<T, '_count'> & { headcount: number; positionsCount: number } {
+  const { _count, ...rest } = row;
+  return {
+    ...rest,
+    headcount: _count?.employmentRecords ?? 0,
+    positionsCount: _count?.positions ?? 0,
+  };
+}
+
 @Injectable()
 export class OrganizationRepository {
   constructor(private readonly prisma: HrPrismaService) {}
@@ -51,24 +82,29 @@ export class OrganizationRepository {
         : {}),
     };
 
-    return this.prisma.$transaction([
+    const [rows, total] = await this.prisma.$transaction([
       this.prisma.organizationUnit.findMany({
         where,
         orderBy: [{ code: 'asc' }, { id: 'asc' }],
+        include: headcountInclude(tenantId),
         skip: window.skip,
         take: window.take,
       }),
       this.prisma.organizationUnit.count({ where }),
     ]);
+
+    return [rows.map(stripCount), total];
   }
 
   /** Up to `take` units of the tenant, for the in-memory tree assembly. */
   async listForTree(tenantId: string, take: number) {
-    return this.prisma.organizationUnit.findMany({
+    const rows = await this.prisma.organizationUnit.findMany({
       where: { tenantId },
       orderBy: [{ code: 'asc' }, { id: 'asc' }],
+      include: headcountInclude(tenantId),
       take,
     });
+    return rows.map(stripCount);
   }
 
   /**
@@ -100,7 +136,11 @@ export class OrganizationRepository {
 
   /** The whole unit row, or `null` — another tenant's unit is indistinguishable from absent. */
   async findById(tenantId: string, id: string) {
-    return this.prisma.organizationUnit.findFirst({ where: { id, tenantId } });
+    const row = await this.prisma.organizationUnit.findFirst({
+      where: { id, tenantId },
+      include: headcountInclude(tenantId),
+    });
+    return row ? stripCount(row) : null;
   }
 
   /** Existence alone, for the two guards: a row either is in this tenant or is not. */
@@ -135,13 +175,36 @@ export class OrganizationRepository {
     });
   }
 
-  /** The INSERT. A duplicate code surfaces as the driver's `P2002`, untranslated. */
-  async create(tenantId: string, data: { code: string; name: string; parentId: string | null }) {
+  /** The profile columns a create or update may carry, all optional. */
+  async create(
+    tenantId: string,
+    data: {
+      code: string;
+      name: string;
+      parentId: string | null;
+      kind?: OrganizationUnitKind;
+      managerName?: string | null;
+      location?: string | null;
+      monthlyBudget?: string | null;
+      responsibility?: string | null;
+    }
+  ) {
     return this.prisma.organizationUnit.create({ data: { tenantId, ...data } });
   }
 
   /** The mutable columns of a unit. `id` alone is safe here: the tenant read already ran. */
-  async update(id: string, data: { name?: string; parentId?: string | null }) {
+  async update(
+    id: string,
+    data: {
+      name?: string;
+      parentId?: string | null;
+      kind?: OrganizationUnitKind;
+      managerName?: string | null;
+      location?: string | null;
+      monthlyBudget?: string | null;
+      responsibility?: string | null;
+    }
+  ) {
     return this.prisma.organizationUnit.update({ where: { id }, data });
   }
 

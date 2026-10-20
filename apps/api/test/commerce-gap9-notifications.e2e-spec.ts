@@ -88,10 +88,19 @@ import { CommerceSearchSourceService } from '../src/modules/commerce/search/comm
 import { PurchaseController } from '../src/modules/commerce/purchase/purchase.controller';
 import { PurchaseService } from '../src/modules/commerce/purchase/purchase.service';
 import { PurchaseTimelineService } from '../src/modules/commerce/purchase/purchase-timeline.service';
+import { PurchaseHistoryService } from '../src/modules/commerce/purchase/purchase-history.service';
+import { PurchaseHistoryRepository } from '../src/modules/commerce/purchase/purchase-history.repository';
+import { PaymentPlanRepository } from '../src/modules/commerce/payment-plan/payment-plan.repository';
+import { ReceivingHistoryRepository } from '../src/modules/commerce/receiving/receiving-history.repository';
+import { ReturnHistoryRepository } from '../src/modules/commerce/returns/return-history.repository';
 import { PurchaseRepository } from '../src/modules/commerce/purchase/purchase.repository';
 import { PurchaseCompletionPolicyRepository } from '../src/modules/commerce/completion/purchase-completion-policy.repository';
 import { PurchaseCompletionPolicyService } from '../src/modules/commerce/completion/purchase-completion-policy.service';
 import { PurchaseCompletionService } from '../src/modules/commerce/completion/purchase-completion.service';
+import { InventoryPostingRepository } from '../src/modules/commerce/integration/inventory-posting.repository';
+import { InventoryIntegrationService } from '../src/modules/commerce/integration/inventory-integration.service';
+import { INVENTORY_POSTING_PORT } from '../src/modules/commerce/integration/inventory-posting.port';
+import { createFakeInventoryPostingPort } from './fixtures/fake-inventory-posting-port';
 import { CommercialController } from '../src/modules/commerce/commercial/commercial.controller';
 import { CommercialConfigurationRepository } from '../src/modules/commerce/commercial/commercial-configuration.repository';
 import { CommercialConfigurationService } from '../src/modules/commerce/commercial/commercial-configuration.service';
@@ -173,10 +182,12 @@ class ProbeHeaderStrategy {
       claims: null,
     });
   }
-  private success(): void {
+  private success(_arg?: unknown): void {
+      void _arg;
     throw new Error('passport replaces this method before authenticate() runs');
   }
-  private fail(): void {
+  private fail(_arg?: unknown): void {
+      void _arg;
     throw new Error('passport replaces this method before authenticate() runs');
   }
 }
@@ -228,9 +239,20 @@ class ProbeHeaderStrategy {
     PurchaseRepository,
     PurchaseService,
     PurchaseTimelineService,
+    // PHASE W3.2: the aggregated-history route on `PurchaseController` — its
+    // service and read-only repository, plus the plan repository the completion
+    // service consults for outstanding installments.
+    PurchaseHistoryService,
+    PurchaseHistoryRepository,
+    PaymentPlanRepository,
+    ReceivingHistoryRepository,
+    ReturnHistoryRepository,
     PurchaseCompletionPolicyRepository,
     PurchaseCompletionPolicyService,
     PurchaseCompletionService,
+    InventoryPostingRepository,
+    InventoryIntegrationService,
+    { provide: INVENTORY_POSTING_PORT, useValue: createFakeInventoryPostingPort() },
     CommercialConfigurationRepository,
     CommercialConfigurationService,
     CommercialLifecycleRepository,
@@ -406,6 +428,8 @@ describe('GAP-9 — Commerce notifications, end to end (real Core Notification C
       await db.commercialAssignment.deleteMany({ where });
       await db.workflowStepInstance.deleteMany({ where });
       await db.workflowInstance.deleteMany({ where });
+      // PHASE W3: append-only status events RESTRICT their document — they go first.
+      await db.purchaseStatusEvent.deleteMany({ where });
       await db.purchaseLine.deleteMany({ where });
       await db.purchaseDocument.deleteMany({ where });
       await db.purchaseDocumentCounter.deleteMany({ where });
@@ -535,7 +559,7 @@ describe('GAP-9 — Commerce notifications, end to end (real Core Notification C
 
     // And the recipient sees it through CORE's own route, unread.
     const items = await inbox(approverA1Id);
-    expect(items.map((item) => item.id)).toEqual([rows[0].id]);
+    expect(items.map((item: { id: string }) => item.id)).toEqual([rows[0].id]);
     expect(await unreadCount(approverA1Id)).toBe(1);
   });
 

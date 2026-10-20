@@ -149,7 +149,13 @@ export const PURCHASE_DOCUMENT_TRANSITIONS: Readonly<
   DRAFT: Object.freeze(['SUBMITTED'] as const),
   SUBMITTED: Object.freeze(['APPROVED', 'REJECTED'] as const),
   APPROVED: Object.freeze([] as const),
-  REJECTED: Object.freeze([] as const),
+  // REACTIVATION (GAP-6 follow-up): the ONE route out of REJECTED, written ONLY by the
+  // reopen act (`POST …/purchase-documents/:id/reopen`). The rejection itself is never
+  // erased — it stays on the settled workflow instance and in the audit trail — and the
+  // reopened document lands back in DRAFT, the one editable status, from which a fresh
+  // submit starts a fresh approval round. CANCELLED and CLOSED deliberately have no
+  // outgoing edge: withdrawal and completion are one-way.
+  REJECTED: Object.freeze(['DRAFT'] as const),
   CANCELLED: Object.freeze([] as const),
   CLOSED: Object.freeze([] as const),
 });

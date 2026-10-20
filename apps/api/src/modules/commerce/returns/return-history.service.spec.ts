@@ -234,17 +234,24 @@ function build() {
     compensate: jest.fn().mockResolvedValue({ id: PAYMENT_ID }),
   };
 
+  const inventoryIntegration = {
+    planReturnDispatchPostings: jest.fn().mockResolvedValue([]),
+    attemptPostings: jest.fn().mockResolvedValue(undefined),
+  };
+
   return {
     service: new ReturnHistoryService(
       repository as unknown as ReturnHistoryRepository,
       audit as unknown as CommerceAuditGateway,
       unitOfWork as unknown as CommerceUnitOfWork,
-      payments as unknown as PaymentHistoryService
+      payments as unknown as PaymentHistoryService,
+      inventoryIntegration as never
     ),
     repository,
     audit,
     unitOfWork,
     payments,
+    inventoryIntegration,
   };
 }
 
@@ -795,6 +802,8 @@ describe('C1 step S — the four lifecycle commands: matrix first, one row, one 
       state: 'APPROVED',
       actorUserId: 'u1',
       reason: 'supplier agreed',
+      refundedPaymentId: null,
+      refundCompensationPaymentId: null,
     });
     expect(view.state).toBe('APPROVED');
     expect(view.transitions).toHaveLength(2); // the original row, plus this one
@@ -916,6 +925,8 @@ describe('C1 step S — the four lifecycle commands: matrix first, one row, one 
       state: 'RECEIVED_BACK',
       actorUserId: 'u1',
       reason: null,
+      refundedPaymentId: null,
+      refundCompensationPaymentId: null,
     });
     expect(view.state).toBe('RECEIVED_BACK');
     expect(audit.record).not.toHaveBeenCalled();
@@ -971,6 +982,10 @@ describe('C1 step S — refund: Q first, then REFUNDED — the §4-E boundary, e
       state: 'REFUNDED',
       actorUserId: 'u1',
       reason: 'goods returned to supplier',
+      // W3.1/W4-B: the funded payment AND the exact compensation row both ride
+      // the REFUNDED row — the links the closure evaluator reads.
+      refundedPaymentId: '77777777-7777-4777-8777-777777777777',
+      refundCompensationPaymentId: '77777777-7777-4777-8777-777777777777',
     });
     expect(view.state).toBe('REFUNDED');
     expect(audit.record).not.toHaveBeenCalled();
@@ -981,6 +996,25 @@ describe('C1 step S — refund: Q first, then REFUNDED — the §4-E boundary, e
       oldValue: { state: 'RECEIVED_BACK' },
       newValue: { state: 'REFUNDED' },
     });
+  });
+
+  it('W4: a stated refund amount is forwarded to Q — the partial figure rides the compensation', async () => {
+    const { service, repository, payments } = build();
+    repository.findReturnDocument.mockResolvedValue(receivedBackReturn());
+
+    await service.refund(ACTOR, DOCUMENT_ID, RETURN_ID, {
+      paymentId: PAYMENT_ID,
+      amount: 20,
+      reason: 'partial refund for 2 of 10 units',
+    } as RefundReturnDto);
+
+    expect(payments.compensate).toHaveBeenCalledWith(
+      ACTOR,
+      DOCUMENT_ID,
+      PAYMENT_ID,
+      { amount: 20, reason: 'partial refund for 2 of 10 units' },
+      TX_HANDLE
+    );
   });
 
   it('maps ANY Q refusal to refund_compensation_failed — NO transition, NO REFUNDED, NO S audit', async () => {

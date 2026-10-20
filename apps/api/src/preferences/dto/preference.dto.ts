@@ -138,6 +138,19 @@ export class UpdatePreferenceDto {
   sidebarCollapsed?: boolean;
 
   /**
+   * Opt-in switches for the two navigation personalization features. Both default
+   * OFF — the user turns them on under «تنظیمات». Disabling hides the feature but
+   * keeps the stored lists, so re-enabling restores rather than wipes.
+   */
+  @IsOptional()
+  @IsBoolean()
+  navFavoritesEnabled?: boolean;
+
+  @IsOptional()
+  @IsBoolean()
+  navRecentEnabled?: boolean;
+
+  /**
    * Pinned hrefs in user-chosen display order, so this is an ordered list and not a
    * set. Shape and size are checked here; whether each href EXISTS in the navigation
    * tree and whether the CALLER may open it are decided by the service, the only layer

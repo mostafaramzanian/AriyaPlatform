@@ -824,7 +824,8 @@ export class CommercialLifecycleService {
       actor.tenantId,
       tx,
       document.id,
-      target
+      target,
+      actor.userId
     );
   }
 

@@ -29,7 +29,9 @@ export type DatasourceCheckKey =
   | 'productionDatabase'
   // Phase F1 — FINANCIAL FOUNDATION: the same rule for the Financial bounded context —
   // a runtime that composes `FinancialPrismaModule` must be able to name its check.
-  | 'financeDatabase';
+  | 'financeDatabase'
+  // Phase W1: the same rule for the Inventory bounded context.
+  | 'inventoryDatabase';
 
 export const DATASOURCE_CHECK_KEYS: Record<Datasource, DatasourceCheckKey> = {
   CORE_DATABASE_URL: 'coreDatabase',
@@ -40,9 +42,18 @@ export const DATASOURCE_CHECK_KEYS: Record<Datasource, DatasourceCheckKey> = {
   COMMERCE_DATABASE_URL: 'commerceDatabase',
   PRODUCTION_DATABASE_URL: 'productionDatabase',
   FINANCE_DATABASE_URL: 'financeDatabase',
+  INVENTORY_DATABASE_URL: 'inventoryDatabase',
 };
 
 export type InfrastructureCheckKey = 'redis' | 'rabbitmq' | 'storage';
+
+/**
+ * PHASE W3: the token-revocation feed as a readiness CHECK — always `optional`,
+ * never a gate (ttl-bound-only is a documented degraded posture, not an outage).
+ * It answers "is the deny-set feed actually wired?", which no datasource or
+ * broker probe can: RabbitMQ up ≠ this process's consumer bound.
+ */
+export type SecurityCheckKey = 'tokenRevocationFeed';
 
 export const INFRASTRUCTURE_CHECK_KEYS: Record<InfrastructureService, InfrastructureCheckKey> = {
   redis: 'redis',
@@ -50,12 +61,13 @@ export const INFRASTRUCTURE_CHECK_KEYS: Record<InfrastructureService, Infrastruc
   minio: 'storage',
 };
 
-export type CheckKey = DatasourceCheckKey | InfrastructureCheckKey;
+export type CheckKey = DatasourceCheckKey | InfrastructureCheckKey | SecurityCheckKey;
 
 /** Every check key this system can report, in a stable, declared order. */
 export const CHECK_KEYS: readonly CheckKey[] = [
   ...DATASOURCES.map((d) => DATASOURCE_CHECK_KEYS[d]),
   ...INFRASTRUCTURE_SERVICES.map((s) => INFRASTRUCTURE_CHECK_KEYS[s]),
+  'tokenRevocationFeed',
 ];
 
 /**

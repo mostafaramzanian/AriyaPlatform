@@ -107,6 +107,13 @@ function buildService() {
     }),
   };
   const directory = { findTenantMember: jest.fn().mockResolvedValue({ id: 'member' }) };
+  const orderReferences = {
+    resolve: jest.fn(async (_tenantId: string, orderReference: string) => ({
+      orderReference,
+      projectReference: null,
+      displayName: orderReference,
+    })),
+  };
 
   type ServiceArgs = ConstructorParameters<typeof CheckRequestService>;
   const service = new CheckRequestService(
@@ -114,6 +121,7 @@ function buildService() {
     attachments as unknown as ServiceArgs[1],
     audit as unknown as ServiceArgs[2],
     directory as unknown as ServiceArgs[3],
+    orderReferences as unknown as ServiceArgs[4],
   );
   return { service, repository, attachments, audit, directory };
 }

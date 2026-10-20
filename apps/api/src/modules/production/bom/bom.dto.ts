@@ -268,6 +268,18 @@ export class ListBomHeadersQueryDto {
   @IsOptional()
   @IsIn(['DRAFT', 'SUBMITTED', 'APPROVED', 'REJECTED'])
   status?: 'DRAFT' | 'SUBMITTED' | 'APPROVED' | 'REJECTED';
+
+  /**
+   * Phase PRODUCTION-REGISTER-REDESIGN: exact-match filter on the opaque `projectRef`
+   * column, bounded by the column's own `VARCHAR(128)`. The register's project dropdown
+   * lists only the DISTINCT refs the tenant already stores (see the `summary` route), so
+   * an exact match is the honest predicate — a `contains` here would let a caller probe
+   * for refs it never saw.
+   */
+  @IsOptional()
+  @IsString()
+  @MaxLength(128)
+  projectRef?: string;
 }
 
 /** Resolves the effective page window for a list query, clamped to the ceiling. */

@@ -13,6 +13,7 @@ import { CheckRequestRepository } from './check-request/check-request.repository
 import { CheckRequestService } from './check-request/check-request.service';
 import { CheckAttachmentRepository } from './check-request/check-attachment.repository';
 import { CheckAttachmentService } from './check-request/check-attachment.service';
+import { PurchaseOrderReferenceModule } from '../purchase-order-reference/purchase-order-reference.module';
 
 /**
  * Phase F1 — FINANCIAL FOUNDATION: the Financial bounded context's composition root.
@@ -69,6 +70,10 @@ import { CheckAttachmentService } from './check-request/check-attachment.service
     PlatformEntitlementModule,
     UserDirectoryModule,
     StorageModule,
+    // PHASE W2-C: binds the order-reference port through the NEUTRAL bridge
+    // module — this module still imports no Commerce file itself (the boundary
+    // spec holds); the bridge owns the one legal edge into Commerce.
+    PurchaseOrderReferenceModule,
   ],
   // TWO controllers, ONE feature: the requests surface (`check-requests/:id/...`) and
   // the static process definition the wizard renders from (`check-process`). Both carry

@@ -43,7 +43,12 @@ export type Datasource =
   // FINANCE_DATABASE_URL. Same sequence again: the declaration lands WITH the schema,
   // the migration, the generated client and the module's own Prisma module/service, so
   // the owner status is `implemented` from the first commit that names it.
-  | 'FINANCE_DATABASE_URL';
+  | 'FINANCE_DATABASE_URL'
+  // Phase W1 — WAREHOUSE / INVENTORY FOUNDATION: Inventory owns `inventory_db`,
+  // reached only through INVENTORY_DATABASE_URL. Same landing sequence: the
+  // declaration arrives WITH the schema, the migration, the generated client and
+  // the module's own Prisma module/service.
+  | 'INVENTORY_DATABASE_URL';
 
 export const DATASOURCES: readonly Datasource[] = [
   'CORE_DATABASE_URL',
@@ -54,6 +59,7 @@ export const DATASOURCES: readonly Datasource[] = [
   'COMMERCE_DATABASE_URL',
   'PRODUCTION_DATABASE_URL',
   'FINANCE_DATABASE_URL',
+  'INVENTORY_DATABASE_URL',
 ];
 
 export type InfrastructureService = 'redis' | 'rabbitmq' | 'minio';
@@ -114,6 +120,8 @@ export const RUNTIME_DATASOURCE_MATRIX: Record<RuntimeId, RuntimePolicy> = {
       // Phase F1: the Core-only runtime serves no Financial module either — same
       // boundary, same consequence: no Financial client in the image, no connection.
       FINANCE_DATABASE_URL: 'not-used',
+      // Phase W1: and no Inventory module either.
+      INVENTORY_DATABASE_URL: 'not-used',
     },
     infrastructure: {
       redis: 'optional',
@@ -135,6 +143,8 @@ export const RUNTIME_DATASOURCE_MATRIX: Record<RuntimeId, RuntimePolicy> = {
       PRODUCTION_DATABASE_URL: 'not-used',
       // Phase F1: and the same for Financial.
       FINANCE_DATABASE_URL: 'not-used',
+      // Phase W1: and the same for Inventory.
+      INVENTORY_DATABASE_URL: 'not-used',
     },
     infrastructure: {
       redis: 'optional',
@@ -177,6 +187,11 @@ export const RUNTIME_DATASOURCE_MATRIX: Record<RuntimeId, RuntimePolicy> = {
       // `core`, `cms` and `future-hr` still mark it `not-used`, so those images ship no
       // Financial client and never reach `finance_db`.
       FINANCE_DATABASE_URL: 'required',
+      // Phase W1 — WAREHOUSE / INVENTORY FOUNDATION: the combined runtime HOSTS
+      // `InventoryModule` (`AppModule` imports it) and its health graph imports
+      // `InventoryPrismaModule`, so `inventory_db` joins the required set — the
+      // same edit every earlier module made in this place.
+      INVENTORY_DATABASE_URL: 'required',
     },
     infrastructure: {
       redis: 'optional',
@@ -198,6 +213,8 @@ export const RUNTIME_DATASOURCE_MATRIX: Record<RuntimeId, RuntimePolicy> = {
       PRODUCTION_DATABASE_URL: 'not-used',
       // Phase F1: nor a Financial module.
       FINANCE_DATABASE_URL: 'not-used',
+      // Phase W1: nor an Inventory module.
+      INVENTORY_DATABASE_URL: 'not-used',
     },
     infrastructure: {
       redis: 'optional',
@@ -244,7 +261,7 @@ export function instantiatedDatasources(runtime: RuntimeId): Datasource[] {
   return DATASOURCES.filter((d) => datasourceInstantiation(runtime, d) === 'instantiated');
 }
 
-export type DatasourceOwner = 'core' | 'cms' | 'observability' | 'correspondence' | 'hr' | 'commerce' | 'production' | 'financial';
+export type DatasourceOwner = 'core' | 'cms' | 'observability' | 'correspondence' | 'hr' | 'commerce' | 'production' | 'financial' | 'inventory';
 
 /**
  * Phase ARCH-1.3: datasource -> owning Prisma project / module / generated client.
@@ -413,6 +430,22 @@ export const DATASOURCE_OWNERS: Record<Datasource, DatasourceOwnerDefinition> = 
     // is what the prisma project, the module directory and this registry entry agree on.
     status: 'implemented',
   },
+  INVENTORY_DATABASE_URL: {
+    datasource: 'INVENTORY_DATABASE_URL',
+    owner: 'inventory',
+    prismaProject: 'inventory',
+    prismaSchema: 'prisma/inventory/schema.prisma',
+    migrationRoot: 'prisma/inventory/migrations',
+    generatedClientDir: 'inventory-client',
+    prismaModuleClass: 'InventoryPrismaModule',
+    prismaModuleFile: 'modules/inventory/database/inventory-prisma.module.ts',
+    prismaServiceClass: 'InventoryPrismaService',
+    prismaServiceFile: 'modules/inventory/database/inventory-prisma.service.ts',
+    generateScript: 'prisma:generate:inventory',
+    // Phase W1: the schema, migration, generated client and Prisma module/service
+    // land with this declaration — `implemented` from the first commit.
+    status: 'implemented',
+  },
 };
 
 export const DATASOURCE_OWNER_ORDER: readonly DatasourceOwner[] = [
@@ -428,6 +461,8 @@ export const DATASOURCE_OWNER_ORDER: readonly DatasourceOwner[] = [
   'production',
   // Phase F1 — FINANCIAL FOUNDATION: appended last for the same reason.
   'financial',
+  // Phase W1 — appended last for the same reason.
+  'inventory',
 ];
 
 export function ownerOf(datasource: Datasource): DatasourceOwnerDefinition {

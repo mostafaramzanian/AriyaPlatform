@@ -104,6 +104,8 @@ export const CHECK_REQUEST_ERROR_CODES = {
   PROJECT_REQUIRED: 'CHECK_REQUEST_PROJECT_REQUIRED',
   /** V4 — a خرید with no order reference. Source: «شناسه شماره سفارش ثبت گردد!» */
   ORDER_REFERENCE_REQUIRED: 'CHECK_REQUEST_ORDER_REFERENCE_REQUIRED',
+  /** W2-C — a stated order reference that resolves to NO purchase order of the acting tenant. */
+  ORDER_REFERENCE_UNKNOWN: 'CHECK_REQUEST_ORDER_REFERENCE_UNKNOWN',
   /** V5 — a project purchase with no manager. Source: «مدیر پروژه انتخاب گردد!» */
   PROJECT_MANAGER_REQUIRED: 'CHECK_REQUEST_PROJECT_MANAGER_REQUIRED',
   /** V6 — no authenticated requester to force. Source: «درخواست کننده انتخاب گردد!» */

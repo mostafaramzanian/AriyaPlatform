@@ -160,6 +160,15 @@ function build() {
     create: jest.fn().mockResolvedValue(requestRow()),
     findById: jest.fn().mockResolvedValue(requestRow()),
     list: jest.fn().mockResolvedValue({ requests: [requestRow()], total: 1 }),
+    registerSummary: jest.fn().mockResolvedValue({
+      total: 7,
+      statusCounts: new Map([
+        ['DRAFT', 2],
+        ['APPROVED', 5],
+      ]),
+      approvedLast30Days: 4,
+      rework: 1,
+    }),
     updateDraft: jest.fn().mockResolvedValue(requestRow({ title: 'updated' })),
     submit: jest.fn().mockResolvedValue(requestRow({ status: 'SUBMITTED' })),
     decide: jest.fn().mockResolvedValue(requestRow({ status: 'APPROVED' })),
@@ -345,6 +354,20 @@ describe('BomChangeRequestService — reads are tenant-scoped and fail closed', 
     }
     expect(repository.listItems).not.toHaveBeenCalled();
     expect(repository.submit).not.toHaveBeenCalled();
+  });
+
+  it('zero-fills the closed lifecycle in the register summary, tenant-bound', async () => {
+    const { service, repository } = build();
+
+    const summary = await service.summary({ ...ACTOR });
+
+    expect(repository.registerSummary).toHaveBeenCalledWith(TENANT);
+    expect(summary).toEqual({
+      total: 7,
+      statusCounts: { DRAFT: 2, SUBMITTED: 0, APPROVED: 5, REJECTED: 0 },
+      approvedLast30Days: 4,
+      rework: 1,
+    });
   });
 });
 

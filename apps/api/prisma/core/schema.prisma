@@ -49,6 +49,7 @@ enum PermissionDomain {
   COMMERCE
   PRODUCTION
   FINANCIAL
+  INVENTORY
 }
 
 // Phase 49E: bounded notification categories.
@@ -357,9 +358,30 @@ model EmailVerification {
 }
 
 // Password reset tokens
+/// PHASE PASSWORD-RESET-CODE: one requested password-reset CODE per row.
+///
+/// The credential the user receives by email is a SIX-DIGIT code, never a link token, so
+/// the stored value is a HASH of that code (never the code itself) and the row carries the
+/// attempt counter that bounds online guessing.
+///
+/// `codeHash` is unique because the hash is salted with the USER id (and a process-level
+/// pepper) — see `TokenHashService.hashPasswordResetCode` — so two accounts that are sent
+/// the same six digits do not collide in this column, and a leaked table cannot be
+/// brute-forced offline without the pepper.
+///
+/// `attempts` is what makes a six-digit secret safe ONLINE: the reset path refuses a code
+/// after `MAX_PASSWORD_RESET_ATTEMPTS` wrong guesses and burns the row (`used: true`), so
+/// the caller must request a new code — and requesting one is rate-limited per IP
+/// (`RateLimitMiddleware`) and cooled down per account (`AuthService`).
+///
+/// A row is single-use (`used`), short-lived (`expiresAt`, minutes not hours) and retired
+/// when the next one is issued: at most one live code exists per account.
 model PasswordReset {
   id        String   @id @default(uuid())
-  token     String   @unique
+  /// SHA-256 of the six-digit code salted with the user id and the process pepper.
+  codeHash  String   @unique
+  /// Wrong-code guesses against THIS row; at the cap the row is burned.
+  attempts  Int      @default(0)
   user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
   userId    String
   expiresAt DateTime
@@ -1621,6 +1643,14 @@ model UserPreference {
   /// `CoreShell`, so it resets on every reload; persisting it is the entire fix.
   /// Irrelevant below the `lg:` breakpoint, where the sidebar is a drawer.
   sidebarCollapsed Boolean @default(false)
+
+  /// Opt-in switches for the two navigation personalization features. BOTH DEFAULT
+  /// FALSE: an untouched account sees neither the favourite stars nor the
+  /// recent-visits group until it enables them under «تنظیمات». They gate
+  /// PRESENTATION only — the stored lists are kept while a feature is off, so
+  /// re-enabling restores what the user had pinned rather than wiping it.
+  navFavoritesEnabled Boolean @default(false)
+  navRecentEnabled    Boolean @default(false)
 
   /// Pinned navigation hrefs, in user-chosen display order — which is why this is
   /// an ordered `String[]` and not a set. Bounded to 12 entries by the

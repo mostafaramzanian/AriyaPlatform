@@ -34,6 +34,17 @@ export default async () => {
   // Wait for PostgreSQL to be ready
   await waitForPostgres();
 
+  // E2E-STAGING-ISOLATION GUARD: the e2e harness runs `db:migrate` + `db:seed`
+  // and test-tenant teardown. It MUST NOT run against a cluster that hosts a
+  // deployed environment. We identify the cluster by PostgreSQL's stable
+  // `system_identifier` (port/proxy names lie — the e2e-dbproxy at :5544
+  // forwards into the staging postgres), then:
+  //   1. refuse if the resolved cluster is listed in E2E_PG_FORBIDDEN_SYSTEM_IDS;
+  //   2. refuse unless the operator either pins the expected test cluster via
+  //      E2E_PG_EXPECTED_SYSTEM_ID or explicitly opts into the shared target
+  //      with E2E_ALLOW_SHARED_PG=1.
+  await assertE2ePostgresTargetIsSafe();
+
   // Run per-owner Prisma migrations for all six datasources.
   console.log('[E2E] Running Prisma migrations (all owners)...');
   await runCommand('npm', ['run', 'db:migrate'], {
@@ -62,6 +73,65 @@ export default async () => {
   // Store setup completion time for test timing
   global.__E2E_SETUP_TIME__ = Date.now();
 };
+
+async function assertE2ePostgresTargetIsSafe(): Promise<void> {
+  const pg = createRequire(__filename)('pg');
+  const client = new pg.Client(
+    process.env.CORE_DATABASE_URL || process.env.DATABASE_URL,
+  );
+  await client.connect();
+  try {
+    const { rows } = await client.query(
+      'SELECT system_identifier::text AS id FROM pg_control_system()',
+    );
+    const systemId: string = rows[0]?.id ?? '';
+    console.log(`[E2E] PostgreSQL system_identifier: ${systemId}`);
+
+    const forbidden = (process.env.E2E_PG_FORBIDDEN_SYSTEM_IDS || '')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+    if (forbidden.includes(systemId)) {
+      throw new Error(
+        `[E2E] REFUSED: resolved PostgreSQL cluster (system_identifier=${systemId}) ` +
+          'is listed in E2E_PG_FORBIDDEN_SYSTEM_IDS. This e2e run would migrate, ' +
+          'seed and tear down data on a NON-DISPOSABLE environment. Point the ' +
+          '*_DATABASE_URL variables at a dedicated test cluster instead.',
+      );
+    }
+
+    const expected = (process.env.E2E_PG_EXPECTED_SYSTEM_ID || '').trim();
+    if (expected) {
+      if (systemId !== expected) {
+        throw new Error(
+          `[E2E] REFUSED: resolved cluster ${systemId} does not match ` +
+            `E2E_PG_EXPECTED_SYSTEM_ID=${expected}. Wrong target — aborting ` +
+            'before any migration or seed runs.',
+        );
+      }
+      console.log('[E2E] Cluster identity matches the expected test cluster.');
+      return;
+    }
+
+    if (process.env.E2E_ALLOW_SHARED_PG === '1') {
+      console.warn(
+        '[E2E] WARNING: E2E_ALLOW_SHARED_PG=1 — running migrations/seed/teardown ' +
+          'against a cluster whose identity is NOT pinned. Test tenants may share ' +
+          'storage with a deployed environment.',
+      );
+      return;
+    }
+
+    throw new Error(
+      '[E2E] REFUSED: no cluster-identity attestation. Set ' +
+        'E2E_PG_EXPECTED_SYSTEM_ID to the dedicated test cluster ' +
+        'system_identifier (recommended), or set E2E_ALLOW_SHARED_PG=1 to ' +
+        'acknowledge running against an unpinned shared target.',
+    );
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
 
 function waitForPostgres(): Promise<void> {
   return new Promise((resolve) => {

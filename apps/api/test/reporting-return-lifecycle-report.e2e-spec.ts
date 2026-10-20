@@ -44,6 +44,7 @@ import {
 } from './reporting-export.fixtures';
 import { PrismaService as CorePrismaService } from '../src/database/prisma.service';
 import { CommercePrismaService } from '../src/modules/commerce/database/commerce-prisma.service';
+import { ensureCommerceProcurementTestProvisioning } from './fixtures/commerce-provisioning';
 
 type SupertestResponse = import('supertest').Response;
 
@@ -318,6 +319,15 @@ describe('Reporting — Commerce Return Lifecycle Report (ninth vertical slice)'
     if (!tenantA) throw new Error('[E2E] Seeded tenant tenant-test-1 not found');
     tenantAId = tenantA.id;
 
+    // Test-only provisioning, and it MUST run BEFORE any login: login resolves the
+    // caller's permission claim through the PermissionSource port (which caches its
+    // answer), so a grant written after the first token is minted leaves every later
+    // request carrying a permission-empty identity. The grant/enrolment migrations
+    // cannot supply these rows themselves — they only see what existed at migration
+    // time, while the roles and `tenant-test-1` are created afterwards by `db:seed`.
+    // Shapes mirrored, nothing else touched: fixtures/commerce-provisioning.ts.
+    await ensureCommerceProcurementTestProvisioning(coreDb, [tenantAId]);
+
     const seededAdminRow = await coreDb.user.findUnique({ where: { email: 'admin@localhost' } });
     if (!seededAdminRow) throw new Error('[E2E] Seeded admin user not found');
     admin = {
@@ -543,7 +553,7 @@ describe('Reporting — Commerce Return Lifecycle Report (ninth vertical slice)'
 
     const body = envelope(res.body);
     expect(body.total).toBe(5);
-    const ids = body.items.map((item) => item.id);
+    const ids = body.items.map((item: { id: string }) => item.id);
     expect(new Set(ids).size).toBe(5);
     expect(ids.sort()).toEqual(
       [retRefunded.id, retReceivedBack.id, retApproved.id, retRequested.id, retRejected.id].sort()
@@ -597,7 +607,7 @@ describe('Reporting — Commerce Return Lifecycle Report (ninth vertical slice)'
         .set('Authorization', `Bearer ${admin.token}`)
         .expect(200);
       const body = envelope(res.body);
-      expect({ state, ids: body.items.map((item) => item.id) }).toEqual({
+      expect({ state, ids: body.items.map((item: { id: string }) => item.id) }).toEqual({
         state,
         ids: [returnId],
       });
@@ -672,7 +682,7 @@ describe('Reporting — Commerce Return Lifecycle Report (ninth vertical slice)'
       )
       .set('Authorization', `Bearer ${admin.token}`)
       .expect(200);
-    expect(envelope(sameDay.body).items.map((item) => item.id)).toEqual(
+    expect(envelope(sameDay.body).items.map((item: { id: string }) => item.id)).toEqual(
       expect.arrayContaining([retRefunded.id])
     );
   });
@@ -707,7 +717,9 @@ describe('Reporting — Commerce Return Lifecycle Report (ninth vertical slice)'
       .get(`${reportUrl()}?search=${encodeURIComponent(RUN_ID)}&pageSize=100`)
       .set('Authorization', `Bearer ${admin.token}`)
       .expect(200);
-    expect(envelope(byReason.body).items.map((item) => item.id)).toEqual([retRefunded.id]);
+    expect(envelope(byReason.body).items.map((item: { id: string }) => item.id)).toEqual([
+      retRefunded.id,
+    ]);
     expect(envelope(byReason.body).items[0].reason).toContain(RUN_ID);
 
     // A different reason phrase — the same OR branch, another row. SCOPED to this
@@ -717,7 +729,9 @@ describe('Reporting — Commerce Return Lifecycle Report (ninth vertical slice)'
       .get(scoped(`&search=${encodeURIComponent('آسیب دیده در حمل')}&pageSize=100`))
       .set('Authorization', `Bearer ${admin.token}`)
       .expect(200);
-    expect(envelope(byPhrase.body).items.map((item) => item.id)).toEqual([retReceivedBack.id]);
+    expect(envelope(byPhrase.body).items.map((item: { id: string }) => item.id)).toEqual([
+      retReceivedBack.id,
+    ]);
 
     // The parent document's number — the same-owner join a tenant-wide register needs.
     const byNumber: SupertestResponse = await api()
@@ -725,7 +739,7 @@ describe('Reporting — Commerce Return Lifecycle Report (ninth vertical slice)'
       .set('Authorization', `Bearer ${admin.token}`)
       .expect(200);
     const body = envelope(byNumber.body);
-    expect(body.items.map((item) => item.id).sort()).toEqual(
+    expect(body.items.map((item: { id: string }) => item.id).sort()).toEqual(
       [retRefunded.id, retReceivedBack.id, retApproved.id, retRequested.id, retRejected.id].sort()
     );
     for (const item of body.items) expect(item.purchaseDocumentNumber).toBe(docANumber);
@@ -803,7 +817,7 @@ describe('Reporting — Commerce Return Lifecycle Report (ninth vertical slice)'
       .get(`${reportUrl()}?pageSize=100`)
       .set('Authorization', `Bearer ${admin.token}`)
       .expect(200);
-    const ids = envelope(list.body).items.map((item) => item.id);
+    const ids = envelope(list.body).items.map((item: { id: string }) => item.id);
     expect(ids).not.toContain(tenantBReturnId);
 
     // A foreign id behaves EXACTLY like a missing one: 404, not 403.
@@ -892,7 +906,7 @@ describe('Reporting — Commerce Return Lifecycle Report (ninth vertical slice)'
     // history — four events for the full forward chain, never a sibling's.
     expect(page.total).toBe(4);
     expect(page.items).toHaveLength(4);
-    expect(page.items.map((item) => item.action).sort()).toEqual(
+    expect(page.items.map((item: { action: string }) => item.action).sort()).toEqual(
       ['approve', 'create', 'receive_back', 'refund'].sort()
     );
     for (const item of page.items) {
@@ -909,7 +923,7 @@ describe('Reporting — Commerce Return Lifecycle Report (ninth vertical slice)'
       .expect(200);
     const rejectedPage = envelope(rejected.body);
     expect(rejectedPage.total).toBe(2);
-    expect(rejectedPage.items.map((item) => item.action).sort()).toEqual(
+    expect(rejectedPage.items.map((item: { action: string }) => item.action).sort()).toEqual(
       ['create', 'reject'].sort()
     );
   });
@@ -1055,7 +1069,7 @@ describe('Reporting — Commerce Return Lifecycle Report (ninth vertical slice)'
       .get(scoped('&state=REQUESTED&pageSize=100'))
       .set('Authorization', `Bearer ${admin.token}`)
       .expect(200);
-    expect(envelope(beforeRes.body).items.map((item) => item.id)).toContain(sixth.id);
+    expect(envelope(beforeRes.body).items.map((item: { id: string }) => item.id)).toContain(sixth.id);
 
     expect(await transition(admin.token, docAId, sixth.id, 'reject', { reason: 'live' })).toBe(
       'REJECTED'
@@ -1067,7 +1081,7 @@ describe('Reporting — Commerce Return Lifecycle Report (ninth vertical slice)'
       .expect(200);
     const afterBody = envelope(afterRes.body);
     expect(afterBody.total).toBe(6);
-    const row = afterBody.items.find((item) => item.id === sixth.id);
+    const row = afterBody.items.find((item: { id: string }) => item.id === sixth.id);
     expect(row.state).toBe('REJECTED');
     // The partition moved with the real command: REJECTED gained one, REQUESTED kept
     // its untouched one (the fixture's `retRequested` never moved).

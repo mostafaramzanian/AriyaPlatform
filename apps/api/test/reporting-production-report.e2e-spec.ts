@@ -39,6 +39,8 @@ import {
   responseBuffer,
 } from './reporting-export.fixtures';
 import { PrismaService as CorePrismaService } from '../src/database/prisma.service';
+import { ensureProductionReportingTestProvisioning } from './fixtures/production-provisioning';
+import { ProductionAuditOutboxRelayService } from '../src/modules/production/production-audit-outbox-relay.service';
 
 type SupertestResponse = import('supertest').Response;
 
@@ -258,14 +260,14 @@ function envelope<T>(body: { data?: T } | T): T {
   return (body as { data?: T }).data ?? (body as T);
 }
 
-function idsOf(body): string[] {
-  const page = envelope(body);
-  return ((page?.items ?? []) as { id: string }[]).map((item) => item.id);
+function idsOf(body: unknown): string[] {
+  const page = envelope(body as { items?: unknown });
+  return ((page.items ?? []) as { id: string }[]).map((item) => item.id);
 }
 
-function statusesOf(body): (string | null)[] {
-  const page = envelope(body);
-  return ((page?.items ?? []) as { status: string }[]).map((item) => item.status);
+function statusesOf(body: unknown): (string | null)[] {
+  const page = envelope(body as { items?: unknown });
+  return ((page.items ?? []) as { status: string }[]).map((item) => item.status);
 }
 
 describe('Reporting — Production operational status report (real runtime)', () => {
@@ -283,6 +285,14 @@ describe('Reporting — Production operational status report (real runtime)', ()
 
   beforeAll(async () => {
     await waitForReadiness();
+
+    // Test-only provisioning for THIS tenant, and it MUST run BEFORE any login: login resolves
+    // the caller's permission claim through the PermissionSource port (which caches its answer),
+    // so a grant written after the first token is minted leaves every later request carrying a
+    // permission-empty identity — and every Production write below would answer 403 instead of
+    // 201. Shapes mirrored, nothing else touched: fixtures/production-provisioning.ts.
+    await ensureProductionReportingTestProvisioning(getCoreDb(), ['tenant-test-1']);
+
     const roleId = await findAdminRoleId();
 
     const seeded = await login('admin@localhost', PASSWORDS.seededAdmin);
@@ -543,6 +553,16 @@ describe('Reporting — Production operational status report (real runtime)', ()
   });
 
   it('serves the selected BOM’s authoritative timeline — and only for it', async () => {
+    // The audit outbox is the platform's intentional async durability design: each Production
+    // mutation commits its audit intent with the business row, and
+    // ProductionAuditOutboxRelayService delivers it to core_db."AuditLog" on a poll — whose own
+    // contract documents a direct call from tests (financial-check-issuance.e2e-spec.ts reads its
+    // timeline the same way). The whole suite lifecycle fits inside one relay window, and the
+    // events this test asserts are NOT symmetric: some are written synchronously through
+    // AUDIT_PORT while the others are still unclaimed outbox rows. So drain the outbox
+    // deterministically before reading. Production code and every assertion below are unchanged.
+    await getApp().get(ProductionAuditOutboxRelayService).relay();
+
     const res: SupertestResponse = await api()
       .get(reportUrl(`/${submittedId}/timeline`))
       .set('Authorization', `Bearer ${admin.token}`)
@@ -550,7 +570,7 @@ describe('Reporting — Production operational status report (real runtime)', ()
 
     expect(Array.isArray(res.body.items)).toBe(true);
     expect(res.body.total).toBeGreaterThanOrEqual(2); // create + item create + submit were audited
-    const actions = res.body.items.map((item) => item.action);
+    const actions = res.body.items.map((item: { action: string }) => item.action);
     expect(actions).toEqual(expect.arrayContaining(['create', 'submit']));
     // The timeline projection never carries raw envelope internals.
     for (const item of res.body.items) {
@@ -614,7 +634,7 @@ describe('Reporting — Production operational status report (real runtime)', ()
       'تاریخ ایجاد',
     ]);
     expect(sheet.data).toHaveLength(listed.items.length);
-    expect(sheet.data.map((row) => row[0])).toEqual(listed.items.map((item) => item.title));
+    expect(sheet.data.map((row) => row[0])).toEqual(listed.items.map((item: { title: string }) => item.title));
     expect(sheet.firstColumn).toContain('وضعیت');
 
     const docx: SupertestResponse = await getExportFile(

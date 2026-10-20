@@ -8,7 +8,13 @@ import {
 import { PurchaseRepository } from '../purchase/purchase.repository';
 import type { PurchaseDocumentFilter } from '../purchase/purchase.repository';
 import { PURCHASE_DOCUMENT_STATUSES } from '../purchase/purchase-status';
+import { addMoney, negateMoney, sumMoney } from '../purchase/purchase-money';
 import type {
+  CommercePurchaseAgingBucket,
+  CommercePurchaseAgingPage,
+  CommercePurchaseAgingRow,
+  CommercePurchaseCostReport,
+  CommercePurchaseCostRow,
   CommercePurchaseReportPage,
   CommercePurchaseReportQuery,
   CommercePurchaseReportRow,
@@ -166,6 +172,137 @@ export class CommercePurchaseReportingReaderService implements CommercePurchaseR
       pageSize: result.page.pageSize,
       total: result.page.total,
     };
+  }
+
+  /**
+   * PHASE W2-C — the pending-aging read: every in-circulation document, aged
+   * from the instant its CURRENT status was entered.
+   *
+   * THE AGING ORIGIN IS `statusChangedAt` — the column every conditional
+   * status statement writes — falling back to `createdAt` only for rows that
+   * predate the column (their true entry instant was never recorded, and
+   * creation is the honest floor). `updatedAt` is deliberately unread: it
+   * moves on every edit, so it cannot answer "how long in THIS state".
+   *
+   * ONE `generatedAt` per call: every `ageDays`/`agingBucket` on the page AND
+   * in the strip is computed against the same instant, so two numbers in one
+   * response can never have been measured at two different times.
+   */
+  async listPendingAging(
+    scope: CommerceReportingScope,
+    query: { page?: number; pageSize?: number }
+  ): Promise<CommercePurchaseAgingPage> {
+    const window = resolveReportWindow(query);
+    const generatedAt = new Date();
+
+    const rows = await this.documents.listPendingForAging(scope.tenantId);
+
+    const byBucket: Record<CommercePurchaseAgingBucket, number> = {
+      DAYS_0_7: 0,
+      DAYS_8_30: 0,
+      DAYS_31_90: 0,
+      OVER_90: 0,
+    };
+    const aged = rows.map((row) => {
+      const statusEnteredAt = row.statusChangedAt ?? row.createdAt;
+      const ageDays = Math.max(
+        0,
+        Math.floor((generatedAt.getTime() - statusEnteredAt.getTime()) / 86_400_000)
+      );
+      const agingBucket: CommercePurchaseAgingBucket =
+        ageDays <= 7
+          ? 'DAYS_0_7'
+          : ageDays <= 30
+            ? 'DAYS_8_30'
+            : ageDays <= 90
+              ? 'DAYS_31_90'
+              : 'OVER_90';
+      byBucket[agingBucket] += 1;
+      return {
+        id: row.id,
+        documentNumber: row.documentNumber,
+        status: row.status,
+        statusEnteredAt: statusEnteredAt.toISOString(),
+        ageDays,
+        agingBucket,
+        totalAmount: money(row.totalAmount),
+        currency: row.currency,
+        createdAt: row.createdAt.toISOString(),
+      } satisfies CommercePurchaseAgingRow;
+    });
+
+    return {
+      items: aged.slice((window.page - 1) * window.pageSize, window.page * window.pageSize),
+      total: aged.length,
+      page: window.page,
+      pageSize: window.pageSize,
+      byBucket,
+      generatedAt: generatedAt.toISOString(),
+    };
+  }
+
+  /**
+   * PHASE W2-C — the committed-cost read: Commerce's own charge-target column
+   * (`costCenter`, «مرکز هزینه») cross the document currency, never a fabricated
+   * project join — `PurchaseDocument` holds no project reference and none is
+   * invented here.
+   *
+   * THE THREE FACTS, kept separate so nothing is double-counted:
+   *   * COMMITTED is Σ `totalAmount` over rows whose status is not CANCELLED;
+   *   * PAID is the NET append-only payment ledger — compensation rows carry
+   *     negative amounts, so the plain sum is already the honest figure, and it
+   *     is counted even on a cancelled document because money that moved moved;
+   *   * OUTSTANDING is `committed − paid` in exact `Decimal(18,4)` arithmetic
+   *     (`purchase-money`'s scaled-bigint functions — never a float).
+   *
+   * MIXED CURRENCIES ARE NEVER SUMMED: the bucket key is `(costCenter,
+   * currency)`, so an IRR total and a USD total can never collapse into one
+   * meaningless number.
+   */
+  async listCostByCenter(
+    scope: CommerceReportingScope
+  ): Promise<CommercePurchaseCostReport> {
+    const rows = await this.documents.listCostBasis(scope.tenantId);
+    const generatedAt = new Date();
+
+    const buckets = new Map<string, CommercePurchaseCostRow & { committed: string[]; paid: string[] }>();
+    for (const row of rows) {
+      const costCenter = row.costCenter as string; // `not: null` in the predicate
+      const key = `${costCenter}${row.currency ?? ''}`;
+      let bucket = buckets.get(key);
+      if (!bucket) {
+        bucket = {
+          costCenter,
+          currency: row.currency,
+          documentCount: 0,
+          committedAmount: '0.0000',
+          paidAmount: '0.0000',
+          outstandingAmount: '0.0000',
+          committed: [],
+          paid: [],
+        };
+        buckets.set(key, bucket);
+      }
+      bucket.documentCount += 1;
+      if (row.status !== 'CANCELLED' && row.totalAmount !== null) {
+        bucket.committed.push(row.totalAmount.toString());
+      }
+      for (const payment of row.payments) bucket.paid.push(payment.amount.toString());
+    }
+
+    const items: CommercePurchaseCostRow[] = [...buckets.values()].map((bucket) => ({
+      costCenter: bucket.costCenter,
+      currency: bucket.currency,
+      documentCount: bucket.documentCount,
+      committedAmount: sumMoney(bucket.committed),
+      paidAmount: sumMoney(bucket.paid),
+      outstandingAmount: addMoney(
+        sumMoney(bucket.committed),
+        negateMoney(sumMoney(bucket.paid))
+      ),
+    }));
+
+    return { items, generatedAt: generatedAt.toISOString() };
   }
 }
 

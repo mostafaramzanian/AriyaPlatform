@@ -306,6 +306,32 @@ export class BomChangeRequestService {
   }
 
   /**
+   * Phase PRODUCTION-CHANGES-REDESIGN: the register summary consumed by the KPI strip and
+   * the status pills of `/admin/production/changes`. Zero-fills the closed lifecycle so a
+   * status the database has never held reads as `0` rather than an absent key.
+   */
+  async summary(actor: BomChangeActor): Promise<{
+    total: number;
+    statusCounts: Record<'DRAFT' | 'SUBMITTED' | 'APPROVED' | 'REJECTED', number>;
+    approvedLast30Days: number;
+    rework: number;
+  }> {
+    const raw = await this.repository.registerSummary(actor.tenantId);
+
+    return {
+      total: raw.total,
+      statusCounts: {
+        DRAFT: raw.statusCounts.get('DRAFT') ?? 0,
+        SUBMITTED: raw.statusCounts.get('SUBMITTED') ?? 0,
+        APPROVED: raw.statusCounts.get('APPROVED') ?? 0,
+        REJECTED: raw.statusCounts.get('REJECTED') ?? 0,
+      },
+      approvedLast30Days: raw.approvedLast30Days,
+      rework: raw.rework,
+    };
+  }
+
+  /**
    * One request with ALL of its detail rows, or 404.
    *
    * The rows come back in ONE read of this tenant's own table, ordered by `createdAt` — the

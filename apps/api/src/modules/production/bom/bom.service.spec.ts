@@ -84,6 +84,17 @@ function build() {
     findById: jest.fn().mockResolvedValue(row()),
     list: jest.fn().mockResolvedValue({ items: [row()], total: 1 }),
     updateDraft: jest.fn().mockResolvedValue(row({ title: 'renamed' })),
+    registerSummary: jest.fn().mockResolvedValue({
+      total: 7,
+      statusCounts: new Map([
+        ['DRAFT', 2],
+        ['APPROVED', 5],
+      ]),
+      activeItems: 12,
+      inFlightChanges: 3,
+      projectRefs: ['proj-a'],
+      productTreeRefs: ['tree-1'],
+    }),
     submit: jest.fn().mockResolvedValue(row({ status: 'SUBMITTED', submittedAt: new Date() })),
     decide: jest
       .fn()
@@ -200,6 +211,7 @@ describe('BomHeaderService.list and getOne', () => {
       take: 5,
       status: 'DRAFT',
       search: undefined,
+      projectRef: undefined,
     });
     expect(page).toMatchObject({ total: 1, page: 2, pageSize: 5 });
     expect(page.items).toHaveLength(1);
@@ -222,6 +234,22 @@ describe('BomHeaderService.list and getOne', () => {
     await expect(service.getOne(ACTOR, BOM_ID)).rejects.toBeInstanceOf(NotFoundException);
     // The tenant travelled with the id — that is the whole difference.
     expect(repository.findById).toHaveBeenCalledWith(TENANT, BOM_ID);
+  });
+
+  it('zero-fills the closed lifecycle in the register summary and keeps the actor tenant', async () => {
+    const { service, repository } = build();
+
+    const summary = await service.summary(ACTOR);
+
+    expect(repository.registerSummary).toHaveBeenCalledWith(TENANT);
+    expect(summary).toEqual({
+      total: 7,
+      statusCounts: { DRAFT: 2, SUBMITTED: 0, APPROVED: 5, REJECTED: 0 },
+      activeItems: 12,
+      inFlightChanges: 3,
+      projectRefs: ['proj-a'],
+      productTreeRefs: ['tree-1'],
+    });
   });
 
 describe('BomHeaderService.update', () => {

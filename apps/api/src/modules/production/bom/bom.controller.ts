@@ -91,6 +91,20 @@ export class BomHeaderController {
     return this.boms.list(resolveProductionActor(req), query);
   }
 
+  /**
+   * Phase PRODUCTION-REGISTER-REDESIGN: the register summary — `GET /production/boms/summary`.
+   *
+   * Declared BEFORE `@Get(':id')` so the literal segment is not consumed by the UUID
+   * parser. A READ, so `production.bom.read`; the summary is only an aggregation over
+   * rows the caller could already page through, and the tenant predicate is applied
+   * inside the repository exactly as on `list`.
+   */
+  @Get('summary')
+  @Roles(Permissions.PRODUCTION_BOM_READ)
+  async getSummary(@Request() req: ExRequest) {
+    return this.boms.summary(resolveProductionActor(req));
+  }
+
   /** One BOM header, or 404 when the id is not this tenant's. */
   @Get(':id')
   @Roles(Permissions.PRODUCTION_BOM_READ)

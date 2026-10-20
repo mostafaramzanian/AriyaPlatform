@@ -9,6 +9,7 @@ import {
   Post,
   Query,
   Request,
+  StreamableFile,
   UseGuards,
 } from '@nestjs/common';
 import { Request as ExRequest } from 'express';
@@ -29,6 +30,7 @@ import {
   UpdateEmployeeDto,
 } from '../dto/employee.dto';
 import { ListEmployeesQueryDto } from '../dto/hr-query.dto';
+import { ImportEmployeesDto } from '../dto/employee-import.dto';
 
 /**
  * Phase 51-HR-1: the personnel-record HTTP surface — `/hr/employees`.
@@ -78,6 +80,62 @@ export class EmployeesController {
   @Roles(Permissions.HR_EMPLOYEES_READ)
   async list(@Request() req: ExRequest, @Query() query: ListEmployeesQueryDto) {
     return this.employees.list(resolveHrActor(req), query);
+  }
+
+  /**
+   * The KPI strip of the redesigned directory — `GET /hr/employees/summary`.
+   * DECLARED BEFORE `:id`: literal segments must outrank the parameterised route or
+   * `ParseUUIDPipe` swallows them ("uuid v 4 is expected"), the trap this file's
+   * ordering rule exists to prevent.
+   */
+  @Get('summary')
+  @Roles(Permissions.HR_EMPLOYEES_READ)
+  async summary(@Request() req: ExRequest) {
+    return this.employees.summary(resolveHrActor(req));
+  }
+
+  /**
+   * «تولید‌خودکار» — the next free personnel code for the create form
+   * (`GET /hr/employees/next-code`).
+   *
+   * GATED ON MANAGE, NOT READ: its only consumer is the create form, which itself
+   * requires `hr.employees.manage`, and the next sequence is an operational fact about
+   * writes in flight rather than directory data a read-only caller needs. DECLARED
+   * BEFORE `:id`, as every literal segment in this file is, so `ParseUUIDPipe` can
+   * never swallow it.
+   */
+  @Get('next-code')
+  @Roles(Permissions.HR_EMPLOYEES_MANAGE)
+  async nextCode(@Request() req: ExRequest) {
+    return this.employees.suggestEmployeeCode(resolveHrActor(req));
+  }
+
+  /**
+   * «خروجی اکسل» — the SAME filtered directory as a workbook. Same read permission,
+   * same DTO: an actor who may not see these rows may not download them, and the
+   * file's filter state cannot differ from the table's by construction.
+   */
+  @Get('export/xlsx')
+  @Roles(Permissions.HR_EMPLOYEES_READ)
+  async exportXlsx(@Request() req: ExRequest, @Query() query: ListEmployeesQueryDto) {
+    const file = await this.employees.exportXlsx(resolveHrActor(req), query);
+    return new StreamableFile(file.buffer, {
+      type: file.mimeType,
+      disposition: `attachment; filename="${file.fileName}"`,
+    });
+  }
+
+  /**
+   * «بارگذاری گروهی» — a bounded batch create (`POST /hr/employees/import`). Rows are
+   * named by catalogue CODES, resolved tenant-scoped in the service; each row takes
+   * the real `create` path so audits, duplicate codes and interval rules are
+   * identical to the single-create form. MANAGE permission, like `create`.
+   */
+  @Post('import')
+  @HttpCode(200)
+  @Roles(Permissions.HR_EMPLOYEES_MANAGE)
+  async importRows(@Request() req: ExRequest, @Body() dto: ImportEmployeesDto) {
+    return this.employees.importRows(resolveHrActor(req), dto.rows);
   }
 
   @Get(':id')

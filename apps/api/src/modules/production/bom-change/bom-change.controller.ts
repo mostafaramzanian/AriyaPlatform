@@ -95,6 +95,20 @@ export class BomChangeRequestController {
   }
 
   /**
+   * Phase PRODUCTION-CHANGES-REDESIGN: the register summary —
+   * `GET /production/bom-change-requests/summary`.
+   *
+   * Declared BEFORE `@Get(':id')` so the literal segment is not consumed by the UUID
+   * parser. A READ, so `production.bom.read`; it aggregates only rows the caller could
+   * already page through, tenant-scoped inside the repository exactly like `list`.
+   */
+  @Get('summary')
+  @Roles(Permissions.PRODUCTION_BOM_READ)
+  async getSummary(@Request() req: ExRequest) {
+    return this.requests.summary(resolveProductionActor(req));
+  }
+
+  /**
    * One request with ALL of its detail rows, or 404.
    *
    * A change request of another tenant is indistinguishable from one that does not exist —

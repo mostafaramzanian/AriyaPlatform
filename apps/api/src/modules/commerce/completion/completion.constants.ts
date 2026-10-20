@@ -48,6 +48,39 @@ export const PURCHASE_COMPLETION_FAILURE = {
    * established 409, never a silent success.
    */
   WRITE_CONFLICT: 'PURCHASE_COMPLETION_WRITE_CONFLICT',
+  /**
+   * PHASE W2-C: at least one durable `InventoryPosting` planned from this
+   * document's lines is still `PENDING` or `FAILED` — the stock evidence for a
+   * receipt/return has not reached the inventory ledger, so the purchase may
+   * not be presented as complete. Retry the posting first; the refusal carries
+   * the count.
+   */
+  INTEGRATION_UNRESOLVED: 'PURCHASE_COMPLETION_INTEGRATION_UNRESOLVED',
+  /**
+   * PHASE W3 (confirmed closure rule): at least one line's net received
+   * quantity (Σ receipt events, compensations subtracted) is below its ordered
+   * quantity — fulfilment is incomplete, so the document may not close.
+   */
+  FULFILLMENT_INCOMPLETE: 'PURCHASE_FULFILLMENT_INCOMPLETE',
+  /**
+   * PHASE W3: a return on this document is still in a non-terminal state
+   * (REQUESTED / APPROVED / RECEIVED_BACK) — goods or refund disposition is
+   * open, so closure would bury an unresolved lifecycle.
+   */
+  RETURN_UNRESOLVED: 'PURCHASE_RETURN_UNRESOLVED',
+  /**
+   * PHASE W3: the payment projection is not `PAID` (UNPAID or PARTIAL) or an
+   * APPROVED payment plan still has open unexecuted installments — the
+   * required payments are not fully settled.
+   */
+  PAYMENT_SETTLEMENT_INCOMPLETE: 'PURCHASE_PAYMENT_SETTLEMENT_INCOMPLETE',
+  /**
+   * PHASE W3: the settlement facts contradict each other — an OVERPAID
+   * projection, an unstated total, or a PAID sum beside open approved-plan
+   * installments. A human must resolve the inconsistency; closure never
+   * papers over it.
+   */
+  PAYMENT_INCONSISTENT: 'PURCHASE_PAYMENT_INCONSISTENT',
 } as const;
 
 export type PurchaseCompletionFailureCode =

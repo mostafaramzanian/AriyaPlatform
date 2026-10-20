@@ -60,6 +60,8 @@ const PREFERENCE_SELECT = {
   textScale: true,
   motion: true,
   sidebarCollapsed: true,
+  navFavoritesEnabled: true,
+  navRecentEnabled: true,
   navFavorites: true,
   navRecent: true,
   dashboardLayout: true,
@@ -74,6 +76,9 @@ export interface PreferenceDto {
   textScale: number;
   motion: MotionPreference;
   sidebarCollapsed: boolean;
+  /** Opt-in feature switches — both default false. */
+  navFavoritesEnabled: boolean;
+  navRecentEnabled: boolean;
   /** Already filtered to targets the caller may currently open. */
   navFavorites: string[];
   /** Already filtered, and never contains an audit surface. */
@@ -100,6 +105,8 @@ export const PREFERENCE_DEFAULTS = {
   textScale: 100,
   motion: MotionPreference.SYSTEM,
   sidebarCollapsed: false,
+  navFavoritesEnabled: false,
+  navRecentEnabled: false,
 } as const;
 
 /**
@@ -118,6 +125,8 @@ type PreferenceWriteData = {
   textScale?: number;
   motion?: MotionPreference;
   sidebarCollapsed?: boolean;
+  navFavoritesEnabled?: boolean;
+  navRecentEnabled?: boolean;
   navFavorites?: string[];
   navRecent?: string[];
   dashboardLayout?: Prisma.NullableJsonNullValueInput | Prisma.InputJsonValue;
@@ -202,6 +211,8 @@ export class PreferenceService {
       textScale: row.textScale,
       motion: row.motion,
       sidebarCollapsed: row.sidebarCollapsed,
+      navFavoritesEnabled: row.navFavoritesEnabled,
+      navRecentEnabled: row.navRecentEnabled,
       navFavorites: row.navFavorites.filter((href) => isNavTargetAllowed(href, granted)),
       navRecent: row.navRecent.filter(
         (href) => isNavTargetAllowed(href, granted) && !isExcludedFromRecent(href),
@@ -303,6 +314,9 @@ export class PreferenceService {
     if (dto.textScale !== undefined) data.textScale = dto.textScale;
     if (dto.motion !== undefined) data.motion = dto.motion;
     if (dto.sidebarCollapsed !== undefined) data.sidebarCollapsed = dto.sidebarCollapsed;
+    if (dto.navFavoritesEnabled !== undefined)
+      data.navFavoritesEnabled = dto.navFavoritesEnabled;
+    if (dto.navRecentEnabled !== undefined) data.navRecentEnabled = dto.navRecentEnabled;
 
     if (dto.navFavorites !== undefined) {
       data.navFavorites = this.sanitizeFavorites(dto.navFavorites, granted);

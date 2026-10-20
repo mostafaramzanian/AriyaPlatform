@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-require-imports -- committed debug utility; runs under plain node against ../dist and cannot use ESM imports. */
 const { Test } = require('@nestjs/testing');
 (async function(){
   try{

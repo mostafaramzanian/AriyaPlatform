@@ -188,6 +188,22 @@ export class RefundReturnDto {
   @IsUUID('4')
   paymentId!: string;
 
+  /**
+   * PHASE W4: the refunded figure when it is smaller than the named payment —
+   * omitted means the compensation negates the whole payment (the established
+   * full-refund act). A stated amount must not exceed the payment; over-refund
+   * is refused by the payment slice (409).
+   */
+  @IsOptional()
+  @IsNumber({
+    maxDecimalPlaces: PURCHASE_LINE_MAX_DECIMAL_PLACES,
+    allowNaN: false,
+    allowInfinity: false,
+  })
+  @Min(0.0001)
+  @Max(PURCHASE_MAX_MONEY_AMOUNT)
+  amount?: number;
+
   @IsOptional()
   @IsString()
   @MaxLength(500)

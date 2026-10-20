@@ -2,6 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import { DatasourceHealthProbe } from './datasource-health.probe';
 import { InfrastructureHealthProbe } from './infrastructure-health.probe';
 import { ReadinessEvaluator } from './readiness.evaluator';
+import { RevocationFeedProbe } from './revocation-feed.probe';
 import { ProbeResult, ReadinessReport, sanitizeDetail } from './health.contract';
 
 /**
@@ -28,6 +29,7 @@ export class HealthService {
   constructor(
     private readonly datasourceProbe: DatasourceHealthProbe,
     private readonly infrastructureProbe: InfrastructureHealthProbe,
+    private readonly revocationProbe: RevocationFeedProbe,
     private readonly evaluator: ReadinessEvaluator
   ) {}
 
@@ -49,12 +51,17 @@ export class HealthService {
     const results: ProbeResult[] = [
       ...(await this.runProbeFamily('datasources', () => this.datasourceProbe.probeAll())),
       ...(await this.runProbeFamily('infrastructure', () => this.infrastructureProbe.probeAll())),
+      // PHASE W3: the revocation feed's posture is a synchronous read of the
+      // registry's own snapshot — no I/O, so it rides the family backstop.
+      ...(await this.runProbeFamily('security', () =>
+        Promise.resolve(this.revocationProbe.probe())
+      )),
     ];
     return this.evaluator.evaluate(results);
   }
 
   private async runProbeFamily(
-    family: 'datasources' | 'infrastructure',
+    family: 'datasources' | 'infrastructure' | 'security',
     probe: () => Promise<ProbeResult[]>
   ): Promise<ProbeResult[]> {
     try {

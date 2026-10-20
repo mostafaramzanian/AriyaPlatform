@@ -16,6 +16,11 @@ import type { PurchaseDocumentStatus } from './purchase-status';
 import { PurchaseRepository } from './purchase.repository';
 import type { PurchaseDocumentTotals, PurchaseLineWrite } from './purchase.repository';
 import { CommerceUnitOfWork } from '../database/commerce-transaction';
+import {
+  formatJalaliDateKey,
+  instantToJalaliDate,
+  jalaliWallTimeToInstant,
+} from '../../../calendar/jalali.util';
 import { CommercialLifecycleService } from '../commercial/commercial-lifecycle.service';
 import { WorkflowLineRoutingService } from '../workflow/workflow-line-routing.service';
 import type {
@@ -96,6 +101,9 @@ export const PURCHASE_AUDIT_ACTION = {
   CREATE: 'create',
   UPDATE: 'update',
   SUBMIT: 'submit',
+  // REACTIVATION (GAP-6 follow-up): the reopen act's verb — the trail records that a
+  // REJECTED document was returned to DRAFT, beside the submit that rejected it.
+  REOPEN: 'reopen',
 } as const;
 
 /** One document as the repository returns it, labels included. */
@@ -186,8 +194,10 @@ export class PurchaseService {
       requesterId: dto.requesterId,
       supplierId: dto.supplierId ?? null,
       currency: dto.currency ?? null,
+      costCenter: dto.costCenter ?? null,
       totals,
       lines,
+      actorUserId: actor.userId,
     });
 
     await this.audit.record(actor, {
@@ -200,6 +210,7 @@ export class PurchaseService {
         status: document.status,
         requesterId: document.requesterId,
         currency: document.currency,
+        costCenter: document.costCenter,
         subtotalAmount: PurchaseService.money(document.subtotalAmount),
         taxAmount: PurchaseService.money(document.taxAmount),
         totalAmount: PurchaseService.money(document.totalAmount),
@@ -251,7 +262,12 @@ export class PurchaseService {
 
     const [rows, total] = await this.repository.listDocumentPage(
       actor.tenantId,
-      { status: query.status, requesterId: query.requesterId, search: query.search },
+      {
+        status: query.status,
+        requesterId: query.requesterId,
+        costCenter: query.costCenter,
+        search: query.search,
+      },
       window
     );
 
@@ -262,6 +278,86 @@ export class PurchaseService {
       page: window.page,
       pageSize: window.pageSize,
       total,
+    };
+  }
+
+  /**
+   * The home surface's aggregate read: register totals plus the CURRENT JALALI
+   * MONTH's spend — computed server-side so no client ever sums a page of rows
+   * and calls it a KPI (the lying-dashboard rule the home comment cites).
+   *
+   * THE MONTH IS JALALI, NOT GREGORIAN, because the figure is rendered as
+   * «گردش ریالی ماه جاری» and Tehran is the application zone: the window opens
+   * on the 1st of the current Jalali month at 00:00 Asia/Tehran, resolved through
+   * the calendar module's own conversion so the definition has ONE answer.
+   * CANCELLED documents never spend, so they are excluded from every sum; NULL
+   * totals (unpriced documents) contribute nothing rather than reading as 0 that
+   * was never stated.
+   *
+   * `daily` is a fixed 30-point series of per-day spend ending today, for the
+   * KPI card's sparkline; `previousMonthTotal` lets the client render an honest
+   * trend rather than an invented percentage.
+   */
+  async summary(actor: CommerceActor) {
+    const now = new Date();
+    const today = instantToJalaliDate(now);
+    const monthStart = jalaliWallTimeToInstant(today.jy, today.jm, 1, 0, 0);
+    const prev =
+      today.jm === 1 ? { jy: today.jy - 1, jm: 12 } : { jy: today.jy, jm: today.jm - 1 };
+    const prevMonthStart = jalaliWallTimeToInstant(prev.jy, prev.jm, 1, 0, 0);
+    const dayStart = jalaliWallTimeToInstant(today.jy, today.jm, today.jd, 0, 0);
+    const sparkStart = new Date(dayStart.getTime() - 29 * 86_400_000);
+
+    const since = prevMonthStart < sparkStart ? prevMonthStart : sparkStart;
+    const [rows, counts, allSpend, costCenters] = await Promise.all([
+      this.repository.findSpendSince(actor.tenantId, since),
+      this.repository.countByStatus(actor.tenantId, {}),
+      this.repository.findSpendSince(actor.tenantId, new Date(0)),
+      this.repository.findCostCenters(actor.tenantId),
+    ]);
+
+    const alive = rows.filter((row) => row.status !== 'CANCELLED' && row.totalAmount !== null);
+    const sumOver = (list: typeof alive) =>
+      list.reduce((acc, row) => addMoney(acc, String(row.totalAmount)), '0');
+
+    const dayKeys: string[] = [];
+    for (let i = 29; i >= 0; i--) {
+      dayKeys.push(
+        formatJalaliDateKey(instantToJalaliDate(new Date(dayStart.getTime() - i * 86_400_000)))
+      );
+    }
+    const buckets = new Map(dayKeys.map((key) => [key, '0']));
+    for (const row of alive) {
+      const key = formatJalaliDateKey(instantToJalaliDate(row.createdAt));
+      const existing = buckets.get(key);
+      if (existing !== undefined) buckets.set(key, addMoney(existing, String(row.totalAmount)));
+    }
+
+    let total = 0;
+    counts.forEach((count) => {
+      total += count;
+    });
+
+    const statusCounts: Record<string, number> = {};
+    counts.forEach((count, status) => {
+      statusCounts[status] = count;
+    });
+
+    const inCirculationTotal = sumOver(
+      allSpend.filter((row) => row.status !== 'CANCELLED' && row.totalAmount !== null)
+    );
+
+    return {
+      total,
+      submitted: counts.get('SUBMITTED') ?? 0,
+      statusCounts,
+      inCirculationTotal,
+      costCenters,
+      monthTotal: sumOver(alive.filter((row) => row.createdAt >= monthStart)),
+      previousMonthTotal: sumOver(
+        alive.filter((row) => row.createdAt >= prevMonthStart && row.createdAt < monthStart)
+      ),
+      daily: dayKeys.map((key) => Number(buckets.get(key))),
     };
   }
 
@@ -303,6 +399,7 @@ export class PurchaseService {
         ...(dto.requesterId !== undefined ? { requesterId: dto.requesterId } : {}),
         ...(dto.supplierId !== undefined ? { supplierId: dto.supplierId } : {}),
         ...(dto.currency !== undefined ? { currency: dto.currency } : {}),
+        ...(dto.costCenter !== undefined ? { costCenter: dto.costCenter } : {}),
       },
       ...(totals ? { totals } : {}),
       ...(lines ? { lines } : {}),
@@ -387,6 +484,7 @@ export class PurchaseService {
         actor.tenantId,
         tx,
         id,
+        actor.userId,
         outbox
       );
       if (!marked) {
@@ -457,6 +555,80 @@ export class PurchaseService {
     return this.serialize(submitted, await this.identity.profilesFor([submitted.requesterId]));
   }
 
+  /**
+   * REACTIVATION (GAP-6 follow-up): return a REJECTED document to DRAFT
+   * (`POST commerce/purchase-documents/:id/reopen`).
+   *
+   * THE REJECTION IS NEVER ERASED. The settled workflow instance, its negative
+   * decision and every audit row stay exactly where they are — only the document's
+   * own status moves, conditionally, through the `REJECTED → DRAFT` edge the status
+   * table declares beside this act. The document becomes editable again, and the
+   * NEXT submit starts a FRESH approval round (fresh line routing and commercial
+   * activation, exactly as every submit performs); nothing pretends the first round
+   * did not happen.
+   *
+   * WHO: `commerce.manage`, the same remit as every other document write (create /
+   * update / submit / close). WHAT: only `REJECTED` — every other status answers
+   * 409 with the status named, so CANCELLED, CLOSED and in-flight documents are
+   * refused by construction rather than by a UI that hides the button.
+   */
+  async reopen(actor: CommerceActor, id: string) {
+    const existing = await this.repository.findDocumentById(actor.tenantId, id);
+    if (!existing) throw new NotFoundException('Purchase document not found');
+
+    if (!canTransitionPurchaseDocument(existing.status, 'DRAFT')) {
+      throw new ConflictException(
+        `A purchase document in status ${existing.status} cannot be reopened; only a REJECTED document returns to draft`
+      );
+    }
+
+    const outbox = this.audit.buildOutboxPayload(actor, {
+      action: PURCHASE_AUDIT_ACTION.REOPEN,
+      resource: COMMERCE_AUDIT_RESOURCE.PURCHASE_DOCUMENT,
+      resourceId: id,
+      oldValue: { status: existing.status },
+      newValue: { status: 'DRAFT' },
+    });
+
+    const reopened = await this.unitOfWork.run((tx) =>
+      this.repository.reopenDocumentIn(actor.tenantId, tx, id, actor.userId, outbox)
+    );
+
+    if (!reopened) {
+      throw new ConflictException(
+        'The purchase document left REJECTED while this request was being applied'
+      );
+    }
+
+    return this.serialize(reopened, await this.identity.profilesFor([reopened.requesterId]));
+  }
+
+  /**
+   * PHASE W3: `GET /commerce/purchase-documents/:id/status-events` — the document's
+   * append-only status-transition history, exactly as persisted.
+   *
+   * Existence is the tenant-scoped 404 gate first — a foreign document's history
+   * must be indistinguishable from no document at all. `fromStatus` is NULL on the
+   * creation event only; rows are returned in the repository's deterministic
+   * order. This is NOT the audit timeline (that is the `timeline` route): these
+   * rows record transitions, the audit trail records actor/action evidence.
+   */
+  async getStatusEvents(actor: CommerceActor, id: string) {
+    const document = await this.repository.findDocumentById(actor.tenantId, id);
+    if (!document) throw new NotFoundException('Purchase document not found');
+    const events = await this.repository.listStatusEvents(actor.tenantId, id);
+    return {
+      items: events.map((event) => ({
+        id: event.id,
+        fromStatus: event.fromStatus,
+        toStatus: event.toStatus,
+        source: event.source,
+        actorUserId: event.actorUserId,
+        occurredAt: event.occurredAt.toISOString(),
+      })),
+    };
+  }
+
   // ---------------------------------------------------------------------------
   // Translation, projection and the two guards
   // ---------------------------------------------------------------------------
@@ -515,6 +687,7 @@ export class PurchaseService {
       ...(dto.requesterId !== undefined ? ['requesterId'] : []),
       ...(dto.supplierId !== undefined ? ['supplierId'] : []),
       ...(dto.currency !== undefined ? ['currency'] : []),
+      ...(dto.costCenter !== undefined ? ['costCenter'] : []),
       ...(dto.lines ? ['lines'] : []),
     ];
   }
@@ -561,6 +734,7 @@ export class PurchaseService {
       },
       supplierId: document.supplierId,
       currency: document.currency,
+      costCenter: document.costCenter ?? null,
       subtotalAmount: PurchaseService.money(document.subtotalAmount),
       taxAmount: PurchaseService.money(document.taxAmount),
       totalAmount: PurchaseService.money(document.totalAmount),

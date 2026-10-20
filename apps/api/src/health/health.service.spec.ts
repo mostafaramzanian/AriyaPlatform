@@ -3,6 +3,7 @@ import { HealthService } from './health.service';
 import { DatasourceHealthProbe } from './datasource-health.probe';
 import { InfrastructureHealthProbe } from './infrastructure-health.probe';
 import { ReadinessEvaluator } from './readiness.evaluator';
+import { RevocationFeedProbe } from './revocation-feed.probe';
 import { ProbeResult } from './health.contract';
 import { RuntimeId } from '../runtime-datasources';
 
@@ -78,6 +79,9 @@ describe('HealthService', () => {
       {
         probeAll: probes.infrastructure ?? (async () => []),
       } as unknown as InfrastructureHealthProbe,
+      // W3: no registry bound — the probe reports 'not-configured', which is
+      // OPTIONAL and therefore never the reason these assertions differ.
+      new RevocationFeedProbe(null),
       new ReadinessEvaluator(runtime)
     );
 
@@ -103,6 +107,8 @@ describe('HealthService', () => {
         // Phase F1 — FINANCIAL FOUNDATION: Financial is `required` in the COMBINED runtime
         // for the same reason — the composition root imports `FinancialPrismaModule`.
         ok('financeDatabase', 'required'),
+        // Phase W1: Inventory is `required` in the COMBINED runtime for the same reason.
+        ok('inventoryDatabase', 'required'),
       ],
       infrastructure: infraNotConfigured,
     });
@@ -112,7 +118,7 @@ describe('HealthService', () => {
     expect(report.healthy).toBe(true);
     expect(report.blocking).toEqual([]);
     expect(report.optionalDegraded).toEqual(['observabilityDatabase']);
-    expect(report.notConfigured).toEqual(['redis', 'rabbitmq', 'storage']);
+    expect(report.notConfigured).toEqual(['redis', 'rabbitmq', 'storage', 'tokenRevocationFeed']);
     expect(report.checks.observabilityDatabase).toBe(false);
   });
 
@@ -135,6 +141,8 @@ describe('HealthService', () => {
         // Phase F1 — FINANCIAL FOUNDATION: Financial is `required` too, and healthy, so it
         // is not a blocker either.
         ok('financeDatabase', 'required'),
+        // Phase W1: Inventory is `required` in the COMBINED runtime for the same reason.
+        ok('inventoryDatabase', 'required'),
       ],
       infrastructure: infraNotConfigured,
     });
@@ -160,17 +168,20 @@ describe('HealthService', () => {
         notUsed('productionDatabase'),
         // Phase F1 — FINANCIAL FOUNDATION: and the same for Financial.
         notUsed('financeDatabase'),
+        // Phase W1: and the same for Inventory.
+        notUsed('inventoryDatabase'),
       ],
     });
 
     const report = await service.getReadinessStatus();
 
     expect(report.healthy).toBe(true);
-    expect(report.skipped).toBe(6); // cms, correspondence, HR, Commerce, Production and Financial
+    expect(report.skipped).toBe(7); // cms, correspondence, HR, Commerce, Production, Financial and Inventory
     expect(report.requirements.cmsDatabase).toBe('not-used');
     expect(report.requirements.commerceDatabase).toBe('not-used');
     expect(report.requirements.productionDatabase).toBe('not-used');
     expect(report.requirements.financeDatabase).toBe('not-used');
+    expect(report.requirements.inventoryDatabase).toBe('not-used');
     expect(report.requirements.observabilityDatabase).toBe('optional');
   });
 

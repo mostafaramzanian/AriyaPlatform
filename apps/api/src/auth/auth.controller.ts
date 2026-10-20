@@ -95,8 +95,13 @@ export class AuthController {
 
   @Public()
   @Post('forgot-password')
-  @ApiOperation({ summary: 'Request password reset' })
-  @ApiResponse({ status: 200, description: 'Reset email sent if account exists' })
+  @ApiOperation({ summary: 'Email a six-digit password-reset code' })
+  @ApiResponse({
+    status: 200,
+    description:
+      'Always 200: a code was emailed if the address exists, and the answer never says which',
+  })
+  @ApiResponse({ status: 429, description: 'Too many requests (per-IP rate limit)' })
   @HttpCode(200)
   async forgotPassword(@Body() body: ForgotPasswordDto) {
     return this.authService.requestPasswordReset(body.email);
@@ -104,12 +109,13 @@ export class AuthController {
 
   @Public()
   @Post('reset-password')
-  @ApiOperation({ summary: 'Reset password with token' })
+  @ApiOperation({ summary: 'Set a new password with the emailed code' })
   @ApiResponse({ status: 200, description: 'Password reset successful' })
-  @ApiResponse({ status: 400, description: 'Invalid or expired token' })
+  @ApiResponse({ status: 400, description: 'Invalid or expired reset code' })
+  @ApiResponse({ status: 429, description: 'Too many requests (per-IP rate limit)' })
   @HttpCode(200)
   async resetPassword(@Body() body: ResetPasswordDto) {
-    return this.authService.resetPassword(body.token, body.newPassword);
+    return this.authService.resetPassword(body.email, body.code, body.newPassword);
   }
 
   @Public()

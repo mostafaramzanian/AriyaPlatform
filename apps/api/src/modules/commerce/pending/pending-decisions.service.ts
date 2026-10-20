@@ -5,6 +5,7 @@ import {
   type CommercePageQueryDto,
 } from '../dto/commerce-query.dto';
 import { CommercialLifecycleRepository } from '../commercial/commercial-lifecycle.repository';
+import { CommerceIdentityGateway, type DirectoryUserProfile } from '../commerce-identity.gateway';
 import { PurchaseRepository } from '../purchase/purchase.repository';
 import { WorkflowExecutionRepository } from '../workflow/workflow-execution.repository';
 
@@ -56,6 +57,23 @@ export interface CommercePendingDecisionItem {
   /** The configured step's key and its AUTHORED name (from the pinned version's step row). */
   readonly stepKey: string | null;
   readonly stepName: string | null;
+  /**
+   * The task-card document projection: the columns a decision card renders
+   * (requester + profile, cost center, total, status, registration instant).
+   * `null` when the reference resolves to no row this tenant holds — exactly
+   * like `purchaseDocumentId`/`documentNumber`, which remain for compatibility.
+   */
+  readonly document: {
+    id: string;
+    documentNumber: string;
+    status: string;
+    requesterId: string;
+    requester: DirectoryUserProfile | null;
+    costCenter: string | null;
+    totalAmount: string | null;
+    currency: string | null;
+    createdAt: string;
+  } | null;
 }
 
 /** What both halves sort by: newest first, `id` breaking same-instant ties. */
@@ -72,7 +90,8 @@ export class PendingDecisionsService {
   constructor(
     private readonly executions: WorkflowExecutionRepository,
     private readonly approvals: CommercialLifecycleRepository,
-    private readonly purchases: PurchaseRepository
+    private readonly purchases: PurchaseRepository,
+    private readonly identity: CommerceIdentityGateway
   ) {}
 
   /** One page of THIS user's actionable decisions, both systems, tenant-scoped. */
@@ -112,10 +131,32 @@ export class PendingDecisionsService {
     const lineDocuments = await this.purchases.findDocumentIdsByLineIds(actor.tenantId, lineIds);
     documentIds.push(...lineDocuments.values());
 
-    const numbers = await this.purchases.findDocumentNumbersByIds(actor.tenantId, [
+    const documents = await this.purchases.findDocumentSummariesByIds(actor.tenantId, [
       ...documentIds,
       ...approvals.map((approval) => approval.purchaseDocumentId),
     ]);
+
+    // Requester profiles in ONE batch for the whole page — the same N+1 rule the
+    // register's own list read follows.
+    const requesterIds = [...documents.values()].map((row) => row.requesterId);
+    const profiles = await this.identity.profilesFor(requesterIds);
+
+    const documentOf = (documentId: string | null) => {
+      if (!documentId) return null;
+      const row = documents.get(documentId);
+      if (!row) return null;
+      return {
+        id: row.id,
+        documentNumber: row.documentNumber,
+        status: row.status,
+        requesterId: row.requesterId,
+        requester: profiles.get(row.requesterId) ?? null,
+        costCenter: row.costCenter,
+        totalAmount: row.totalAmount === null ? null : String(row.totalAmount),
+        currency: row.currency,
+        createdAt: row.createdAt.toISOString(),
+      };
+    };
 
     const items: CommercePendingDecisionItem[] = [
       ...steps.map((step): CommercePendingDecisionItem => {
@@ -123,31 +164,37 @@ export class PendingDecisionsService {
           step.instance.subjectType === 'PURCHASE_DOCUMENT'
             ? step.instance.subjectId
             : (lineDocuments.get(step.instance.subjectId) ?? null);
+        const document = documentOf(documentId);
         return {
           kind: 'WORKFLOW_STEP',
           id: step.id,
           status: 'PENDING',
           createdAt: step.createdAt.toISOString(),
           purchaseDocumentId: documentId,
-          documentNumber: documentId ? (numbers.get(documentId) ?? null) : null,
+          documentNumber: document?.documentNumber ?? null,
           purchaseLineId: step.scopeType === 'LINE' ? step.scopeId : null,
           workflowInstanceId: step.instance.id,
           stepKey: step.stepDefinition.stepKey,
           stepName: step.stepDefinition.displayName,
+          document,
         };
       }),
-      ...approvals.map((approval): CommercePendingDecisionItem => ({
-        kind: 'COMMERCIAL_APPROVAL',
-        id: approval.id,
-        status: 'PENDING',
-        createdAt: approval.createdAt.toISOString(),
-        purchaseDocumentId: approval.purchaseDocumentId,
-        documentNumber: numbers.get(approval.purchaseDocumentId) ?? null,
-        purchaseLineId: approval.purchaseLineId,
-        workflowInstanceId: null,
-        stepKey: null,
-        stepName: null,
-      })),
+      ...approvals.map((approval): CommercePendingDecisionItem => {
+        const document = documentOf(approval.purchaseDocumentId);
+        return {
+          kind: 'COMMERCIAL_APPROVAL',
+          id: approval.id,
+          status: 'PENDING',
+          createdAt: approval.createdAt.toISOString(),
+          purchaseDocumentId: approval.purchaseDocumentId,
+          documentNumber: document?.documentNumber ?? null,
+          purchaseLineId: approval.purchaseLineId,
+          workflowInstanceId: null,
+          stepKey: null,
+          stepName: null,
+          document,
+        };
+      }),
     ];
 
     items.sort(newestFirst);

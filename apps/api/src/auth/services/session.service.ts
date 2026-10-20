@@ -21,7 +21,9 @@ import { REDIS_CLIENT } from '../../common/redis.module';
 @Injectable()
 export class SessionService {
   private readonly logger = new Logger(SessionService.name);
-  private readonly SESSION_TTL = 30 * 24 * 60 * 60; // 30 days in seconds
+  // Matches `AuthService.refreshTokenExpiration`: the session record must not
+  // outlive the refresh token it backs (9 hours, in seconds).
+  private readonly SESSION_TTL = 9 * 60 * 60;
 
   // Atomic Lua script that enforces a configurable per-user session cap.
   // It removes stale index entries, evicts the oldest sessions deterministically

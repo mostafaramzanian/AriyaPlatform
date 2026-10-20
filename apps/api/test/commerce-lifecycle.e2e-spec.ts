@@ -72,7 +72,11 @@ import {
   type TenantResolution,
   type TenantResolutionInput,
 } from '../src/platform/auth/tenant-resolver.contract';
-import { AUDIT_PORT, type AuditEventInput, type AuditPort } from '../src/platform/audit/audit.contract';
+import {
+  AUDIT_PORT,
+  type AuditEventInput,
+  type AuditPort,
+} from '../src/platform/audit/audit.contract';
 import { createFakeAuditPort } from './fixtures/fake-audit-port';
 // PHASE C9 (GAP-5): the Commerce search source registers into a CONTRACT-DRIVEN in-memory
 // port here — the same `register/project/authorize` shapes the real binding enforces — so
@@ -110,10 +114,17 @@ import { PurchaseCompletionPolicyController } from '../src/modules/commerce/comp
 import { PurchaseCompletionPolicyRepository } from '../src/modules/commerce/completion/purchase-completion-policy.repository';
 import { PurchaseCompletionPolicyService } from '../src/modules/commerce/completion/purchase-completion-policy.service';
 import { PurchaseCompletionService } from '../src/modules/commerce/completion/purchase-completion.service';
+import { InventoryPostingRepository } from '../src/modules/commerce/integration/inventory-posting.repository';
+import { InventoryIntegrationService } from '../src/modules/commerce/integration/inventory-integration.service';
+import { INVENTORY_POSTING_PORT } from '../src/modules/commerce/integration/inventory-posting.port';
+import { createFakeInventoryPostingPort } from './fixtures/fake-inventory-posting-port';
 import { PurchaseService } from '../src/modules/commerce/purchase/purchase.service';
 import { PurchaseTimelineService } from '../src/modules/commerce/purchase/purchase-timeline.service';
+import { PurchaseHistoryRepository } from '../src/modules/commerce/purchase/purchase-history.repository';
+import { PurchaseHistoryService } from '../src/modules/commerce/purchase/purchase-history.service';
 import { PurchaseRepository } from '../src/modules/commerce/purchase/purchase.repository';
 import { PaymentHistoryController } from '../src/modules/commerce/payment/payment-history.controller';
+import { PaymentPlanRepository } from '../src/modules/commerce/payment-plan/payment-plan.repository';
 import { PaymentHistoryService } from '../src/modules/commerce/payment/payment-history.service';
 import { PaymentHistoryRepository } from '../src/modules/commerce/payment/payment-history.repository';
 import { ReceivingHistoryController } from '../src/modules/commerce/receiving/receiving-history.controller';
@@ -140,6 +151,10 @@ import { WorkflowLineRoutingController } from '../src/modules/commerce/workflow/
 import { WorkflowExecutionController } from '../src/modules/commerce/workflow/workflow-execution.controller';
 import { PendingDecisionsController } from '../src/modules/commerce/pending/pending-decisions.controller';
 import { PendingDecisionsService } from '../src/modules/commerce/pending/pending-decisions.service';
+import { QuotationController } from '../src/modules/commerce/quotation/quotation.controller';
+import { QuotationRepository } from '../src/modules/commerce/quotation/quotation.repository';
+import { QuotationService } from '../src/modules/commerce/quotation/quotation.service';
+import { SupplierRepository } from '../src/modules/commerce/supplier/supplier.repository';
 
 // ---------------------------------------------------------------------------
 // The two-tenant registry and the in-memory port fakes (seam 2)
@@ -218,6 +233,28 @@ const fakeEntitlementPort: EntitlementPort = {
 
 // PHASE P-AUDIT-READ: the fake is contract-driven for BOTH port methods — `read` validates
 // through the same `validateAuditReadQuery` the Core binding uses (test/fixtures/fake-audit-port).
+/**
+ * GAP-6 follow-up 3.3: the in-memory `IStorageProvider` double. Contract-shaped
+ * (upload/getUrl/delete) and CAPTURES the objects, so the e2e can prove the
+ * workflow end to end — object written first, row binding second, cleanup on a
+ * lost race, signed-URL resolution — without MinIO. The real provider's own
+ * contract is Financial's attachment e2e's business, not this suite's.
+ */
+const fakeStorage = {
+  objects: new Map<string, Buffer>(),
+  async upload(key: string, buffer: Buffer): Promise<string> {
+    this.objects.set(key, buffer);
+    return key;
+  },
+  async getUrl(key: string): Promise<string> {
+    if (!this.objects.has(key)) throw new Error('unknown object');
+    return `signed://${key}`;
+  },
+  async delete(key: string): Promise<boolean> {
+    return this.objects.delete(key);
+  },
+};
+
 const contractAuditPort = createFakeAuditPort(auditEvents);
 
 /**
@@ -291,10 +328,12 @@ class ProbeHeaderStrategy {
       claims: null,
     });
   }
-  private success(): void {
+  private success(_arg?: unknown): void {
+    void _arg;
     throw new Error('passport replaces this method before authenticate() runs');
   }
-  private fail(): void {
+  private fail(_arg?: unknown): void {
+    void _arg;
     throw new Error('passport replaces this method before authenticate() runs');
   }
 }
@@ -307,6 +346,7 @@ class ProbeHeaderStrategy {
  */
 interface PurchaseDocumentLine {
   id: string;
+  quantity?: string | number;
 }
 
 interface CreatedPurchaseDocument {
@@ -323,6 +363,8 @@ interface CreatedPurchaseDocument {
 interface PaymentStatusProjection {
   status: string;
   paidAmount: string | number;
+  /** The document's own total, as the projection reports it beside the paid amount. */
+  totalAmount: string | number | null;
 }
 
 interface PaymentProjection {
@@ -625,6 +667,8 @@ describe('Commerce lifecycle independence e2e (Step V): the five dimensions of a
       PendingDecisionsController,
       // PHASE C3 (GAP-2): the production line-routing CONFIGURATION routes under test.
       WorkflowLineRoutingController,
+      // PHASE GAP-6: the price-quotation routes — record, decide, and the trail read.
+      QuotationController,
       CommerceTenantProbeController,
     ],
     providers: [
@@ -639,22 +683,31 @@ describe('Commerce lifecycle independence e2e (Step V): the five dimensions of a
       CommerceIdentityGateway,
       CommerceAuditGateway,
       CommerceNotificationGateway,
-    // PHASE C9 (GAP-5): the search source, wired exactly as production wires it — its
-    // constructor registers it with the port provided below.
-    CommerceSearchSourceService,
+      // PHASE C9 (GAP-5): the search source, wired exactly as production wires it — its
+      // constructor registers it with the port provided below.
+      CommerceSearchSourceService,
       CommerceUnitOfWork,
       PurchaseRepository,
       PurchaseService,
       // PHASE C7 (GAP-7): the timeline route on `PurchaseController` needs its service —
       // wired exactly as commerce.module.ts wires it (repository + audit gateway above).
       PurchaseTimelineService,
+      // PHASE W3.2: the aggregated history route's service + repository.
+      PurchaseHistoryRepository,
+      PurchaseHistoryService,
       // PHASE C4-R (GAP-3): the completion slice — the policy row's owner, its
       // configuration surface, and the one service that may move a document to CLOSED.
       PurchaseCompletionPolicyRepository,
       PurchaseCompletionPolicyService,
       PurchaseCompletionService,
+      InventoryPostingRepository,
+      InventoryIntegrationService,
+      { provide: INVENTORY_POSTING_PORT, useValue: createFakeInventoryPostingPort() },
       PaymentHistoryRepository,
       PaymentHistoryService,
+      // PHASE W3: the closure evaluator's settlement facts — open installments of
+      // APPROVED plans — are read through the plan slice's own repository.
+      PaymentPlanRepository,
       ReceivingHistoryRepository,
       ReceivingHistoryService,
       ReturnHistoryRepository,
@@ -672,6 +725,17 @@ describe('Commerce lifecycle independence e2e (Step V): the five dimensions of a
       WorkflowLineRoutingService,
       WorkflowLineRoutingConfigurationService,
       PendingDecisionsService, // PHASE C2 (GAP-1b): composes both repositories' pending reads.
+      // PHASE GAP-6: the quotation slice — wired exactly as commerce.module.ts wires it
+      // (repository + the gateways provided above).
+      QuotationRepository,
+      QuotationService,
+      // SUPPLIER MASTER DATA: QuotationService's new optional `supplierId`
+      // existence check reads through the owning slice's repository — wired here
+      // exactly as commerce.module.ts wires it.
+      SupplierRepository,
+      // GAP-6 follow-up 3.3: the ONE storage dependency QuotationService now has —
+      // the in-memory double above, never MinIO, in this harness.
+      { provide: 'IStorageProvider', useValue: fakeStorage },
       // the in-memory ports (seam 2)
       { provide: TenantResolver, useValue: fakeTenantResolver },
       { provide: PermissionSource, useValue: fakePermissionSource },
@@ -716,12 +780,8 @@ describe('Commerce lifecycle independence e2e (Step V): the five dimensions of a
     documentId: string,
     as: string = userA1
   ): Promise<CreatedPurchaseDocument> =>
-    (
-      await http()
-        .get(`${api}/purchase-documents/${documentId}`)
-        .set(authed(as))
-        .expect(200)
-    ).body as CreatedPurchaseDocument;
+    (await http().get(`${api}/purchase-documents/${documentId}`).set(authed(as)).expect(200))
+      .body as CreatedPurchaseDocument;
 
   const getPayments = async (documentId: string): Promise<PaymentProjection> =>
     (
@@ -747,10 +807,7 @@ describe('Commerce lifecycle independence e2e (Step V): the five dimensions of a
         .expect(200)
     ).body as ReturnProjection;
 
-  const getApprovals = async (
-    documentId: string,
-    as: string = userA1
-  ): Promise<ApprovalListing> =>
+  const getApprovals = async (documentId: string, as: string = userA1): Promise<ApprovalListing> =>
     (
       await http()
         .get(`${api}/commercial-approvals?documentId=${documentId}`)
@@ -770,10 +827,7 @@ describe('Commerce lifecycle independence e2e (Step V): the five dimensions of a
       .set(authed(asUser))
       .send({ comment: null });
 
-  const createDoc = async (
-    lines: unknown[],
-    currency = 'EUR'
-  ): Promise<CreatedPurchaseDocument> =>
+  const createDoc = async (lines: unknown[], currency = 'EUR'): Promise<CreatedPurchaseDocument> =>
     (
       await http()
         .post(`${api}/purchase-documents`)
@@ -1452,7 +1506,7 @@ describe('Commerce lifecycle independence e2e (Step V): the five dimensions of a
       expect(page1.body.pageSize).toBe(3);
       expect(page1.body.items.length).toBeLessThanOrEqual(3);
       expect(page1.body.total).toBeGreaterThanOrEqual(1);
-      const ours = page1.body.items.find((item) => item.id === c2Run.id);
+      const ours = page1.body.items.find((item: { id: string }) => item.id === c2Run.id);
       expect(ours).toBeDefined();
       expect(ours).not.toHaveProperty('tenantId');
       expect(JSON.stringify(page1.body)).not.toContain('"tenantId"');
@@ -1481,7 +1535,7 @@ describe('Commerce lifecycle independence e2e (Step V): the five dimensions of a
 
       // Another tenant cannot see it: B's list holds only B's runs.
       const forB = await listRuns(userB1).expect(200);
-      expect(forB.body.items.some((item) => item.id === c2Run.id)).toBe(false);
+      expect(forB.body.items.some((item: { id: string }) => item.id === c2Run.id)).toBe(false);
       // …and the id itself is indistinguishable from an absent one across tenants.
       await getRun(c2Run.id, userB1).expect(404);
     });
@@ -1499,10 +1553,11 @@ describe('Commerce lifecycle independence e2e (Step V): the five dimensions of a
 
       // The workflow half: a WORKFLOW_STEP row for OUR run — LINE-scoped, so its document
       // was resolved through the line (one batched statement) and its number rendered.
-      const stepItem = items.find(
+      const stepItem = (items as { kind: string; workflowInstanceId: string | null }[]).find(
         (item) => item.kind === 'WORKFLOW_STEP' && item.workflowInstanceId === c2Run.id
-      );
+      ) as (typeof items)[number] | undefined;
       expect(stepItem).toBeDefined();
+      if (!stepItem) throw new Error('expected a WORKFLOW_STEP inbox row for the run');
       expect(stepItem).toMatchObject({
         id: expect.any(String),
         status: 'PENDING',
@@ -1516,10 +1571,12 @@ describe('Commerce lifecycle independence e2e (Step V): the five dimensions of a
 
       // The commercial half: a COMMERCIAL_APPROVAL row for the same document — its own id,
       // its own line, no workflow fields (the kinds are never merged into one model).
-      const approvalItem = items.find(
+      const approvalItem = (items as { kind: string; purchaseDocumentId: string | null }[]).find(
         (item) => item.kind === 'COMMERCIAL_APPROVAL' && item.purchaseDocumentId === c2Doc.id
-      );
+      ) as (typeof items)[number] | undefined;
       expect(approvalItem).toBeDefined();
+      if (!approvalItem)
+        throw new Error('expected a COMMERCIAL_APPROVAL inbox row for the document');
       expect(approvalItem).toMatchObject({
         id: expect.any(String),
         status: 'PENDING',
@@ -1536,7 +1593,7 @@ describe('Commerce lifecycle independence e2e (Step V): the five dimensions of a
       const asRequester = await inbox(userA1).expect(200);
       expect(
         asRequester.body.items.filter(
-          (item) => item.purchaseDocumentId === c2Doc.id
+          (item: PendingDecisionItem) => item.purchaseDocumentId === c2Doc.id
         )
       ).toHaveLength(0);
       expect(asRequester.body.total).toBe(0);
@@ -1545,7 +1602,7 @@ describe('Commerce lifecycle independence e2e (Step V): the five dimensions of a
       const asB = await inbox(userB1).expect(200);
       expect(
         asB.body.items.filter(
-          (item) =>
+          (item: PendingDecisionItem) =>
             item.purchaseDocumentId === c2Doc.id || item.workflowInstanceId === c2Run.id
         )
       ).toHaveLength(0);
@@ -1638,13 +1695,13 @@ describe('Commerce lifecycle independence e2e (Step V): the five dimensions of a
       // The workflow half left the inbox the moment it stopped being actionable…
       const after = await inbox(userA2).expect(200);
       expect(
-        after.body.items.some((item) => item.workflowInstanceId === c2Run.id)
+        after.body.items.some((item: PendingDecisionItem) => item.workflowInstanceId === c2Run.id)
       ).toBe(false);
       // …while the commercial half of the SAME document is still what it was: one system's
       // decision never decided the other's row.
       expect(
         after.body.items.some(
-          (item) =>
+          (item: PendingDecisionItem) =>
             item.kind === 'COMMERCIAL_APPROVAL' && item.purchaseDocumentId === c2Doc.id
         )
       ).toBe(true);
@@ -1660,7 +1717,9 @@ describe('Commerce lifecycle independence e2e (Step V): the five dimensions of a
         .expect(200);
 
       const after = await inbox(userA2).expect(200);
-      expect(after.body.items.some((item) => item.id === c2ApprovalId)).toBe(false);
+      expect(after.body.items.some((item: PendingDecisionItem) => item.id === c2ApprovalId)).toBe(
+        false
+      );
 
       // The stale decision on THAT system is refused as well (the module's conflict, the
       // rule step P already shipped) — the regression the C2 contract asks to keep green.
@@ -1684,7 +1743,9 @@ describe('Commerce lifecycle independence e2e (Step V): the five dimensions of a
       // The inbox shows the run's step before the cancel (it is actionable right now).
       const before = await inbox(userA2).expect(200);
       expect(
-        before.body.items.some((item) => item.workflowInstanceId === cancelRun.id)
+        before.body.items.some(
+          (item: PendingDecisionItem) => item.workflowInstanceId === cancelRun.id
+        )
       ).toBe(true);
 
       // N's contract: a `commerce.approve`-guarded route, and "no cancellation roles" — the
@@ -1776,6 +1837,7 @@ describe('Commerce lifecycle independence e2e (Step V): the five dimensions of a
         (v) => v.versionLabel === 'V-ALL-APPROVED'
       );
       expect(fixture).toBeDefined();
+      if (!fixture) throw new Error('expected a published V-ALL-APPROVED routing version');
       expect(fixture).not.toHaveProperty('tenantId');
       expect(fixture).toMatchObject({
         status: 'PUBLISHED',
@@ -1784,8 +1846,9 @@ describe('Commerce lifecycle independence e2e (Step V): the five dimensions of a
         multipleMatchBehavior: 'HIGHEST_PRIORITY',
         aggregationPolicy: 'ALL_APPROVED',
       });
-      expect(fixture.routeRules).toEqual(expect.any(Array));
-      expect(fixture.routeRules.length).toBeGreaterThan(0);
+      const routeRules = fixture.routeRules as unknown[];
+      expect(routeRules).toEqual(expect.any(Array));
+      expect(routeRules.length).toBeGreaterThan(0);
 
       const detail = await getOne(fixture.id, userA1).expect(200);
       expect(detail.body).toEqual(fixture);
@@ -1823,13 +1886,13 @@ describe('Commerce lifecycle independence e2e (Step V): the five dimensions of a
       await getOne(theirs.body.id, userA1).expect(404);
 
       const listA = await list(userA1).expect(200);
-      expect(
-        (listA.body as RoutingVersionPage).items.some((v) => v.id === theirs.body.id)
-      ).toBe(false);
+      expect((listA.body as RoutingVersionPage).items.some((v) => v.id === theirs.body.id)).toBe(
+        false
+      );
       const listB = await list(userB1).expect(200);
-      expect(
-        (listB.body as RoutingVersionPage).items.some((v) => v.id === mine.body.id)
-      ).toBe(false);
+      expect((listB.body as RoutingVersionPage).items.some((v) => v.id === mine.body.id)).toBe(
+        false
+      );
 
       // A client-stated tenant is refused by the whitelist, never believed — neither as a
       // query parameter that could widen the read nor as a body field that could widen the write.
@@ -1966,9 +2029,7 @@ describe('Commerce lifecycle independence e2e (Step V): the five dimensions of a
       // Exactly ONE row with that label exists in this tenant — the refusal wrote nothing.
       const page = await list(userA1, '?page=1&pageSize=100').expect(200);
       expect(
-        (page.body as RoutingVersionPage).items.filter(
-          (v) => v.versionLabel === 'C3-LABEL-DUP'
-        )
+        (page.body as RoutingVersionPage).items.filter((v) => v.versionLabel === 'C3-LABEL-DUP')
       ).toHaveLength(1);
     });
 
@@ -2052,6 +2113,37 @@ describe('Commerce lifecycle independence e2e (Step V): the five dimensions of a
   // configure; the code contains no preference for APPROVED, DRAFT or anything else —
   // which is exactly what C4 (the previous attempt) refused to invent.
   // =========================================================================
+  /**
+   * B2.3 — the DURABLE AUDIT OUTBOX, drained deterministically.
+   *
+   * Mutations moved to the outbox write their audit event INSIDE the business
+   * transaction and reach `AUDIT_PORT` only through `CommerceAuditOutboxRelayService`'s
+   * 10-second poll — a timer this harness deliberately does not run. This helper IS
+   * that relay's success path, synchronously: deliver every pending row to the SAME
+   * fake port the timeline reads through, then delete it. Assertions below therefore
+   * still prove the event exists and is bound correctly — they read the delivered
+   * trail, never the outbox row's own text.
+   */
+  const drainAuditOutbox = async () => {
+    // PHASE R-10 — SCOPED TO THIS RUN'S OWN TENANTS, deliberately.
+    //
+    // An UNFILTERED read here (what this helper used to do) both DELETED other runs'
+    // queue rows — the outbox is durable by design, so those rows belong to whoever
+    // wrote them — and fed another run's events into this run's fake port, which is a
+    // way for an assertion to read evidence this run never produced. `tenantAId` /
+    // `tenantBId` carry this run's timestamp, so scoping by them is scoping by run.
+    const rows = await db.auditOutbox.findMany({
+      where: { tenantId: { in: [tenantAId, tenantBId] } },
+      orderBy: { createdAt: 'asc' },
+    });
+    for (const row of rows) {
+      await fakeAuditPort.record(
+        row.payload as unknown as Parameters<typeof fakeAuditPort.record>[0]
+      );
+      await db.auditOutbox.delete({ where: { id: row.id } });
+    }
+  };
+
   describe('PHASE C4-R — the purchase completion policy and the CLOSED transition', () => {
     const policiesList = (as: string) =>
       http().get(`${api}/completion-policies?page=1&pageSize=50`).set(authed(as));
@@ -2096,6 +2188,40 @@ describe('Commerce lifecycle independence e2e (Step V): the five dimensions of a
       const approved = await getDoc(doc.id);
       expect(approved.status).toBe('APPROVED');
       return approved;
+    };
+
+    /**
+     * PHASE W3: the confirmed closure prerequisites — every line FULLY received
+     * through its own production route, then one payment settling the stated
+     * total to an outstanding of exactly zero. A document that has not been
+     * driven through BOTH is no longer a legal close fixture.
+     */
+    const settleDocument = async (doc: CreatedPurchaseDocument) => {
+      await http()
+        .post(`${api}/purchase-documents/${doc.id}/receipts`)
+        .set(authed(userA1))
+        .send({
+          lines: doc.lines.map((line) => ({
+            purchaseLineId: line.id,
+            quantity: Number(line.quantity),
+          })),
+        })
+        .expect(201);
+      await http()
+        .post(`${api}/purchase-documents/${doc.id}/payments`)
+        .set(authed(userA1))
+        .send({
+          amount: Number(doc.totalAmount),
+          method: 'CASH',
+          externalReference: `W3-SETTLE-${doc.id.slice(0, 8)}`,
+        })
+        .expect(201);
+      // The prerequisites are actually met — the settle helper can never pass a
+      // document that is still unfulfilled or unpaid into a "success" close.
+      expect(
+        (await getReceipts(doc.id)).lines.every((l) => l.receivingStatus === 'FULLY_RECEIVED')
+      ).toBe(true);
+      expect((await getPayments(doc.id)).paymentStatus.status).toBe('PAID');
     };
 
     it('C4-A: configures and publishes a completion policy — auth, edge validation, immutability', async () => {
@@ -2150,11 +2276,9 @@ describe('Commerce lifecycle independence e2e (Step V): the five dimensions of a
       v1 = created.body.id;
 
       // A draft may be edited — the status set only — before it is validated.
-      const edited = await policyPatch(
-        v1,
-        { allowedFromStatuses: ['APPROVED'] },
-        userA1
-      ).expect(200);
+      const edited = await policyPatch(v1, { allowedFromStatuses: ['APPROVED'] }, userA1).expect(
+        200
+      );
       expect(edited.body.allowedFromStatuses).toEqual(['APPROVED']);
 
       expect((await policyValidate(v1, userA1)).body).toMatchObject({ status: 'VALIDATED' });
@@ -2191,6 +2315,9 @@ describe('Commerce lifecycle independence e2e (Step V): the five dimensions of a
 
     it('C4-B: closes an APPROVED document under the published policy, recording actor, clock and pin', async () => {
       const doc = await approveDocument();
+      // W3: fulfilment AND settlement are prerequisites — a merely-APPROVED
+      // document is no longer closable.
+      await settleDocument(doc);
 
       const closed = await closeDoc(doc.id, userA1).expect(200);
       expect(closed.body).toMatchObject({ id: doc.id, status: 'CLOSED', editable: false });
@@ -2215,6 +2342,9 @@ describe('Commerce lifecycle independence e2e (Step V): the five dimensions of a
       expect(stored.completedAt).toBeInstanceOf(Date);
       expect(stored.completionPolicyVersionId).toBe(v1);
 
+      // The close event is DURABLE (B2.3 outbox) — deliver it before asserting.
+      await drainAuditOutbox();
+
       // The document's own audit resource records the act, with both states.
       expect(
         auditEvents.some(
@@ -2231,7 +2361,7 @@ describe('Commerce lifecycle independence e2e (Step V): the five dimensions of a
       expect(again.body.code).toBe('PURCHASE_DOCUMENT_ALREADY_COMPLETED');
 
       // Nothing else moved: the completion wrote one column set and no other lifecycle.
-      expect((await getPayments(doc.id)).paymentStatus.status).toBe('UNPAID');
+      expect((await getPayments(doc.id)).paymentStatus.status).toBe('PAID');
       expect((await getReturns(doc.id)).returns).toHaveLength(0);
 
       // Keep the id for the historical-safety assertion after the policy changes.
@@ -2278,8 +2408,12 @@ describe('Commerce lifecycle independence e2e (Step V): the five dimensions of a
 
     it('C4-F: two concurrent closes produce exactly one transition and one established 409', async () => {
       const doc = await approveDocument();
+      await settleDocument(doc);
 
-      const [first, second] = await Promise.all([closeDoc(doc.id, userA1), closeDoc(doc.id, userA1)]);
+      const [first, second] = await Promise.all([
+        closeDoc(doc.id, userA1),
+        closeDoc(doc.id, userA1),
+      ]);
       const statuses = [first.status, second.status].sort();
       expect(statuses).toEqual([200, 409]);
 
@@ -2325,6 +2459,7 @@ describe('Commerce lifecycle independence e2e (Step V): the five dimensions of a
       // EFFECTIVE: a DRAFT document closes now, under V2, where V1 refused exactly that —
       // the product's configured rule, not a constant in the code.
       const draft = await createDoc(oneLine(1, 10));
+      await settleDocument(draft);
       expect((await closeDoc(draft.id, userA1)).body).toMatchObject({
         id: draft.id,
         status: 'CLOSED',
@@ -2393,7 +2528,9 @@ describe('Commerce lifecycle independence e2e (Step V): the five dimensions of a
 
     it('C4-G: on a CLOSED document every other lifecycle keeps its own behaviour (§29)', async () => {
       // Later payments continue on the same purchase — completion is not payment, and the
-      // payment surface was never gated on the document's status.
+      // payment surface was never gated on the document's status. The document was
+      // settled before its close (W3), so this row over-pays it: the projection says so
+      // honestly rather than re-showing PAID.
       await http()
         .post(`${api}/purchase-documents/${closedUnderV1}/payments`)
         .set(authed(userA1))
@@ -2401,8 +2538,8 @@ describe('Commerce lifecycle independence e2e (Step V): the five dimensions of a
         .expect(201);
 
       const payments = await getPayments(closedUnderV1);
-      expect(payments.paymentStatus.status).toBe('PAID');
-      expect(payments.items).toHaveLength(1);
+      expect(payments.paymentStatus.status).toBe('OVERPAID');
+      expect(payments.items).toHaveLength(2);
 
       // …and paying a completed purchase does not move its completion anywhere.
       const reloaded = await getDoc(closedUnderV1);
@@ -2410,8 +2547,9 @@ describe('Commerce lifecycle independence e2e (Step V): the five dimensions of a
       expect(reloaded.completedByUserId).toBe(userA1);
 
       // Receiving and returns remain their own read-time projections, untouched: the
-      // receipt surface still answers NOT_RECEIVED and there are still no returns.
-      expect((await getReceipts(closedUnderV1)).lines[0].receivingStatus).toBe('NOT_RECEIVED');
+      // receipt surface still answers FULLY_RECEIVED (settled before close) and there
+      // are still no returns.
+      expect((await getReceipts(closedUnderV1)).lines[0].receivingStatus).toBe('FULLY_RECEIVED');
       expect((await getReturns(closedUnderV1)).returns).toHaveLength(0);
 
       // The document's line workflow keeps ITS outcome: completion moved the document's
@@ -2438,6 +2576,976 @@ describe('Commerce lifecycle independence e2e (Step V): the five dimensions of a
         completedByUserId: userA1,
         completionPolicyVersionId: v1,
       });
+    });
+  });
+
+  // =========================================================================
+  // PHASE W3 — the CONFIRMED closure rule + the status-event history
+  //
+  // The product owner's rule is now the law the route enforces: EVERY line
+  // FULLY_RECEIVED on its net receipt history AND the payment projection
+  // exactly PAID, under the same document row lock as the write. These cases
+  // run under V2 (published in C4-D, allows DRAFT), so eligibility — never the
+  // status gate — is what answers each close.
+  // =========================================================================
+  describe('PHASE W3 — confirmed closure rule + status-event history', () => {
+    // Self-contained policy (same pattern as C7-C): publishing archives whatever
+    // a previous phase published, so the single-published invariant holds whether
+    // the suite ran its C4 tests or this describe was filtered to run alone.
+    beforeAll(async () => {
+      const policy = await http()
+        .post(`${api}/completion-policies`)
+        .set(authed(userA1))
+        .send({ versionLabel: `W3-POLICY-${runId}`, allowedFromStatuses: ['DRAFT'] })
+        .expect(201);
+      await http()
+        .post(`${api}/completion-policies/${policy.body.id}/validate`)
+        .set(authed(userA1))
+        .expect(200);
+      await http()
+        .post(`${api}/completion-policies/${policy.body.id}/publish`)
+        .set(authed(userA1))
+        .expect(200);
+    });
+
+    const closeDoc = (id: string, as: string) =>
+      http().post(`${api}/purchase-documents/${id}/close`).set(authed(as));
+
+    const statusEvents = async (id: string, as: string = userA1) =>
+      (
+        await http()
+          .get(`${api}/purchase-documents/${id}/status-events`)
+          .set(authed(as))
+          .expect(200)
+      ).body.items as Array<{
+        id: string;
+        fromStatus: string | null;
+        toStatus: string;
+        source: string;
+        actorUserId: string | null;
+        occurredAt: string;
+      }>;
+
+    it('W3-A: close refuses on BOTH unfulfilled and unsettled — every reason, machine-readable', async () => {
+      const doc = await createDoc(oneLine(1, 10));
+      const refused = await closeDoc(doc.id, userA1);
+      expect(refused.status).toBe(409);
+      const codes = (refused.body.reasons ?? []).map((r: { code: string }) => r.code);
+      expect(codes).toContain('PURCHASE_FULFILLMENT_INCOMPLETE');
+      expect(codes).toContain('PURCHASE_PAYMENT_SETTLEMENT_INCOMPLETE');
+      // The document did not move and no close event exists.
+      expect((await getDoc(doc.id)).status).toBe('DRAFT');
+      const events = await statusEvents(doc.id);
+      expect(events.map((e) => e.toStatus)).toEqual(['DRAFT']);
+    });
+
+    it('W3-B: full receipt with money still owed refuses — a receipt record is not settlement', async () => {
+      const doc = await createDoc(oneLine(1, 10));
+      await http()
+        .post(`${api}/purchase-documents/${doc.id}/receipts`)
+        .set(authed(userA1))
+        .send({ lines: [{ purchaseLineId: doc.lines[0].id, quantity: 1 }] })
+        .expect(201);
+      const refused = await closeDoc(doc.id, userA1);
+      expect(refused.status).toBe(409);
+      expect(refused.body.code).toBe('PURCHASE_PAYMENT_SETTLEMENT_INCOMPLETE');
+    });
+
+    it('W3-C: a compensated receipt does not inflate fulfilment — net received is the fact', async () => {
+      const doc = await createDoc(oneLine(1, 10));
+      const receipt = await http()
+        .post(`${api}/purchase-documents/${doc.id}/receipts`)
+        .set(authed(userA1))
+        .send({ lines: [{ purchaseLineId: doc.lines[0].id, quantity: 1 }] })
+        .expect(201);
+      // Settle the money so ONLY the compensation separates this close from success.
+      await http()
+        .post(`${api}/purchase-documents/${doc.id}/payments`)
+        .set(authed(userA1))
+        .send({ amount: 10, method: 'CASH', externalReference: 'W3-C-PAY' })
+        .expect(201);
+      await http()
+        .post(`${api}/purchase-documents/${doc.id}/receipts/${receipt.body.lines[0].id}/compensate`)
+        .set(authed(userA1))
+        .send({ quantity: 1, reason: 'misreceipt' })
+        .expect(201);
+      const refused = await closeDoc(doc.id, userA1);
+      expect(refused.status).toBe(409);
+      expect(refused.body.code).toBe('PURCHASE_FULFILLMENT_INCOMPLETE');
+    });
+
+    it('W3-D: an unresolved return blocks the close even fully received and paid', async () => {
+      const doc = await createDoc(oneLine(1, 10));
+      const receipt = await http()
+        .post(`${api}/purchase-documents/${doc.id}/receipts`)
+        .set(authed(userA1))
+        .send({ lines: [{ purchaseLineId: doc.lines[0].id, quantity: 1 }] })
+        .expect(201);
+      await http()
+        .post(`${api}/purchase-documents/${doc.id}/payments`)
+        .set(authed(userA1))
+        .send({ amount: 10, method: 'CASH', externalReference: 'W3-D-PAY' })
+        .expect(201);
+      // REQUESTED is unresolved — goods/refund disposition is still open.
+      await http()
+        .post(`${api}/purchase-documents/${doc.id}/returns`)
+        .set(authed(userA1))
+        .send({
+          reason: 'DAMAGED',
+          replacementRequired: false,
+          lines: [
+            {
+              purchaseLineId: doc.lines[0].id,
+              receiptLineId: receipt.body.lines[0].id,
+              quantity: 1,
+            },
+          ],
+        })
+        .expect(201);
+      const refused = await closeDoc(doc.id, userA1);
+      expect(refused.status).toBe(409);
+      expect(refused.body.code).toBe('PURCHASE_RETURN_UNRESOLVED');
+    });
+
+    it('W3-E: a payment compensation un-settles a document that summed to PAID', async () => {
+      const doc = await createDoc(oneLine(1, 10));
+      await http()
+        .post(`${api}/purchase-documents/${doc.id}/receipts`)
+        .set(authed(userA1))
+        .send({ lines: [{ purchaseLineId: doc.lines[0].id, quantity: 1 }] })
+        .expect(201);
+      const paid = await http()
+        .post(`${api}/purchase-documents/${doc.id}/payments`)
+        .set(authed(userA1))
+        .send({ amount: 10, method: 'CASH', externalReference: 'W3-E-PAY' })
+        .expect(201);
+      await http()
+        .post(`${api}/purchase-documents/${doc.id}/payments/${paid.body.id}/compensate`)
+        .set(authed(userA1))
+        .send({ reason: 'STATED_IN_ERROR' })
+        .expect(201);
+      const refused = await closeDoc(doc.id, userA1);
+      expect(refused.status).toBe(409);
+      expect(refused.body.code).toBe('PURCHASE_PAYMENT_SETTLEMENT_INCOMPLETE');
+    });
+
+    it('W3-F: the status-event history is append-only, ordered and actor-bound', async () => {
+      // A submitted document: create + submit events, both actor-bound, ordered.
+      const submitted = await createDoc(oneLine(1, 10));
+      await http()
+        .post(`${api}/purchase-documents/${submitted.id}/submit`)
+        .set(authed(userA1))
+        .expect(200);
+      const submittedEvents = await statusEvents(submitted.id);
+      expect(submittedEvents.map((e) => [e.fromStatus, e.toStatus])).toEqual([
+        [null, 'DRAFT'],
+        ['DRAFT', 'SUBMITTED'],
+      ]);
+      for (const event of submittedEvents) {
+        expect(event.actorUserId).toBe(userA1);
+        expect(event.occurredAt).toEqual(expect.any(String));
+      }
+      const instants = submittedEvents.map((e) => e.occurredAt);
+      expect([...instants].sort()).toEqual(instants);
+
+      // A settled DRAFT document: the close lands its own CLOSED event under V2.
+      const doc = await createDoc(oneLine(1, 10));
+      await http()
+        .post(`${api}/purchase-documents/${doc.id}/receipts`)
+        .set(authed(userA1))
+        .send({ lines: [{ purchaseLineId: doc.lines[0].id, quantity: 1 }] })
+        .expect(201);
+      await http()
+        .post(`${api}/purchase-documents/${doc.id}/payments`)
+        .set(authed(userA1))
+        .send({ amount: 10, method: 'CASH', externalReference: 'W3-F-PAY' })
+        .expect(201);
+      await closeDoc(doc.id, userA1).expect(200);
+      const closedEvents = await statusEvents(doc.id);
+      expect(closedEvents.map((e) => [e.fromStatus, e.toStatus])).toEqual([
+        [null, 'DRAFT'],
+        ['DRAFT', 'CLOSED'],
+      ]);
+
+      // A refused repeat close writes NO event — append-only means no phantom row.
+      await closeDoc(doc.id, userA1).expect(409);
+      expect((await statusEvents(doc.id)).length).toBe(2);
+
+      // Tenant-scoped: B cannot read A's history.
+      await http()
+        .get(`${api}/purchase-documents/${doc.id}/status-events`)
+        .set(authed(userB1))
+        .expect(404);
+    });
+
+    // ---------------------------------------------------------------------
+    // PHASE W3.1 — the product owner's resolved-return decision: a fully
+    // settled return must NOT keep the document open. Ordered 10, received
+    // 10, returned 2, return REFUNDED, the returned money recorded and the
+    // remainder paid — the document closes.
+    // ---------------------------------------------------------------------
+    it('W3-G: a resolved+refunded return does not block closure — net payable is settled', async () => {
+      const doc = await createDoc(oneLine(10, 1)); // total 10
+      const receipt = await http()
+        .post(`${api}/purchase-documents/${doc.id}/receipts`)
+        .set(authed(userA1))
+        .send({ lines: [{ purchaseLineId: doc.lines[0].id, quantity: 10 }] })
+        .expect(201);
+      // Two payments so the refund can name the one covering the return.
+      const kept = await http()
+        .post(`${api}/purchase-documents/${doc.id}/payments`)
+        .set(authed(userA1))
+        .send({ amount: 8, method: 'CASH', externalReference: 'W3-G-KEPT' })
+        .expect(201);
+      const refundable = await http()
+        .post(`${api}/purchase-documents/${doc.id}/payments`)
+        .set(authed(userA1))
+        .send({ amount: 2, method: 'CASH', externalReference: 'W3-G-RET' })
+        .expect(201);
+
+      const ret = await http()
+        .post(`${api}/purchase-documents/${doc.id}/returns`)
+        .set(authed(userA1))
+        .send({
+          reason: 'DAMAGED',
+          replacementRequired: false,
+          lines: [
+            {
+              purchaseLineId: doc.lines[0].id,
+              receiptLineId: receipt.body.lines[0].id,
+              quantity: 2,
+            },
+          ],
+        })
+        .expect(201);
+      await http()
+        .post(`${api}/purchase-documents/${doc.id}/returns/${ret.body.id}/approve`)
+        .set(authed(userA1))
+        .expect(201);
+      await http()
+        .post(`${api}/purchase-documents/${doc.id}/returns/${ret.body.id}/receive-back`)
+        .set(authed(userA1))
+        .expect(201);
+      await http()
+        .post(`${api}/purchase-documents/${doc.id}/returns/${ret.body.id}/refund`)
+        .set(authed(userA1))
+        .send({ paymentId: refundable.body.id, reason: 'returned goods refunded' })
+        .expect(201);
+
+      // Net payable 10 − 2 = 8, paid exactly 8 — the document closes.
+      await closeDoc(doc.id, userA1).expect(200);
+      expect((await getDoc(doc.id)).status).toBe('CLOSED');
+      const events = await statusEvents(doc.id);
+      expect(events.map((e) => e.toStatus)).toEqual(['DRAFT', 'CLOSED']);
+      expect(kept.status).toBe(201);
+    });
+
+    it('W3-H: a return approved and received-back but NOT refunded still blocks', async () => {
+      const doc = await createDoc(oneLine(10, 1));
+      const receipt = await http()
+        .post(`${api}/purchase-documents/${doc.id}/receipts`)
+        .set(authed(userA1))
+        .send({ lines: [{ purchaseLineId: doc.lines[0].id, quantity: 10 }] })
+        .expect(201);
+      await http()
+        .post(`${api}/purchase-documents/${doc.id}/payments`)
+        .set(authed(userA1))
+        .send({ amount: 10, method: 'CASH', externalReference: 'W3-H-PAY' })
+        .expect(201);
+      const ret = await http()
+        .post(`${api}/purchase-documents/${doc.id}/returns`)
+        .set(authed(userA1))
+        .send({
+          reason: 'DAMAGED',
+          replacementRequired: false,
+          lines: [
+            {
+              purchaseLineId: doc.lines[0].id,
+              receiptLineId: receipt.body.lines[0].id,
+              quantity: 2,
+            },
+          ],
+        })
+        .expect(201);
+      await http()
+        .post(`${api}/purchase-documents/${doc.id}/returns/${ret.body.id}/approve`)
+        .set(authed(userA1))
+        .expect(201);
+      await http()
+        .post(`${api}/purchase-documents/${doc.id}/returns/${ret.body.id}/receive-back`)
+        .set(authed(userA1))
+        .expect(201);
+      // RECEIVED_BACK is still unresolved: the money disposition is open.
+      const refused = await closeDoc(doc.id, userA1);
+      expect(refused.status).toBe(409);
+      expect(refused.body.code).toBe('PURCHASE_RETURN_UNRESOLVED');
+      expect((await getDoc(doc.id)).status).toBe('DRAFT');
+    });
+
+    it('W3-I: a refund that settles the WHOLE document — payable zero — closes', async () => {
+      const doc = await createDoc(oneLine(10, 1));
+      const receipt = await http()
+        .post(`${api}/purchase-documents/${doc.id}/receipts`)
+        .set(authed(userA1))
+        .send({ lines: [{ purchaseLineId: doc.lines[0].id, quantity: 10 }] })
+        .expect(201);
+      const payment = await http()
+        .post(`${api}/purchase-documents/${doc.id}/payments`)
+        .set(authed(userA1))
+        .send({ amount: 10, method: 'CASH', externalReference: 'W3-I-PAY' })
+        .expect(201);
+      const ret = await http()
+        .post(`${api}/purchase-documents/${doc.id}/returns`)
+        .set(authed(userA1))
+        .send({
+          reason: 'FULL_RETURN',
+          replacementRequired: false,
+          lines: [
+            {
+              purchaseLineId: doc.lines[0].id,
+              receiptLineId: receipt.body.lines[0].id,
+              quantity: 10,
+            },
+          ],
+        })
+        .expect(201);
+      await http()
+        .post(`${api}/purchase-documents/${doc.id}/returns/${ret.body.id}/approve`)
+        .set(authed(userA1))
+        .expect(201);
+      await http()
+        .post(`${api}/purchase-documents/${doc.id}/returns/${ret.body.id}/receive-back`)
+        .set(authed(userA1))
+        .expect(201);
+      await http()
+        .post(`${api}/purchase-documents/${doc.id}/returns/${ret.body.id}/refund`)
+        .set(authed(userA1))
+        .send({ paymentId: payment.body.id })
+        .expect(201);
+      // paid 0, payable 0 — fully refunded counts as settled, never as unpaid.
+      await closeDoc(doc.id, userA1).expect(200);
+      expect((await getDoc(doc.id)).status).toBe('CLOSED');
+    });
+
+    // ---------------------------------------------------------------------
+    // PHASE W4 — the partial-refund correctness rule: a 20-unit refund on a
+    // 100-unit payment is 20 refunded, never the payment reversed whole.
+    // ---------------------------------------------------------------------
+    it('W3-K: a PARTIAL refund against one payment leaves the rest payable — and still owed when it is not settled', async () => {
+      const doc = await createDoc(oneLine(10, 1)); // total 10
+      const receipt = await http()
+        .post(`${api}/purchase-documents/${doc.id}/receipts`)
+        .set(authed(userA1))
+        .send({ lines: [{ purchaseLineId: doc.lines[0].id, quantity: 10 }] })
+        .expect(201);
+      // ONE payment covering the whole document — the shape the old model
+      // silently reversed in full for any refund it settled.
+      const payment = await http()
+        .post(`${api}/purchase-documents/${doc.id}/payments`)
+        .set(authed(userA1))
+        .send({ amount: 10, method: 'CASH', externalReference: 'W3-K-PAY' })
+        .expect(201);
+      const ret = await http()
+        .post(`${api}/purchase-documents/${doc.id}/returns`)
+        .set(authed(userA1))
+        .send({
+          reason: 'DAMAGED',
+          replacementRequired: false,
+          lines: [
+            {
+              purchaseLineId: doc.lines[0].id,
+              receiptLineId: receipt.body.lines[0].id,
+              quantity: 2,
+            },
+          ],
+        })
+        .expect(201);
+      await http()
+        .post(`${api}/purchase-documents/${doc.id}/returns/${ret.body.id}/approve`)
+        .set(authed(userA1))
+        .expect(201);
+      await http()
+        .post(`${api}/purchase-documents/${doc.id}/returns/${ret.body.id}/receive-back`)
+        .set(authed(userA1))
+        .expect(201);
+
+      // The refund names a PARTIAL amount — 2 units of a 10-unit payment.
+      await http()
+        .post(`${api}/purchase-documents/${doc.id}/returns/${ret.body.id}/refund`)
+        .set(authed(userA1))
+        .send({ paymentId: payment.body.id, amount: 2, reason: 'refund for 2 of 10' })
+        .expect(201);
+
+      // THE LEDGER PROOF: the compensation row holds −2.0000, not −10.0000 —
+      // paid net is 8.0000 and the remaining obligation is a real figure.
+      const ledger = await http()
+        .get(`${api}/purchase-documents/${doc.id}/payments`)
+        .set(authed(userA1))
+        .expect(200);
+      const compensation = ledger.body.items.find(
+        (row: { reversesPaymentId: string | null }) => row.reversesPaymentId === payment.body.id
+      );
+      expect(compensation).toBeDefined();
+      // Postgres numeric drops the stored scale on read; the VALUE is the fact.
+      expect(Number(compensation.amount)).toBe(-2);
+      // The raw projection answers against the document total — 8 of 10 is
+      // PARTIAL; the NET-payable lens belongs to the closure evaluator alone.
+      expect(ledger.body.paymentStatus.status).toBe('PARTIAL');
+      expect(Number(ledger.body.paymentStatus.paidAmount)).toBe(8);
+
+      // Net payable 10 − 2 = 8, paid net 8 — the document closes on the TRUE sum.
+      await closeDoc(doc.id, userA1).expect(200);
+      expect((await getDoc(doc.id)).status).toBe('CLOSED');
+    });
+
+    it('W3-L: a refund larger than the named payment is refused — over-refund writes nothing', async () => {
+      const doc = await createDoc(oneLine(10, 1));
+      const receipt = await http()
+        .post(`${api}/purchase-documents/${doc.id}/receipts`)
+        .set(authed(userA1))
+        .send({ lines: [{ purchaseLineId: doc.lines[0].id, quantity: 10 }] })
+        .expect(201);
+      const payment = await http()
+        .post(`${api}/purchase-documents/${doc.id}/payments`)
+        .set(authed(userA1))
+        .send({ amount: 10, method: 'CASH', externalReference: 'W3-L-PAY' })
+        .expect(201);
+      const ret = await http()
+        .post(`${api}/purchase-documents/${doc.id}/returns`)
+        .set(authed(userA1))
+        .send({
+          reason: 'DAMAGED',
+          replacementRequired: false,
+          lines: [
+            {
+              purchaseLineId: doc.lines[0].id,
+              receiptLineId: receipt.body.lines[0].id,
+              quantity: 10,
+            },
+          ],
+        })
+        .expect(201);
+      await http()
+        .post(`${api}/purchase-documents/${doc.id}/returns/${ret.body.id}/approve`)
+        .set(authed(userA1))
+        .expect(201);
+      await http()
+        .post(`${api}/purchase-documents/${doc.id}/returns/${ret.body.id}/receive-back`)
+        .set(authed(userA1))
+        .expect(201);
+
+      const refused = await http()
+        .post(`${api}/purchase-documents/${doc.id}/returns/${ret.body.id}/refund`)
+        .set(authed(userA1))
+        .send({ paymentId: payment.body.id, amount: 10.0001 });
+      expect(refused.status).toBe(409);
+
+      // Nothing landed: the refund's compensation was refused, so the REFUNDED
+      // transition rolled back with it and the ledger is untouched.
+      const returns = await http()
+        .get(`${api}/purchase-documents/${doc.id}/returns`)
+        .set(authed(userA1))
+        .expect(200);
+      expect(returns.body.returns.find((r: { id: string }) => r.id === ret.body.id).state).toBe(
+        'RECEIVED_BACK'
+      );
+      const ledger = await http()
+        .get(`${api}/purchase-documents/${doc.id}/payments`)
+        .set(authed(userA1))
+        .expect(200);
+      expect(
+        ledger.body.items.some(
+          (row: { reversesPaymentId: string | null }) => row.reversesPaymentId !== null
+        )
+      ).toBe(false);
+    });
+
+    // ---------------------------------------------------------------------
+    // PHASE W4-B — repeated partial refunds: the one-compensation unique is
+    // gone, the cumulative cap under the payment row's lock is the rule, and
+    // every refund names its OWN compensation row.
+    // ---------------------------------------------------------------------
+    const receivedBackReturn = async (
+      doc: CreatedPurchaseDocument,
+      receipt: { body: { lines: Array<{ id: string }> } },
+      quantity: number
+    ) => {
+      const ret = await http()
+        .post(`${api}/purchase-documents/${doc.id}/returns`)
+        .set(authed(userA1))
+        .send({
+          reason: 'DAMAGED',
+          replacementRequired: false,
+          lines: [
+            {
+              purchaseLineId: doc.lines[0].id,
+              receiptLineId: receipt.body.lines[0].id,
+              quantity,
+            },
+          ],
+        })
+        .expect(201);
+      await http()
+        .post(`${api}/purchase-documents/${doc.id}/returns/${ret.body.id}/approve`)
+        .set(authed(userA1))
+        .expect(201);
+      await http()
+        .post(`${api}/purchase-documents/${doc.id}/returns/${ret.body.id}/receive-back`)
+        .set(authed(userA1))
+        .expect(201);
+      return ret.body as { id: string };
+    };
+    const ledgerRows = async (docId: string) =>
+      (
+        await http()
+          .get(`${api}/purchase-documents/${docId}/payments`)
+          .set(authed(userA1))
+          .expect(200)
+      ).body.items as Array<{ id: string; amount: string; reversesPaymentId: string | null }>;
+
+    it('W3-M: TWO partial refunds land on ONE payment — the cumulative cap, not a one-row rule', async () => {
+      const doc = await createDoc(oneLine(10, 1)); // total 10
+      const receipt = await http()
+        .post(`${api}/purchase-documents/${doc.id}/receipts`)
+        .set(authed(userA1))
+        .send({ lines: [{ purchaseLineId: doc.lines[0].id, quantity: 10 }] })
+        .expect(201);
+      const payment = await http()
+        .post(`${api}/purchase-documents/${doc.id}/payments`)
+        .set(authed(userA1))
+        .send({ amount: 10, method: 'CASH', externalReference: 'W3-M-PAY' })
+        .expect(201);
+
+      // Two separate returns, two separate refunds — 2 then 1 against the SAME
+      // payment. The old unique index made the second impossible.
+      const first = await receivedBackReturn(doc, receipt, 2);
+      await http()
+        .post(`${api}/purchase-documents/${doc.id}/returns/${first.id}/refund`)
+        .set(authed(userA1))
+        .send({ paymentId: payment.body.id, amount: 2 })
+        .expect(201);
+      const second = await receivedBackReturn(doc, receipt, 2);
+      await http()
+        .post(`${api}/purchase-documents/${doc.id}/returns/${second.id}/refund`)
+        .set(authed(userA1))
+        .send({ paymentId: payment.body.id, amount: 1 })
+        .expect(201);
+
+      // TWO compensation rows exist — −2 and −1 — and the net ledger paid is 7.
+      const rows = await ledgerRows(doc.id);
+      const compensations = rows.filter((row) => row.reversesPaymentId === payment.body.id);
+      expect(compensations.map((row) => Number(row.amount)).sort((a, b) => a - b)).toEqual([
+        -2, -1,
+      ]);
+
+      // Net payable 10 − 3 = 7, paid 10 − 3 = 7 — settled exactly, the
+      // document closes on the two precise refund rows.
+      await closeDoc(doc.id, userA1).expect(200);
+      expect((await getDoc(doc.id)).status).toBe('CLOSED');
+    });
+
+    it('W3-N: an aggregate over-refund is refused — cumulative capacity is the cap', async () => {
+      const doc = await createDoc(oneLine(10, 1));
+      const receipt = await http()
+        .post(`${api}/purchase-documents/${doc.id}/receipts`)
+        .set(authed(userA1))
+        .send({ lines: [{ purchaseLineId: doc.lines[0].id, quantity: 10 }] })
+        .expect(201);
+      const payment = await http()
+        .post(`${api}/purchase-documents/${doc.id}/payments`)
+        .set(authed(userA1))
+        .send({ amount: 10, method: 'CASH', externalReference: 'W3-N-PAY' })
+        .expect(201);
+
+      const first = await receivedBackReturn(doc, receipt, 8);
+      await http()
+        .post(`${api}/purchase-documents/${doc.id}/returns/${first.id}/refund`)
+        .set(authed(userA1))
+        .send({ paymentId: payment.body.id, amount: 8 })
+        .expect(201); // 8 refunded, 2 remain refundable
+
+      const second = await receivedBackReturn(doc, receipt, 1);
+      const refused = await http()
+        .post(`${api}/purchase-documents/${doc.id}/returns/${second.id}/refund`)
+        .set(authed(userA1))
+        .send({ paymentId: payment.body.id, amount: 2.5 });
+      expect(refused.status).toBe(409);
+
+      // No partial write: only the first refund's −8 compensation exists, and
+      // the second return is still RECEIVED_BACK — unresolved, blocking.
+      const compensations = (await ledgerRows(doc.id)).filter(
+        (row) => row.reversesPaymentId === payment.body.id
+      );
+      expect(compensations).toHaveLength(1);
+      expect(Number(compensations[0].amount)).toBe(-8);
+      const refused2 = await closeDoc(doc.id, userA1);
+      expect(refused2.status).toBe(409);
+    });
+
+    it('W3-O: two RACED refunds on one payment — only the combination inside the cap commits', async () => {
+      const doc = await createDoc(oneLine(10, 1));
+      const receipt = await http()
+        .post(`${api}/purchase-documents/${doc.id}/receipts`)
+        .set(authed(userA1))
+        .send({ lines: [{ purchaseLineId: doc.lines[0].id, quantity: 10 }] })
+        .expect(201);
+      const payment = await http()
+        .post(`${api}/purchase-documents/${doc.id}/payments`)
+        .set(authed(userA1))
+        .send({ amount: 10, method: 'CASH', externalReference: 'W3-O-PAY' })
+        .expect(201);
+
+      // 6 already refunded → 4 refundable remain. Two concurrent refunds of 3
+      // each: together 6 > 4 — the row lock must let exactly ONE commit.
+      const settled = await receivedBackReturn(doc, receipt, 6);
+      await http()
+        .post(`${api}/purchase-documents/${doc.id}/returns/${settled.id}/refund`)
+        .set(authed(userA1))
+        .send({ paymentId: payment.body.id, amount: 6 })
+        .expect(201);
+      const [racerA, racerB] = await Promise.all([
+        receivedBackReturn(doc, receipt, 1),
+        receivedBackReturn(doc, receipt, 1),
+      ]);
+      const [resA, resB] = await Promise.all([
+        http()
+          .post(`${api}/purchase-documents/${doc.id}/returns/${racerA.id}/refund`)
+          .set(authed(userA1))
+          .send({ paymentId: payment.body.id, amount: 3 }),
+        http()
+          .post(`${api}/purchase-documents/${doc.id}/returns/${racerB.id}/refund`)
+          .set(authed(userA1))
+          .send({ paymentId: payment.body.id, amount: 3 }),
+      ]);
+      const statuses = [resA.status, resB.status].sort();
+      expect(statuses).toEqual([201, 409]);
+
+      // The ledger proves the cap held: compensations sum to −9 (6 + 3),
+      // never −12 — and the losing return carries no REFUNDED transition.
+      const compensations = (await ledgerRows(doc.id)).filter(
+        (row) => row.reversesPaymentId === payment.body.id
+      );
+      expect(compensations.reduce((sum, row) => sum + Number(row.amount), 0)).toBe(-9);
+    });
+
+    it('W3-P: a MANUAL compensation is paid-back money, never a return refund', async () => {
+      const doc = await createDoc(oneLine(10, 1));
+      const receipt = await http()
+        .post(`${api}/purchase-documents/${doc.id}/receipts`)
+        .set(authed(userA1))
+        .send({ lines: [{ purchaseLineId: doc.lines[0].id, quantity: 10 }] })
+        .expect(201);
+      const payment = await http()
+        .post(`${api}/purchase-documents/${doc.id}/payments`)
+        .set(authed(userA1))
+        .send({ amount: 10, method: 'CASH', externalReference: 'W3-P-PAY' })
+        .expect(201);
+
+      // An unrelated manual compensation of 1.5 against the same payment —
+      // money went back, but no return caused it.
+      await http()
+        .post(`${api}/purchase-documents/${doc.id}/payments/${payment.body.id}/compensate`)
+        .set(authed(userA1))
+        .send({ amount: 1.5, reason: 'recorded in error' })
+        .expect(201);
+
+      // A return refunds 2 — only the 2 counts as a return refund. The
+      // evaluator counts the EXACT compensation rows the REFUNDED transitions
+      // name; net payable is 10 − 2 = 8 while paid is 10 − 1.5 − 2 = 6.5 —
+      // so settlement is honestly INCOMPLETE, not faked.
+      const ret = await receivedBackReturn(doc, receipt, 2);
+      await http()
+        .post(`${api}/purchase-documents/${doc.id}/returns/${ret.id}/refund`)
+        .set(authed(userA1))
+        .send({ paymentId: payment.body.id, amount: 2 })
+        .expect(201);
+      const refused = await closeDoc(doc.id, userA1);
+      expect(refused.status).toBe(409);
+      expect((refused.body.reasons ?? []).map((r: { code: string }) => r.code)).toContain(
+        'PURCHASE_PAYMENT_SETTLEMENT_INCOMPLETE'
+      );
+
+      // Settle the remaining 1.5 honestly and the document closes — the
+      // manual compensation stayed out of the refund figure all along.
+      await http()
+        .post(`${api}/purchase-documents/${doc.id}/payments`)
+        .set(authed(userA1))
+        .send({ amount: 1.5, method: 'CASH', externalReference: 'W3-P-TOPUP' })
+        .expect(201);
+      await closeDoc(doc.id, userA1).expect(200);
+      expect((await getDoc(doc.id)).status).toBe('CLOSED');
+    });
+
+    it('W3-Q: a repeated refund of the same return is the established invalid transition', async () => {
+      const doc = await createDoc(oneLine(10, 1));
+      const receipt = await http()
+        .post(`${api}/purchase-documents/${doc.id}/receipts`)
+        .set(authed(userA1))
+        .send({ lines: [{ purchaseLineId: doc.lines[0].id, quantity: 10 }] })
+        .expect(201);
+      const payment = await http()
+        .post(`${api}/purchase-documents/${doc.id}/payments`)
+        .set(authed(userA1))
+        .send({ amount: 10, method: 'CASH', externalReference: 'W3-Q-PAY' })
+        .expect(201);
+      const ret = await receivedBackReturn(doc, receipt, 2);
+      await http()
+        .post(`${api}/purchase-documents/${doc.id}/returns/${ret.id}/refund`)
+        .set(authed(userA1))
+        .send({ paymentId: payment.body.id, amount: 2 })
+        .expect(201);
+
+      const again = await http()
+        .post(`${api}/purchase-documents/${doc.id}/returns/${ret.id}/refund`)
+        .set(authed(userA1))
+        .send({ paymentId: payment.body.id, amount: 2 });
+      expect(again.status).toBe(409);
+      // Exactly ONE compensation exists — no second unintended refund row.
+      const compensations = (await ledgerRows(doc.id)).filter(
+        (row) => row.reversesPaymentId === payment.body.id
+      );
+      expect(compensations).toHaveLength(1);
+    });
+
+    it('W3-R: a MANUAL compensation raced with a return refund — one lock order, no deadlock', async () => {
+      const doc = await createDoc(oneLine(10, 1));
+      const receipt = await http()
+        .post(`${api}/purchase-documents/${doc.id}/receipts`)
+        .set(authed(userA1))
+        .send({ lines: [{ purchaseLineId: doc.lines[0].id, quantity: 10 }] })
+        .expect(201);
+      const payment = await http()
+        .post(`${api}/purchase-documents/${doc.id}/payments`)
+        .set(authed(userA1))
+        .send({ amount: 10, method: 'CASH', externalReference: 'W3-R-PAY' })
+        .expect(201);
+      const ret = await receivedBackReturn(doc, receipt, 2);
+
+      // The deadlock pair the old ordering admitted: the refund path holds
+      // the document and wants the payment; the manual compensation held the
+      // payment and wanted the document's key-share. With W4-C BOTH take the
+      // document first — they serialize, never cycle.
+      const [manual, refund] = await Promise.all([
+        http()
+          .post(`${api}/purchase-documents/${doc.id}/payments/${payment.body.id}/compensate`)
+          .set(authed(userA1))
+          .send({ amount: 1, reason: 'manual correction raced with refund' }),
+        http()
+          .post(`${api}/purchase-documents/${doc.id}/returns/${ret.id}/refund`)
+          .set(authed(userA1))
+          .send({ paymentId: payment.body.id, amount: 2 }),
+      ]);
+
+      // No 5xx — serialization means both fits, or one honestly loses on the
+      // cumulative cap. Whatever the order, the ledger stays inside 10.
+      expect(manual.status).not.toBe(500);
+      expect(refund.status).not.toBe(500);
+      const compensations = (await ledgerRows(doc.id)).filter(
+        (row) => row.reversesPaymentId === payment.body.id
+      );
+      const sum = compensations.reduce((acc, row) => acc + Number(row.amount), 0);
+      expect(sum).toBeGreaterThanOrEqual(-10);
+      // If the refund landed, its transition holds the exact link; if it lost
+      // the race the return stays RECEIVED_BACK — never a half-write.
+      const returns = await http()
+        .get(`${api}/purchase-documents/${doc.id}/returns`)
+        .set(authed(userA1))
+        .expect(200);
+      const state = returns.body.returns.find((r: { id: string }) => r.id === ret.id).state;
+      expect(refund.status === 201 ? 'REFUNDED' : 'RECEIVED_BACK').toBe(state);
+    });
+
+    it('W3-S: a close raced with a refund lands on ONE consistent state', async () => {
+      const doc = await createDoc(oneLine(10, 1));
+      const receipt = await http()
+        .post(`${api}/purchase-documents/${doc.id}/receipts`)
+        .set(authed(userA1))
+        .send({ lines: [{ purchaseLineId: doc.lines[0].id, quantity: 10 }] })
+        .expect(201);
+      const payment = await http()
+        .post(`${api}/purchase-documents/${doc.id}/payments`)
+        .set(authed(userA1))
+        .send({ amount: 10, method: 'CASH', externalReference: 'W3-S-PAY' })
+        .expect(201);
+      const ret = await receivedBackReturn(doc, receipt, 2);
+
+      const [refund, close] = await Promise.all([
+        http()
+          .post(`${api}/purchase-documents/${doc.id}/returns/${ret.id}/refund`)
+          .set(authed(userA1))
+          .send({ paymentId: payment.body.id, amount: 2 }),
+        closeDoc(doc.id, userA1),
+      ]);
+
+      // Exactly one of two legal outcomes — the same document lock decides:
+      // the refund won first (close then sees the settled-against state it
+      // really faces), or the close won first (refund then proceeds on a
+      // CLOSED document per §29's pinned contract, or refuses cleanly). What
+      // must NEVER happen is a torn pair — a REFUNDED transition without its
+      // compensation, or a compensation without its transition.
+      expect([201, 409]).toContain(refund.status);
+      expect([200, 409]).toContain(close.status);
+      const compensations = (await ledgerRows(doc.id)).filter(
+        (row) => row.reversesPaymentId === payment.body.id
+      );
+      const returns = await http()
+        .get(`${api}/purchase-documents/${doc.id}/returns`)
+        .set(authed(userA1))
+        .expect(200);
+      const state = returns.body.returns.find((r: { id: string }) => r.id === ret.id).state;
+      // Atomicity: REFUNDED exists iff its −2 compensation exists.
+      expect(compensations.length > 0).toBe(state === 'REFUNDED');
+      const status = (await getDoc(doc.id)).status;
+      expect(['DRAFT', 'CLOSED']).toContain(status);
+    });
+
+    // ---------------------------------------------------------------------
+    // PHASE W3.2 — the aggregated traceability read: one stream, three truth
+    // sources, over the same real lifecycle.
+    // ---------------------------------------------------------------------
+    it('W3-J: /history merges status, audit and posting facts — sourced, ordered, paged, tenant-scoped', async () => {
+      // A STOCKED line — `itemReference` + a receipt warehouse — so the receipt
+      // plans a real InventoryPosting and the diagnostics source has a fact.
+      const doc = await createDoc([
+        {
+          lineType: 'STANDARD',
+          quantity: 10,
+          unit: 'pcs',
+          unitPrice: 1,
+          tax: 0,
+          itemReference: `W3-J-SKU-${runId}`,
+        },
+      ]);
+      const receipt = await http()
+        .post(`${api}/purchase-documents/${doc.id}/receipts`)
+        .set(authed(userA1))
+        .send({
+          lines: [
+            {
+              purchaseLineId: doc.lines[0].id,
+              quantity: 10,
+              warehouseId: randomUUID(),
+            },
+          ],
+        })
+        .expect(201);
+      const refundable = await http()
+        .post(`${api}/purchase-documents/${doc.id}/payments`)
+        .set(authed(userA1))
+        .send({ amount: 2, method: 'CASH', externalReference: 'W3-J-RET' })
+        .expect(201);
+      await http()
+        .post(`${api}/purchase-documents/${doc.id}/payments`)
+        .set(authed(userA1))
+        .send({ amount: 8, method: 'CASH', externalReference: 'W3-J-KEPT' })
+        .expect(201);
+      const ret = await http()
+        .post(`${api}/purchase-documents/${doc.id}/returns`)
+        .set(authed(userA1))
+        .send({
+          reason: 'DAMAGED',
+          replacementRequired: false,
+          lines: [
+            {
+              purchaseLineId: doc.lines[0].id,
+              receiptLineId: receipt.body.lines[0].id,
+              quantity: 2,
+            },
+          ],
+        })
+        .expect(201);
+      await http()
+        .post(`${api}/purchase-documents/${doc.id}/returns/${ret.body.id}/approve`)
+        .set(authed(userA1))
+        .expect(201);
+      await http()
+        .post(`${api}/purchase-documents/${doc.id}/returns/${ret.body.id}/receive-back`)
+        .set(authed(userA1))
+        .expect(201);
+      await http()
+        .post(`${api}/purchase-documents/${doc.id}/returns/${ret.body.id}/refund`)
+        .set(authed(userA1))
+        .send({ paymentId: refundable.body.id })
+        .expect(201);
+      await closeDoc(doc.id, userA1).expect(200);
+      await drainAuditOutbox();
+
+      const res = await http()
+        .get(`${api}/purchase-documents/${doc.id}/history`)
+        .set(authed(userA1))
+        .expect(200);
+      const body = res.body as {
+        items: Array<{
+          id: string;
+          source: string;
+          action: string;
+          occurredAt: string;
+          postingStatus?: string;
+          attempts?: number;
+          actorUserId?: string | null;
+          outcome?: string;
+          attemptNo?: number;
+        }>;
+        total: number;
+        coverage: unknown;
+      };
+      const sources = new Set(body.items.map((i) => i.source));
+      expect(sources).toEqual(new Set(['status', 'audit', 'posting']));
+      // Chronological, deterministic — same direction as the status-event stream.
+      const times = body.items.map((i) => new Date(i.occurredAt).getTime());
+      expect([...times].sort((a, b) => a - b)).toEqual(times);
+      // The lifecycle is traceable: create audit, return flow audits, close audit,
+      // the DRAFT→CLOSED status transition, and posting diagnostics.
+      const actions = body.items.map((i) => i.action);
+      expect(actions).toEqual(
+        expect.arrayContaining([
+          'create',
+          'refund',
+          'close',
+          'status.closed',
+          'posting.receipt.posted',
+        ])
+      );
+      const posting = body.items.find((i) => i.action === 'posting.receipt.posted');
+      expect(posting).toMatchObject({ postingStatus: 'POSTED', attempts: 1 });
+      // W3.2: the attempt stream is projected at attempt granularity — the
+      // same ledger call that posted the row is its own named event.
+      expect(actions).toContain('posting.attempt.posted');
+      const attemptItem = body.items.find((i) => i.action === 'posting.attempt.posted');
+      expect(attemptItem).toMatchObject({ outcome: 'succeeded', attemptNo: 1 });
+      // The refunded transition carries its payment linkage end to end.
+      const refunded = body.items.find((i) => i.action === 'status.closed');
+      expect(refunded).toMatchObject({ actorUserId: userA1 });
+      expect(body.coverage).toMatchObject({
+        statusEvents: { complete: true, earliest: expect.any(String) },
+        audit: { status: 'ok', truncatedFamilies: [] },
+        postings: { status: 'ok' },
+      });
+
+      // Pagination + filters are server-side over the merged stream.
+      const paged = await http()
+        .get(`${api}/purchase-documents/${doc.id}/history?page=1&pageSize=3`)
+        .set(authed(userA1))
+        .expect(200);
+      expect(paged.body.items).toHaveLength(3);
+      expect(paged.body.total).toBe(body.total);
+      const auditOnly = await http()
+        .get(`${api}/purchase-documents/${doc.id}/history?sources=audit`)
+        .set(authed(userA1))
+        .expect(200);
+      expect(auditOnly.body.items.every((i: { source: string }) => i.source === 'audit')).toBe(
+        true
+      );
+
+      // Cross-tenant and permissionless reads are rejected, never filtered.
+      await http()
+        .get(`${api}/purchase-documents/${doc.id}/history`)
+        .set(authed(userB1))
+        .expect(404);
+      await http()
+        .get(`${api}/purchase-documents/${doc.id}/history`)
+        .set(authed(userA4))
+        .expect(403);
     });
   });
 
@@ -2528,6 +3636,9 @@ describe('Commerce lifecycle independence e2e (Step V): the five dimensions of a
         .set(authed(userA1))
         .expect(200);
 
+      // update + submit are durable (B2.3 outbox) — deliver them before the read.
+      await drainAuditOutbox();
+
       const res = await http().get(timeline(doc.id)).set(authed(userA1)).expect(200);
       const actions = (res.body as TimelinePage).items.map((entry) => entry.action);
 
@@ -2553,9 +3664,9 @@ describe('Commerce lifecycle independence e2e (Step V): the five dimensions of a
       }
 
       // The edit is reported factually: which fields changed, not a business story.
-      const update = (res.body as TimelinePage).items.find(
-        (entry) => entry.action === 'update'
-      );
+      const update = (res.body as TimelinePage).items.find((entry) => entry.action === 'update');
+      expect(update).toBeDefined();
+      if (!update) throw new Error('expected an update timeline entry for the edit');
       expect(update.changedFields).toEqual(['supplierId']);
     });
     it('C7-C: closing a document puts the completion event on its timeline, with actor and clock', async () => {
@@ -2577,16 +3688,29 @@ describe('Commerce lifecycle independence e2e (Step V): the five dimensions of a
         .expect(200);
 
       const doc = await createDoc(oneLine(1, 10));
+      // W3: the confirmed rule requires fulfilment AND settlement before CLOSED.
+      await http()
+        .post(`${api}/purchase-documents/${doc.id}/receipts`)
+        .set(authed(userA1))
+        .send({ lines: [{ purchaseLineId: doc.lines[0].id, quantity: 1 }] })
+        .expect(201);
+      await http()
+        .post(`${api}/purchase-documents/${doc.id}/payments`)
+        .set(authed(userA1))
+        .send({ amount: 10, method: 'CASH', externalReference: 'C7-C-SETTLE' })
+        .expect(201);
       await http()
         .post(`${api}/purchase-documents/${doc.id}/close`)
         .set(authed(userA1))
         .expect(200);
 
+      // The close event is durable (B2.3 outbox) — deliver it before the read.
+      await drainAuditOutbox();
+
       const res = await http().get(timeline(doc.id)).set(authed(userA1)).expect(200);
-      const close = (res.body as TimelinePage).items.find(
-        (entry) => entry.action === 'close'
-      );
+      const close = (res.body as TimelinePage).items.find((entry) => entry.action === 'close');
       expect(close).toBeDefined();
+      if (!close) throw new Error('expected a close timeline entry for the completion');
       expect(close).toMatchObject({ actorId: userA1, success: true });
       expect(close.createdAt).toEqual(expect.any(String));
       // The completion audit writer records the act ON THE DOCUMENT — so it arrives
@@ -2617,12 +3741,8 @@ describe('Commerce lifecycle independence e2e (Step V): the five dimensions of a
       const aTimeline = await http().get(timeline(aDoc.id)).set(authed(userA1)).expect(200);
       const bTimeline = await http().get(timeline(bDoc.id)).set(authed(userB1)).expect(200);
 
-      const aIds = new Set<string>(
-        (aTimeline.body as TimelinePage).items.map((entry) => entry.id)
-      );
-      const bIds = new Set<string>(
-        (bTimeline.body as TimelinePage).items.map((entry) => entry.id)
-      );
+      const aIds = new Set<string>((aTimeline.body as TimelinePage).items.map((entry) => entry.id));
+      const bIds = new Set<string>((bTimeline.body as TimelinePage).items.map((entry) => entry.id));
       expect(aIds.size).toBeGreaterThanOrEqual(1);
       expect(bIds.size).toBeGreaterThanOrEqual(1);
       for (const id of bIds) expect(aIds.has(id)).toBe(false);
@@ -2667,18 +3787,32 @@ describe('Commerce lifecycle independence e2e (Step V): the five dimensions of a
       // a client tries to state: the audit query's tenant/resource/resourceId are
       // server-bound, so they are not even expressible on the wire.
       expect(
-        (await http().get(`${timeline(doc.id)}?pageSize=101`).set(authed(userA1))).status
+        (
+          await http()
+            .get(`${timeline(doc.id)}?pageSize=101`)
+            .set(authed(userA1))
+        ).status
       ).toBe(422);
       expect(
-        (await http().get(`${timeline(doc.id)}?tenantId=not-mine`).set(authed(userA1))).status
+        (
+          await http()
+            .get(`${timeline(doc.id)}?tenantId=not-mine`)
+            .set(authed(userA1))
+        ).status
       ).toBe(422);
       expect(
-        (await http().get(`${timeline(doc.id)}?resource=commerce.receipt`).set(authed(userA1)))
-          .status
+        (
+          await http()
+            .get(`${timeline(doc.id)}?resource=commerce.receipt`)
+            .set(authed(userA1))
+        ).status
       ).toBe(422);
       expect(
-        (await http().get(`${timeline(doc.id)}?resourceId=${randomUUID()}`).set(authed(userA1)))
-          .status
+        (
+          await http()
+            .get(`${timeline(doc.id)}?resourceId=${randomUUID()}`)
+            .set(authed(userA1))
+        ).status
       ).toBe(422);
 
       // And a non-UUID path segment never reaches the service at all.
@@ -2698,8 +3832,7 @@ describe('Commerce lifecycle independence e2e (Step V): the five dimensions of a
           .expect(200);
       }
       const recorded = auditEvents.filter(
-        (event) =>
-          event.resource === 'commerce.purchase_document' && event.resourceId === doc.id
+        (event) => event.resource === 'commerce.purchase_document' && event.resourceId === doc.id
       );
       expect(recorded).toHaveLength(4);
 
@@ -2719,9 +3852,10 @@ describe('Commerce lifecycle independence e2e (Step V): the five dimensions of a
 
       // NO DUPLICATES and NO LOSS: the two pages partition the recorded set exactly,
       // in the platform's one deterministic order.
-      const ids = [...(first.body as TimelinePage).items, ...(second.body as TimelinePage).items].map(
-        (entry) => entry.id
-      );
+      const ids = [
+        ...(first.body as TimelinePage).items,
+        ...(second.body as TimelinePage).items,
+      ].map((entry) => entry.id);
       expect(new Set(ids).size).toBe(4);
       expect(ids.map(recordedEventOf)).toEqual(recorded);
       expect(
@@ -2787,6 +3921,293 @@ describe('Commerce lifecycle independence e2e (Step V): the five dimensions of a
     });
   });
 
+  // =========================================================================
+  // PHASE GAP-6 — price quotations over real HTTP: record → separation of
+  // duties → return-with-reason → corrected version → confirm → routing.
+  // =========================================================================
+  describe('PHASE GAP-6 — price quotations: the confirm/return loop end to end', () => {
+    const quotations = (documentId: string) => `${api}/price-quotations?documentId=${documentId}`;
+
+    it('G6-A: records an itemised version, refuses self-decision and a second pending one', async () => {
+      const doc = await createDoc(oneLine(2, 10));
+      const created = await http()
+        .post(`${api}/price-quotations`)
+        .set(authed(userA2))
+        .send({
+          purchaseDocumentId: doc.id,
+          supplierLabel: 'G6-SELLER',
+          currency: 'EUR',
+          lines: [{ description: 'G6 line', quantity: 2, unitPrice: 10 }],
+        })
+        .expect(201);
+      expect(created.body).toMatchObject({
+        version: 1,
+        status: 'PENDING',
+      });
+      // The DERIVED total (2 × 10), compared numerically like every other money
+      // assertion in this file — the wire renders a Decimal's own toString().
+      expect(Number(created.body.totalAmount)).toBe(20);
+      expect(created.body).not.toHaveProperty('tenantId');
+
+      // SEPARATION OF DUTIES: the recorder never decides their own price.
+      const selfConfirm = await http()
+        .post(`${api}/price-quotations/${created.body.id}/decision`)
+        .set(authed(userA2))
+        .send({ decision: 'CONFIRM' });
+      expect(selfConfirm.status).toBe(409);
+      expect(selfConfirm.body.code).toBe('QUOTATION_SELF_DECISION');
+
+      // ONE live price per document.
+      const second = await http()
+        .post(`${api}/price-quotations`)
+        .set(authed(userA2))
+        .send({ purchaseDocumentId: doc.id, totalAmount: 5 });
+      expect(second.status).toBe(409);
+      expect(second.body.code).toBe('QUOTATION_PENDING_EXISTS');
+
+      // The trail carries the version and an UNCLASSIFIED routing projection
+      // (nothing confirmed yet — the badge never guesses).
+      const trail = await http().get(quotations(doc.id)).set(authed(userA1)).expect(200);
+      expect(trail.body.items).toHaveLength(1);
+      expect(trail.body.paymentRouting).toMatchObject({
+        basis: 'confirmedQuotationTotal',
+        classification: null,
+        sourceQuotationId: null,
+      });
+    });
+
+    it('G6-B: RETURN needs a reason; the correction is a new version; the requester CONFIRMs it and routing classifies', async () => {
+      const doc = await createDoc(oneLine(2, 10));
+      const v1 = (
+        await http()
+          .post(`${api}/price-quotations`)
+          .set(authed(userA2))
+          .send({
+            purchaseDocumentId: doc.id,
+            lines: [{ description: 'G6-B line', quantity: 1, unitPrice: 10 }],
+          })
+          .expect(201)
+      ).body;
+
+      // A RETURN without a reason is refused by name.
+      const noReason = await http()
+        .post(`${api}/price-quotations/${v1.id}/decision`)
+        .set(authed(userA1))
+        .send({ decision: 'RETURN' });
+      expect(noReason.status).toBe(400);
+      expect(noReason.body.code).toBe('QUOTATION_RETURN_REASON_REQUIRED');
+
+      // RETURN with the reason settles v1 forever.
+      const returned = await http()
+        .post(`${api}/price-quotations/${v1.id}/decision`)
+        .set(authed(userA1))
+        .send({ decision: 'RETURN', comment: 'G6-B: model mismatch' })
+        .expect(200);
+      expect(returned.body).toMatchObject({
+        id: v1.id,
+        status: 'RETURNED',
+        decisionComment: 'G6-B: model mismatch',
+      });
+
+      // The correction is a NEW immutable version — v1 is never rewritten.
+      const v2 = (
+        await http()
+          .post(`${api}/price-quotations`)
+          .set(authed(userA2))
+          .send({
+            purchaseDocumentId: doc.id,
+            lines: [{ description: 'G6-B line v2', quantity: 1, unitPrice: 10 }],
+          })
+          .expect(201)
+      ).body;
+      expect(v2.version).toBe(2);
+
+      // A decided version can no longer be decided.
+      const stale = await http()
+        .post(`${api}/price-quotations/${v1.id}/decision`)
+        .set(authed(userA1))
+        .send({ decision: 'CONFIRM' });
+      expect(stale.status).toBe(409);
+      expect(stale.body.code).toBe('QUOTATION_ALREADY_DECIDED');
+
+      // The requester CONFIRMs v2 (and the recorder still may not — G6-A proved it).
+      const confirmed = await http()
+        .post(`${api}/price-quotations/${v2.id}/decision`)
+        .set(authed(userA1))
+        .send({ decision: 'CONFIRM' })
+        .expect(200);
+      expect(confirmed.body.status).toBe('CONFIRMED');
+
+      // The routing projection now classifies from the CONFIRMED total (10 ≤ ceiling).
+      const trail = await http().get(quotations(doc.id)).set(authed(userA1)).expect(200);
+      expect(trail.body.items).toHaveLength(2);
+      expect(trail.body.paymentRouting).toMatchObject({
+        basis: 'confirmedQuotationTotal',
+        classification: 'CASH',
+        sourceQuotationId: v2.id,
+      });
+    });
+
+    it('G6-C: a CLOSED document takes no quotations', async () => {
+      // The C7-C policy (published earlier in this file) allows closing a DRAFT —
+      // after the W3 prerequisites (full receipt + settlement) are met.
+      const doc = await createDoc(oneLine(1, 10));
+      await http()
+        .post(`${api}/purchase-documents/${doc.id}/receipts`)
+        .set(authed(userA1))
+        .send({ lines: [{ purchaseLineId: doc.lines[0].id, quantity: 1 }] })
+        .expect(201);
+      await http()
+        .post(`${api}/purchase-documents/${doc.id}/payments`)
+        .set(authed(userA1))
+        .send({ amount: 10, method: 'CASH', externalReference: 'G6-C-SETTLE' })
+        .expect(201);
+      await http()
+        .post(`${api}/purchase-documents/${doc.id}/close`)
+        .set(authed(userA1))
+        .expect(200);
+
+      const refused = await http()
+        .post(`${api}/price-quotations`)
+        .set(authed(userA2))
+        .send({ purchaseDocumentId: doc.id, totalAmount: 1 });
+      expect(refused.status).toBe(409);
+      expect(refused.body.code).toBe('QUOTATION_DOCUMENT_NOT_OPEN');
+    });
+
+    it('G6-D: uploads the real scan, serves it by signed URL, gates scan-only confirmation, keeps history', async () => {
+      const doc = await createDoc(oneLine(2, 10));
+
+      // A SCAN-ONLY quotation (a stated total, no itemised lines) — the scan IS
+      // its evidence, and it has not been uploaded yet.
+      const scan = (
+        await http()
+          .post(`${api}/price-quotations`)
+          .set(authed(userA2))
+          .send({ purchaseDocumentId: doc.id, totalAmount: 30 })
+          .expect(201)
+      ).body as { id: string };
+      const scanView = (
+        await http().get(quotations(doc.id)).set(authed(userA1)).expect(200)
+      ).body.items.find((row: { id: string }) => row.id === scan.id);
+      expect(scanView).toMatchObject({
+        hasAttachment: false,
+        attachmentDownloadable: false,
+        status: 'PENDING',
+      });
+
+      // Downloading nothing is a NAMED 404 (not a fabricated URL).
+      const missing = await http()
+        .get(`${api}/price-quotations/${scan.id}/attachment`)
+        .set(authed(userA1));
+      expect(missing.status).toBe(404);
+      expect(missing.body.code).toBe('QUOTATION_ATTACHMENT_NOT_RESOLVABLE');
+
+      // Confirming a scan-only quotation WITHOUT its scan is refused by name —
+      // a number nobody can evidence is not a confirmed price.
+      const noScan = await http()
+        .post(`${api}/price-quotations/${scan.id}/decision`)
+        .set(authed(userA1))
+        .send({ decision: 'CONFIRM' });
+      expect(noScan.status).toBe(409);
+      expect(noScan.body.code).toBe('QUOTATION_SCAN_ATTACHMENT_REQUIRED');
+
+      // A spoofed/invalid type is refused BEFORE anything touches storage.
+      const badType = await http()
+        .post(`${api}/price-quotations/${scan.id}/attachment`)
+        .set(authed(userA2))
+        .attach('file', Buffer.from('<html>evil</html>'), {
+          filename: 'evil.html',
+          contentType: 'text/html',
+        });
+      expect(badType.status).toBe(400);
+      expect(badType.body.code).toBe('QUOTATION_FILE_TYPE_NOT_ALLOWED');
+      expect(fakeStorage.objects.size).toBe(0);
+
+      // The REAL scan uploads (multipart), and the storage KEY never reaches the wire.
+      const uploaded = await http()
+        .post(`${api}/price-quotations/${scan.id}/attachment`)
+        .set(authed(userA2))
+        .attach('file', Buffer.from('PNG-scan-bytes'), {
+          filename: 'scan.png',
+          contentType: 'image/png',
+        })
+        .expect(200);
+      expect(uploaded.body).toMatchObject({
+        id: scan.id,
+        hasAttachment: true,
+        attachmentDownloadable: true,
+        status: 'PENDING',
+      });
+      expect(JSON.stringify(uploaded.body)).not.toContain('commerce/');
+
+      // CROSS-TENANT: tenant B sees a foreign row as missing — read AND upload.
+      const crossRead = await http()
+        .get(`${api}/price-quotations/${scan.id}/attachment`)
+        .set(authed(userB1));
+      expect(crossRead.status).toBe(404);
+      const crossUpload = await http()
+        .post(`${api}/price-quotations/${scan.id}/attachment`)
+        .set(authed(userB1))
+        .attach('file', Buffer.from('x'), { filename: 'x.png', contentType: 'image/png' });
+      expect(crossUpload.status).toBe(404);
+
+      // An authorized reader resolves the object to a SHORT-LIVED signed URL.
+      const resolved = await http()
+        .get(`${api}/price-quotations/${scan.id}/attachment`)
+        .set(authed(userA1))
+        .expect(200);
+      expect(resolved.body.url).toMatch(/^signed:\/\//);
+      expect(resolved.body.fileName).toContain('scan.png');
+
+      // With its scan present, the requester confirms the scan-only quotation.
+      await http()
+        .post(`${api}/price-quotations/${scan.id}/decision`)
+        .set(authed(userA1))
+        .send({ decision: 'CONFIRM' })
+        .expect(200);
+
+      // A DECIDED row's evidence trail is immutable — upload is refused by name.
+      const decidedUpload = await http()
+        .post(`${api}/price-quotations/${scan.id}/attachment`)
+        .set(authed(userA2))
+        .attach('file', Buffer.from('y'), { filename: 'y.png', contentType: 'image/png' });
+      expect(decidedUpload.status).toBe(409);
+      expect(decidedUpload.body.code).toBe('QUOTATION_ALREADY_DECIDED');
+
+      // ITEMISED quotations keep working without a scan: their evidence is the
+      // lines — a new itemised version records, confirms, and the trail keeps
+      // every version's own attachment association.
+      const itemised = (
+        await http()
+          .post(`${api}/price-quotations`)
+          .set(authed(userA2))
+          .send({
+            purchaseDocumentId: doc.id,
+            lines: [{ description: 'G6-D line', quantity: 1, unitPrice: 10 }],
+          })
+          .expect(201)
+      ).body as { id: string };
+      await http()
+        .post(`${api}/price-quotations/${itemised.id}/decision`)
+        .set(authed(userA1))
+        .send({ decision: 'CONFIRM' })
+        .expect(200);
+
+      const trail = (await http().get(quotations(doc.id)).set(authed(userA1)).expect(200)).body
+        .items as { id: string; status: string; hasAttachment: boolean }[];
+      const scanRow = trail.find((row) => row.id === scan.id);
+      const itemisedRow = trail.find((row) => row.id === itemised.id);
+      expect(scanRow).toMatchObject({ status: 'CONFIRMED', hasAttachment: true });
+      expect(itemisedRow).toMatchObject({ status: 'CONFIRMED', hasAttachment: false });
+      // The uploaded object is still resolvable after confirmation (review phase).
+      await http()
+        .get(`${api}/price-quotations/${scan.id}/attachment`)
+        .set(authed(userA1))
+        .expect(200);
+    });
+  });
+
   // -------------------------------------------------------------------------
   // Cleanup -- test-only, tenant-scoped, explicit predicates; no TRUNCATE
   // -------------------------------------------------------------------------
@@ -2798,6 +4219,21 @@ describe('Commerce lifecycle independence e2e (Step V): the five dimensions of a
     }
     const where = { tenantId: { in: [tenantAId, tenantBId] } };
     const deleted: Record<string, number> = {};
+    // PHASE R-10 — THE RUN'S OWN OUTBOX ROWS GO WITH THE RUN, FIRST, AND BY TENANT.
+    //
+    // Why this is not optional: this suite's actors are SYNTHETIC (`userA1 = randomUUID()`
+    // and friends) — there is no Core `User` row for them, so the real relay that every
+    // app instance runs can never write their events: it answers P2003
+    // `AuditLog_userId_fkey (index)`, backs off, and keeps the row
+    // (`commerce-audit-outbox-relay.service.ts`). A row left behind by a run therefore
+    // poisons every LATER run's boot log with retries of an event that can never land —
+    // exactly the leftover measured on 2026-10-20: 12 rows for a previous run's
+    // `tenant-A-…`, attempts 7, still pending. The drains inside the suite delete what
+    // they see, but rows written after the last drain survive it, which is why the sweep
+    // belongs HERE. It is scoped to this run's own tenants, so no other run's durable
+    // evidence is touched, and it is a QUEUE deletion, not a trail deletion: the run's
+    // in-memory audit trail (the fake port's array) and Core's `AuditLog` are untouched.
+    deleted.auditOutbox = (await db.auditOutbox.deleteMany({ where })).count;
     deleted.returnLine = (await db.returnLine.deleteMany({ where })).count;
     deleted.returnLifecycleTransition = (
       await db.returnLifecycleTransition.deleteMany({ where })
@@ -2817,7 +4253,15 @@ describe('Commerce lifecycle independence e2e (Step V): the five dimensions of a
     // keys ON the document row (both ON DELETE RESTRICT), so a submitted document keeps the
     // versions it pinned alive until the document itself is gone -- and the groups wait for
     // the versions that name them.
+    // PHASE GAP-6: BEFORE the documents, deliberately — quotations and their lines
+    // RESTRICT against the purchase row (price evidence outlives nothing silently),
+    // so both tables can only go once the documents they name are gone.
+    deleted.quotationLine = (await db.quotationLine.deleteMany({ where })).count;
+    deleted.priceQuotation = (await db.priceQuotation.deleteMany({ where })).count;
     deleted.purchaseLine = (await db.purchaseLine.deleteMany({ where })).count;
+    // PHASE W3: the append-only status history RESTRICTs against the document —
+    // the test harness's teardown is the only place rows of it ever disappear.
+    deleted.purchaseStatusEvent = (await db.purchaseStatusEvent.deleteMany({ where })).count;
     deleted.purchaseDocument = (await db.purchaseDocument.deleteMany({ where })).count;
     // PHASE C4-R: AFTER the documents, deliberately — a completed purchase pins the
     // completion policy that authorised it (ON DELETE RESTRICT), so the policy rows can
@@ -2847,6 +4291,9 @@ describe('Commerce lifecycle independence e2e (Step V): the five dimensions of a
     expect(deleted.returnDocument).toBeGreaterThanOrEqual(1);
     expect(await db.purchaseDocument.count({ where })).toBe(0);
     expect(await db.workflowInstance.count({ where })).toBe(0);
+    // PHASE R-10: the sweep above left the run's own queue EMPTY — the state every later
+    // app instance needs, because a surviving row's synthetic actor can never be written.
+    expect(await db.auditOutbox.count({ where })).toBe(0);
     await app.close();
   });
 

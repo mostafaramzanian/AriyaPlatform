@@ -6,7 +6,6 @@ import type { CommerceAuditGateway } from '../commerce-audit.gateway';
 import { COMMERCE_AUDIT_RESOURCE } from '../commerce.constants';
 import type { CommerceTransactionHandle } from '../database/commerce-transaction';
 import type { PaymentHistoryRepository } from './payment-history.repository';
-import { PaymentCompensationTakenError } from './payment-history.repository';
 import { PAYMENT_AUDIT_ACTION, PaymentHistoryService } from './payment-history.service';
 import { projectPaymentStatus } from './payment-status';
 import type { ListPaymentsQueryDto } from './payment.dto';
@@ -78,6 +77,9 @@ function build() {
     findDocumentForPayment: jest.Mock;
     readPaymentPage: jest.Mock;
     findPaymentForCompensation: jest.Mock;
+    lockDocumentForPayment: jest.Mock;
+    lockPaymentForCompensation: jest.Mock;
+    sumCompensations: jest.Mock;
     findCompensation: jest.Mock;
     append: jest.Mock;
   };
@@ -85,8 +87,16 @@ function build() {
     findDocumentForPayment: jest.fn(),
     readPaymentPage: jest.fn(),
     findPaymentForCompensation: jest.fn(),
+    lockDocumentForPayment: jest.fn().mockResolvedValue({ id: DOCUMENT_ID }),
+    lockPaymentForCompensation: jest.fn().mockResolvedValue({ id: PAYMENT_ID }),
+    sumCompensations: jest.fn().mockResolvedValue(null),
     findCompensation: jest.fn(),
     append: jest.fn(),
+  };
+  const unitOfWork = {
+    run: jest.fn().mockImplementation((work: (handle: unknown) => unknown) =>
+      work('fake-tx-handle')
+    ),
   };
   const audit = {
     record: jest.fn(),
@@ -100,7 +110,8 @@ function build() {
   return {
     service: new PaymentHistoryService(
       repository as unknown as PaymentHistoryRepository,
-      audit as unknown as CommerceAuditGateway
+      audit as unknown as CommerceAuditGateway,
+      unitOfWork as never
     ),
     repository,
     audit,
@@ -258,6 +269,7 @@ describe('Phase C1 Step Q — appending a payment', () => {
   it('answers 404 — BEFORE any write — for a foreign or unknown document', async () => {
     const { service, repository } = build();
     repository.findDocumentForPayment.mockResolvedValue(null);
+    repository.lockDocumentForPayment.mockResolvedValue(null);
 
     await expect(
       service.append(ACTOR, DOCUMENT_ID, { amount: 30, method: 'CASH' })
@@ -313,7 +325,7 @@ describe('Phase C1 Step Q — the compensating row (16, Q4)', () => {
       }),
       // Phase B2.3: durable outbox payload.
       expect.objectContaining({ tenantId: 't1' }),
-      undefined // …and no tx handle in the compensation test: the handle is optional
+      'fake-tx-handle' // the unit-of-work handle — every statement joins it
     );
     expect(view.amount).toBe('-26.2500');
     expect(view.reversesPaymentId).toBe(PAYMENT_ID);
@@ -335,18 +347,52 @@ describe('Phase C1 Step Q — the compensating row (16, Q4)', () => {
     await service.compensate(ACTOR, DOCUMENT_ID, PAYMENT_ID, {}, handle);
 
     const calls = [
-      ...repository.findDocumentForPayment.mock.calls,
+      ...repository.lockDocumentForPayment.mock.calls,
+      ...repository.lockPaymentForCompensation.mock.calls,
       ...repository.findPaymentForCompensation.mock.calls,
-      ...repository.findCompensation.mock.calls,
+      ...repository.sumCompensations.mock.calls,
       ...repository.append.mock.calls,
     ];
-    // Non-vacuity: all four statements really ran, so "each one carries the handle" is a
+    // Non-vacuity: all five statements really ran, so "each one carries the handle" is a
     // claim about this act rather than about an empty array.
-    expect(calls).toHaveLength(4);
+    expect(calls).toHaveLength(5);
     for (const call of calls) expect(call[call.length - 1]).toBe(handle);
 
     // The write happens ONCE, through the joined statement — never through a second one.
     expect(repository.append).toHaveBeenCalledTimes(1);
+  });
+
+  it('W4: a stated amount writes a PARTIAL negation — the refunded figure, not the target', async () => {
+    const { service, repository } = build();
+    repository.findDocumentForPayment.mockResolvedValue(storedDocument());
+    repository.findPaymentForCompensation.mockResolvedValue(
+      storedPayment({ amount: '100.0000' })
+    );
+    repository.findCompensation.mockResolvedValue(null);
+    repository.append.mockResolvedValue(storedPayment({ id: 'comp-1', amount: '-20.0000' }));
+
+    await service.compensate(ACTOR, DOCUMENT_ID, PAYMENT_ID, { amount: 20 });
+
+    expect(repository.append).toHaveBeenCalledWith(
+      't1',
+      expect.objectContaining({ amount: '-20.0000', reversesPaymentId: PAYMENT_ID }),
+      expect.objectContaining({ tenantId: 't1' }),
+      'fake-tx-handle'
+    );
+  });
+
+  it('W4: a stated amount LARGER than the payment is refused — over-refund is not a compensation', async () => {
+    const { service, repository } = build();
+    repository.findDocumentForPayment.mockResolvedValue(storedDocument());
+    repository.findPaymentForCompensation.mockResolvedValue(
+      storedPayment({ amount: '100.0000' })
+    );
+    repository.findCompensation.mockResolvedValue(null);
+
+    await expect(
+      service.compensate(ACTOR, DOCUMENT_ID, PAYMENT_ID, { amount: 100.0001 })
+    ).rejects.toBeInstanceOf(ConflictException);
+    expect(repository.append).not.toHaveBeenCalled();
   });
 
   it('404s an unknown payment of the document — indistinguishable from a foreign one', async () => {
@@ -360,45 +406,83 @@ describe('Phase C1 Step Q — the compensating row (16, Q4)', () => {
     expect(repository.append).not.toHaveBeenCalled();
   });
 
-  it('409s a second compensation from the EARLY read, naming the existing reversal', async () => {
+  it('W4-B: a SECOND partial compensation within the remaining capacity is allowed', async () => {
+    const { service, repository } = build();
+    repository.findDocumentForPayment.mockResolvedValue(storedDocument());
+    repository.findPaymentForCompensation.mockResolvedValue(
+      storedPayment({ amount: '100.0000' })
+    );
+    repository.sumCompensations.mockResolvedValue('-20.0000'); // one refund already landed
+    repository.append.mockResolvedValue(storedPayment({ id: 'comp-2', amount: '-10.0000' }));
+
+    await service.compensate(ACTOR, DOCUMENT_ID, PAYMENT_ID, { amount: 10 });
+
+    expect(repository.lockPaymentForCompensation).toHaveBeenCalledWith(
+      't1',
+      PAYMENT_ID,
+      'fake-tx-handle'
+    );
+    expect(repository.append).toHaveBeenCalledWith(
+      't1',
+      expect.objectContaining({ amount: '-10.0000', reversesPaymentId: PAYMENT_ID }),
+      expect.objectContaining({ tenantId: 't1' }),
+      'fake-tx-handle'
+    );
+  });
+
+  it('W4-B: an omitted amount compensates the REMAINING capacity, not the original', async () => {
+    const { service, repository } = build();
+    repository.findDocumentForPayment.mockResolvedValue(storedDocument());
+    repository.findPaymentForCompensation.mockResolvedValue(
+      storedPayment({ amount: '100.0000' })
+    );
+    repository.sumCompensations.mockResolvedValue('-30.0000');
+    repository.append.mockResolvedValue(storedPayment({ id: 'comp-2', amount: '-70.0000' }));
+
+    await service.compensate(ACTOR, DOCUMENT_ID, PAYMENT_ID, {});
+
+    expect(repository.append).toHaveBeenCalledWith(
+      't1',
+      expect.objectContaining({ amount: '-70.0000' }),
+      expect.objectContaining({ tenantId: 't1' }),
+      'fake-tx-handle'
+    );
+  });
+
+  it('W4-B: a compensation past the CUMULATIVE capacity is refused — no write, no audit', async () => {
     const { service, repository, audit } = build();
     repository.findDocumentForPayment.mockResolvedValue(storedDocument());
-    repository.findPaymentForCompensation.mockResolvedValue(storedPayment());
-    repository.findCompensation.mockResolvedValue(storedPayment({ id: 'comp-already' }));
-
-    await expect(service.compensate(ACTOR, DOCUMENT_ID, PAYMENT_ID, {})).rejects.toThrow(
-      'comp-already'
+    repository.findPaymentForCompensation.mockResolvedValue(
+      storedPayment({ amount: '100.0000' })
     );
+    repository.sumCompensations.mockResolvedValue('-80.0000'); // 20 refundable remain
+
     await expect(
-      service.compensate(ACTOR, DOCUMENT_ID, PAYMENT_ID, {})
+      service.compensate(ACTOR, DOCUMENT_ID, PAYMENT_ID, { amount: 25 })
     ).rejects.toBeInstanceOf(ConflictException);
 
     expect(repository.append).not.toHaveBeenCalled();
     expect(audit.record).not.toHaveBeenCalled();
   });
 
-  it('409s from the unique index when the early read LOST the race — and audits nothing', async () => {
-    const { service, repository, audit } = build();
+  it('W4-B: a fully compensated payment refuses another row outright', async () => {
+    const { service, repository } = build();
     repository.findDocumentForPayment.mockResolvedValue(storedDocument());
-    repository.findPaymentForCompensation.mockResolvedValue(storedPayment());
-    repository.findCompensation
-      .mockResolvedValueOnce(null) // the optimistic read
-      .mockResolvedValueOnce(storedPayment({ id: 'comp-winner' })); // the re-read
-    repository.append.mockRejectedValue(new PaymentCompensationTakenError());
+    repository.findPaymentForCompensation.mockResolvedValue(
+      storedPayment({ amount: '100.0000' })
+    );
+    repository.sumCompensations.mockResolvedValue('-100.0000');
 
     await expect(service.compensate(ACTOR, DOCUMENT_ID, PAYMENT_ID, {})).rejects.toThrow(
-      'comp-winner'
+      'already fully compensated'
     );
-
-    expect(repository.append).toHaveBeenCalledTimes(1);
-    expect(audit.record).not.toHaveBeenCalled(); // a refused write leaves no audit row
+    expect(repository.append).not.toHaveBeenCalled();
   });
 
   it('lets a non-race failure surface untouched — no fallback, no silent success (§3-E)', async () => {
     const { service, repository } = build();
     repository.findDocumentForPayment.mockResolvedValue(storedDocument());
     repository.findPaymentForCompensation.mockResolvedValue(storedPayment());
-    repository.findCompensation.mockResolvedValue(null);
     repository.append.mockRejectedValue(new Error('database unreachable'));
 
     await expect(service.compensate(ACTOR, DOCUMENT_ID, PAYMENT_ID, {})).rejects.toThrow(
@@ -438,12 +522,13 @@ describe('Phase C1 Step Q — independence, tenancy, one trail (18, 21, 22, 23)'
     expect(code).not.toMatch(
       /CommerceIdentityGateway|WorkflowLineRouting|CommercialLifecycle|profilesFor|assertMember/
     );
-    // Exactly TWO constructor dependencies — repository and audit gateway — so the
+    // Constructor dependencies are the repository, the audit gateway and the unit
+    // of work (compensation's lock-read-write must be one transaction) — so the
     // absence is structural, not merely unexercised.
     expect(code).toMatch(
-      /constructor\(\s*private readonly repository: PaymentHistoryRepository,\s*private readonly audit: CommerceAuditGateway\s*\)/
+      /constructor\(\s*private readonly repository: PaymentHistoryRepository,\s*private readonly audit: CommerceAuditGateway,\s*private readonly unitOfWork: CommerceUnitOfWork\s*\)/
     );
-    // The service touches exactly the repository's five methods — no string method
+    // The service touches exactly the repository's methods — no string method
     // a typo invented, no other collaborator's surface.
     const touched = new Set(
       [...code.matchAll(/this\.repository\.(\w+)/g)].map((match) => match[1])
@@ -451,10 +536,12 @@ describe('Phase C1 Step Q — independence, tenancy, one trail (18, 21, 22, 23)'
     expect([...touched].sort()).toEqual(
       [
         'append',
-        'findCompensation',
         'findDocumentForPayment',
         'findPaymentForCompensation',
+        'lockDocumentForPayment',
+        'lockPaymentForCompensation',
         'readPaymentPage',
+        'sumCompensations',
       ].sort()
     );
   });
@@ -480,6 +567,9 @@ describe('Phase C1 Step Q — independence, tenancy, one trail (18, 21, 22, 23)'
       ...repository.readPaymentPage.mock.calls,
       ...repository.append.mock.calls,
       ...repository.findPaymentForCompensation.mock.calls,
+      ...repository.lockDocumentForPayment.mock.calls,
+      ...repository.lockPaymentForCompensation.mock.calls,
+      ...repository.sumCompensations.mock.calls,
       ...repository.findCompensation.mock.calls,
     ].map((call) => call[0]);
 

@@ -207,6 +207,12 @@ export class CreatePurchaseDocumentDto {
   })
   currency?: string;
 
+  /** The cost center / department label the purchase is charged to — free text. */
+  @IsOptional()
+  @IsString()
+  @MaxLength(128)
+  costCenter?: string;
+
   @IsArray()
   @ArrayMinSize(1)
   @ArrayMaxSize(MAX_PURCHASE_LINES)
@@ -254,6 +260,12 @@ export class UpdatePurchaseDocumentDto {
   })
   currency?: string | null;
 
+  /** `null` clears the stored label — the same stated-vs-cleared rule as `supplierId`. */
+  @IsOptional()
+  @IsString()
+  @MaxLength(128)
+  costCenter?: string | null;
+
   @IsOptional()
   @IsArray()
   @ArrayMinSize(1)
@@ -289,6 +301,18 @@ export class ListPurchaseDocumentsQueryDto extends CommercePageQueryDto {
   @IsNotEmpty()
   @MaxLength(64)
   requesterId?: string;
+
+  /**
+   * The "واحد سازمانی" register filter: match the exact cost-center string the
+   * document carries. Exact-match (not contains) because the client offers the
+   * tenant's DISTINCT stored values — a contains match could name a center that
+   * exists and return rows of a differently-named one, an ambiguous filter.
+   */
+  @IsOptional()
+  @IsString()
+  @IsNotEmpty()
+  @MaxLength(128)
+  costCenter?: string;
 }
 
 /**
@@ -314,6 +338,60 @@ export class ListPurchaseDocumentsQueryDto extends CommercePageQueryDto {
  *    nothing, the PLATFORM's defaults are what answer, and the response echoes them.
  */
 export class PurchaseTimelineQueryDto {
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  page?: number;
+
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(COMMERCE_MAX_PAGE_SIZE)
+  pageSize?: number;
+}
+
+/**
+ * PHASE W3.2: the aggregated history query — server-side filters over the
+ * document's merged `status`/`audit`/`posting` streams. Every field is a
+ * NARROWER; none can widen the tenant- and document-scoped read.
+ */
+export class PurchaseHistoryQueryDto {
+  /** Comma-separated source filter: `status`, `audit`, `posting`. */
+  @IsOptional()
+  @IsString()
+  @Matches(/^(status|audit|posting)(,(status|audit|posting))*$/)
+  sources?: string;
+
+  @IsOptional()
+  @IsIn(['succeeded', 'failed', 'pending'])
+  outcome?: 'succeeded' | 'failed' | 'pending';
+
+  /** Exact match on the item's stable action code (`status.closed`, audit action, `posting.<kind>.<status>`). */
+  @IsOptional()
+  @IsString()
+  @MaxLength(128)
+  action?: string;
+
+  /** Exact match on the recorded actor's user id. */
+  @IsOptional()
+  @IsString()
+  @MaxLength(128)
+  actorId?: string;
+
+  /** Inclusive lower bound on `occurredAt`, ISO-8601. */
+  @IsOptional()
+  @IsString()
+  @MaxLength(64)
+  from?: string;
+
+  /** Exclusive upper bound on `occurredAt`, ISO-8601. */
+  @IsOptional()
+  @IsString()
+  @MaxLength(64)
+  to?: string;
+
   @IsOptional()
   @Type(() => Number)
   @IsInt()

@@ -155,10 +155,17 @@ export class OrganizationService {
     }
 
     try {
+      // Optional profile fields are forwarded only when present, so a minimal
+      // create keeps the INSERT it always had — a missing label stays NULL.
       return await this.units.create(actor.tenantId, {
         code: dto.code,
         name: dto.name,
         parentId: dto.parentId ?? null,
+        ...(dto.kind !== undefined ? { kind: dto.kind } : {}),
+        ...(dto.managerName !== undefined ? { managerName: dto.managerName } : {}),
+        ...(dto.location !== undefined ? { location: dto.location } : {}),
+        ...(dto.monthlyBudget !== undefined ? { monthlyBudget: dto.monthlyBudget } : {}),
+        ...(dto.responsibility !== undefined ? { responsibility: dto.responsibility } : {}),
       });
     } catch (err) {
       // The concurrent loser lands here. Same refusal as the pre-check above, because to
@@ -195,6 +202,13 @@ export class OrganizationService {
     const unit = await this.units.update(id, {
       ...(dto.name !== undefined ? { name: dto.name } : {}),
       ...(dto.parentId !== undefined ? { parentId: dto.parentId } : {}),
+      ...(dto.kind !== undefined ? { kind: dto.kind } : {}),
+      // `null` CLEARS a profile label — the same present-but-null semantics as
+      // `parentId`: absence means "leave it", null means "remove it".
+      ...(dto.managerName !== undefined ? { managerName: dto.managerName } : {}),
+      ...(dto.location !== undefined ? { location: dto.location } : {}),
+      ...(dto.monthlyBudget !== undefined ? { monthlyBudget: dto.monthlyBudget } : {}),
+      ...(dto.responsibility !== undefined ? { responsibility: dto.responsibility } : {}),
     });
 
     await this.audit.record(actor, {
@@ -325,6 +339,16 @@ export interface OrganizationTreeNode {
   code: string;
   name: string;
   status: 'ACTIVE' | 'INACTIVE';
+  kind: 'OPERATIONAL' | 'STAFF';
+  managerName: string | null;
+  location: string | null;
+  /** DECIMAL(20,0) at rest; Prisma's Decimal serialises to a digit string on the wire. */
+  monthlyBudget: { toString(): string } | null;
+  responsibility: string | null;
+  /** Live count of ACTIVE employment records pointing at this unit. */
+  headcount: number;
+  /** Live count of position slots defined inside this unit. */
+  positionsCount: number;
   createdAt: Date;
   updatedAt: Date;
   children: OrganizationTreeNode[];

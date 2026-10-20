@@ -33,6 +33,7 @@ import {
   responseBuffer,
 } from './reporting-export.fixtures';
 import { PrismaService as CorePrismaService } from '../src/database/prisma.service';
+import { ensureCommerceProcurementTestProvisioning } from './fixtures/commerce-provisioning';
 
 type SupertestResponse = import('supertest').Response;
 
@@ -209,6 +210,15 @@ describe('Reporting — Purchase Request Status & Lifecycle Report (second verti
     if (!tenantA) throw new Error('[E2E] Seeded tenant tenant-test-1 not found');
     tenantAId = tenantA.id;
 
+    // Test-only provisioning, and it MUST run BEFORE any login: login resolves the
+    // caller's permission claim through the PermissionSource port (which caches its
+    // answer), so a grant written after the first token is minted leaves every later
+    // request carrying a permission-empty identity. The grant/enrolment migrations
+    // cannot supply these rows themselves — they only see what existed at migration
+    // time, while the roles and `tenant-test-1` are created afterwards by `db:seed`.
+    // Shapes mirrored, nothing else touched: fixtures/commerce-provisioning.ts.
+    await ensureCommerceProcurementTestProvisioning(coreDb, [tenantAId]);
+
     const seededAdminRow = await coreDb.user.findUnique({ where: { email: 'admin@localhost' } });
     if (!seededAdminRow) throw new Error('[E2E] Seeded admin user not found');
     admin = {
@@ -304,8 +314,8 @@ describe('Reporting — Purchase Request Status & Lifecycle Report (second verti
       .set('Authorization', `Bearer ${admin.token}`)
       .expect(200);
 
-    const draftIds = envelope(drafts.body).items.map((item) => item.id);
-    const submittedIds = envelope(submitted.body).items.map((item) => item.id);
+    const draftIds = envelope(drafts.body).items.map((item: { id: string }) => item.id);
+    const submittedIds = envelope(submitted.body).items.map((item: { id: string }) => item.id);
 
     expect(draftIds).toContain(draftId);
     expect(draftIds).not.toContain(approvedId);
@@ -330,7 +340,7 @@ describe('Reporting — Purchase Request Status & Lifecycle Report (second verti
       .expect(200);
 
     const body = envelope(res.body);
-    const ids = body.items.map((item) => item.id);
+    const ids = body.items.map((item: { id: string }) => item.id);
     expect(ids).toEqual(expect.arrayContaining([draftId]));
     for (const item of body.items) expect(item.documentNumber).toContain(documentNumber);
   });
@@ -352,7 +362,7 @@ describe('Reporting — Purchase Request Status & Lifecycle Report (second verti
       .get(`${reportUrl()}?status=DRAFT&pageSize=100`)
       .set('Authorization', `Bearer ${admin.token}`)
       .expect(200);
-    const ids = envelope(list.body).items.map((item) => item.id);
+    const ids = envelope(list.body).items.map((item: { id: string }) => item.id);
     expect(ids).not.toContain(tenantBRowId);
 
     // A foreign id behaves EXACTLY like a missing one: 404, not 403.
@@ -411,14 +421,23 @@ describe('Reporting — Purchase Request Status & Lifecycle Report (second verti
   });
 
   it('serves the selected document’s authoritative timeline — and only for it', async () => {
-    const res: SupertestResponse = await api()
-      .get(reportUrl(`/${approvedId}/timeline`))
-      .set('Authorization', `Bearer ${admin.token}`)
-      .expect(200);
+    // The commerce audit relay drains the outbox on a 10s poll — the platform
+    // audit row for `submit` is durable but not synchronous, so the read polls
+    // until the relayed events are visible instead of racing the interval.
+    let res!: SupertestResponse;
+    const deadline = Date.now() + 60_000;
+    for (;;) {
+      res = await api()
+        .get(reportUrl(`/${approvedId}/timeline`))
+        .set('Authorization', `Bearer ${admin.token}`)
+        .expect(200);
+      if (res.body.total >= 2 || Date.now() > deadline) break;
+      await new Promise((resolve) => setTimeout(resolve, 2_000));
+    }
 
     expect(Array.isArray(res.body.items)).toBe(true);
     expect(res.body.total).toBeGreaterThanOrEqual(2); // create + submit were audited
-    const actions = res.body.items.map((item) => item.action);
+    const actions = res.body.items.map((item: { action: string }) => item.action);
     expect(actions).toEqual(expect.arrayContaining(['create', 'submit']));
     // The timeline projection never carries raw envelope internals.
     for (const item of res.body.items) {
@@ -462,7 +481,7 @@ describe('Reporting — Purchase Request Status & Lifecycle Report (second verti
       .set('Authorization', `Bearer ${admin.token}`)
       .expect(200);
     const listed = envelope(list.body);
-    expect(listed.items.map((item) => item.id)).toContain(draftId);
+    expect(listed.items.map((item: { id: string }) => item.id)).toContain(draftId);
 
     const xlsx: SupertestResponse = await getExportFile(
       api(),
@@ -486,7 +505,7 @@ describe('Reporting — Purchase Request Status & Lifecycle Report (second verti
     ]);
     expect(sheet.data).toHaveLength(listed.items.length);
     expect(sheet.data.map((row) => row[0]).sort()).toEqual(
-      listed.items.map((item) => item.documentNumber).sort()
+      listed.items.map((item: { documentNumber: string }) => item.documentNumber).sort()
     );
     // The priced draft keeps its numeric money in the sheet: 1260 as digits, 1200 and
     // 60 are the writer's own amounts — compared as STRINGS of the sheet text, because

@@ -65,6 +65,21 @@ export class ReceiptLineInputDto {
   @Min(0.0001)
   @Max(PURCHASE_MAX_MONEY_AMOUNT)
   quantity!: number;
+
+  /**
+   * Phase W2-B: the destination warehouse the arriving quantity posts into —
+   * REQUIRED (by the service, not this DTO) when the purchase line is
+   * stock-tracked (`itemReference` set); absent on non-stocked lines. Opaque
+   * here; Inventory validates it at posting time.
+   */
+  @IsOptional()
+  @IsUUID('4')
+  warehouseId?: string;
+
+  /** The cell inside the warehouse — optional, opaque to Commerce. */
+  @IsOptional()
+  @IsUUID('4')
+  locationId?: string;
 }
 
 /**

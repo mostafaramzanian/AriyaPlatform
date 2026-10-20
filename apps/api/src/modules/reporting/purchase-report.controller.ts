@@ -94,6 +94,30 @@ export class PurchaseReportController {
     });
   }
 
+  /**
+   * PHASE W2-C — pending-purchase aging («گزارش تأخیر درخواست‌های خرید در
+   * جریان»). Declared BEFORE `:id` deliberately: `aging` is not a UUID, so the
+   * detail route must not swallow it. Same `commerce.read` remit — the report
+   * reads exactly the rows the register already covers.
+   */
+  @Get('aging')
+  @Roles(Permissions.COMMERCE_READ)
+  async aging(@Request() req: ExRequest, @Query() query: PurchaseReportTimelineQueryDto) {
+    return this.report.listPendingAging(resolveReportingActor(req), query);
+  }
+
+  /**
+   * PHASE W2-C — committed cost per cost center («بهای تمام‌شده بر اساس مرکز
+   * هزینه»). Declared BEFORE `:id` for the same reason as `aging`. Same
+   * `commerce.read` remit: the report reads only rows and ledger entries this
+   * remit already covers.
+   */
+  @Get('cost')
+  @Roles(Permissions.COMMERCE_READ)
+  async cost(@Request() req: ExRequest) {
+    return this.report.listCostByCenter(resolveReportingActor(req));
+  }
+
   /** One report row, or 404 when the id is not this tenant's. */
   @Get(':id')
   @Roles(Permissions.COMMERCE_READ)

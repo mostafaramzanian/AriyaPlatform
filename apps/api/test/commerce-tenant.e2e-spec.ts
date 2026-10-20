@@ -110,8 +110,15 @@ import { PurchaseCompletionPolicyController } from '../src/modules/commerce/comp
 import { PurchaseCompletionPolicyRepository } from '../src/modules/commerce/completion/purchase-completion-policy.repository';
 import { PurchaseCompletionPolicyService } from '../src/modules/commerce/completion/purchase-completion-policy.service';
 import { PurchaseCompletionService } from '../src/modules/commerce/completion/purchase-completion.service';
+import { InventoryPostingRepository } from '../src/modules/commerce/integration/inventory-posting.repository';
+import { InventoryIntegrationService } from '../src/modules/commerce/integration/inventory-integration.service';
+import { INVENTORY_POSTING_PORT } from '../src/modules/commerce/integration/inventory-posting.port';
+import { createFakeInventoryPostingPort } from './fixtures/fake-inventory-posting-port';
 import { PurchaseService } from '../src/modules/commerce/purchase/purchase.service';
 import { PurchaseTimelineService } from '../src/modules/commerce/purchase/purchase-timeline.service';
+import { PurchaseHistoryService } from '../src/modules/commerce/purchase/purchase-history.service';
+import { PurchaseHistoryRepository } from '../src/modules/commerce/purchase/purchase-history.repository';
+import { PaymentPlanRepository } from '../src/modules/commerce/payment-plan/payment-plan.repository';
 import { PurchaseRepository } from '../src/modules/commerce/purchase/purchase.repository';
 import { PaymentHistoryController } from '../src/modules/commerce/payment/payment-history.controller';
 import { PaymentHistoryService } from '../src/modules/commerce/payment/payment-history.service';
@@ -242,10 +249,12 @@ class ProbeHeaderStrategy {
       claims: null,
     });
   }
-  private success(): void {
+  private success(_arg?: unknown): void {
+      void _arg;
     throw new Error('passport replaces this method before authenticate() runs');
   }
-  private fail(): void {
+  private fail(_arg?: unknown): void {
+      void _arg;
     throw new Error('passport replaces this method before authenticate() runs');
   }
 }
@@ -476,11 +485,20 @@ describe('Commerce tenant isolation e2e (Step U / G3-G9)', () => {
       // PHASE C7 (GAP-7): the timeline route on `PurchaseController` needs its service —
       // wired exactly as commerce.module.ts wires it (repository + audit gateway above).
       PurchaseTimelineService,
+      // PHASE W3.2: the aggregated-history route on `PurchaseController` — its
+      // service and read-only repository, plus the plan repository the completion
+      // service consults for outstanding installments.
+      PurchaseHistoryService,
+      PurchaseHistoryRepository,
+      PaymentPlanRepository,
       // PHASE C4-R (GAP-3): the completion slice — the policy row's owner, its
       // configuration surface, and the one service that may move a document to CLOSED.
       PurchaseCompletionPolicyRepository,
       PurchaseCompletionPolicyService,
       PurchaseCompletionService,
+      InventoryPostingRepository,
+      InventoryIntegrationService,
+      { provide: INVENTORY_POSTING_PORT, useValue: createFakeInventoryPostingPort() },
       PaymentHistoryRepository,
       PaymentHistoryService,
       ReceivingHistoryRepository,
@@ -594,12 +612,12 @@ describe('Commerce tenant isolation e2e (Step U / G3-G9)', () => {
 
   it('G9: lists are tenant-scoped and the requesterId filter cannot cross tenants', async () => {
     const aList = await http().get(`${api}/purchase-documents`).set(authed(userA1)).expect(200);
-    expect(aList.body.items.map((item) => item.id)).toEqual([docA.id]);
+    expect(aList.body.items.map((item: { id: string }) => item.id)).toEqual([docA.id]);
     const aCount = await db.purchaseDocument.count({ where: { tenantId: tenantAId } });
     expect(aList.body.total).toBe(aCount);
 
     const bList = await http().get(`${api}/purchase-documents`).set(authed(userB1)).expect(200);
-    const bIds = bList.body.items.map((item) => item.id);
+    const bIds = bList.body.items.map((item: { id: string }) => item.id);
     expect(bIds).toContain(docB.id);
     expect(bIds).not.toContain(docA.id);
     const bCount = await db.purchaseDocument.count({ where: { tenantId: tenantBId } });
@@ -1357,8 +1375,8 @@ describe('Commerce tenant isolation e2e (Step U / G3-G9)', () => {
     for (const event of aEvents) expect(event.tenantId).toBe(tenantAId);
     for (const event of bEvents) expect(event.tenantId).toBe(tenantBId);
 
-    const noteA = notifications.find((n) => n.payload.documentId === docA.id);
-    const noteB = notifications.find((n) => n.payload.documentId === docB.id);
+    const noteA = notifications.find((n) => (n.payload as { documentId?: string }).documentId === docA.id);
+    const noteB = notifications.find((n) => (n.payload as { documentId?: string }).documentId === docB.id);
     expect(noteA).toBeDefined();
     expect(noteB).toBeDefined();
     expect(noteA!.payload.tenantId).toBe(tenantAId);
@@ -1398,6 +1416,10 @@ describe('Commerce tenant isolation e2e (Step U / G3-G9)', () => {
     // `PurchaseDocument.line_routing_version_id`, both ON DELETE RESTRICT), so a submitted
     // document keeps the versions it pinned alive until the document itself is gone — and the
     // groups wait for the versions that name them.
+    // PHASE W3: append-only status events RESTRICT their document — they go first.
+    deleted.purchaseStatusEvent = (
+      await db.purchaseStatusEvent.deleteMany({ where })
+    ).count;
     deleted.purchaseLine = (await db.purchaseLine.deleteMany({ where })).count;
     deleted.purchaseDocument = (await db.purchaseDocument.deleteMany({ where })).count;
     deleted.workflowLineRoutingVersion = (

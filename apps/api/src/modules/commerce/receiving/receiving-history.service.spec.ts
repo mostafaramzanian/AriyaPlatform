@@ -128,16 +128,25 @@ function build() {
       work({} as CommerceTransactionHandle)
     ),
   };
+  // Phase W2-B: the integration seam, faked — planning and post-commit
+  // attempts are asserted as calls, never as inventory state.
+  const inventoryIntegration = {
+    planReceiptPostings: jest.fn().mockResolvedValue([]),
+    planCompensationPosting: jest.fn().mockResolvedValue([]),
+    attemptPostings: jest.fn().mockResolvedValue(undefined),
+  };
 
   return {
     service: new ReceivingHistoryService(
       repository as unknown as ReceivingHistoryRepository,
       audit as unknown as CommerceAuditGateway,
-      unitOfWork as unknown as CommerceUnitOfWork
+      unitOfWork as unknown as CommerceUnitOfWork,
+      inventoryIntegration as never
     ),
     repository,
     audit,
     unitOfWork,
+    inventoryIntegration,
   };
 }
 describe('Phase C1 Step R — the read: one snapshot, the whole history, every line (§3-B, §6)', () => {
@@ -886,9 +895,9 @@ describe('Phase C1 Step R — the shape of the slice, read back as text (§3-F, 
     })
     .join('\n');
 
-  it('has exactly THREE constructor dependencies — repository, audit, unit of work (§3-H)', () => {
+  it('has exactly FOUR constructor dependencies — repository, audit, unit of work, integration (§3-H + W2-B)', () => {
     expect(code).toMatch(
-      /constructor\(\s*private readonly repository: ReceivingHistoryRepository,\s*private readonly audit: CommerceAuditGateway,\s*private readonly unitOfWork: CommerceUnitOfWork\s*\)/
+      /constructor\(\s*private readonly repository: ReceivingHistoryRepository,\s*private readonly audit: CommerceAuditGateway,\s*private readonly unitOfWork: CommerceUnitOfWork,\s*private readonly inventoryIntegration: InventoryIntegrationService\s*\)/
     );
     // The absence is STRUCTURAL: no identity gateway (the receiver is opaque,
     // §16), no workflow/commercial/payment dependency and no rule engine —
@@ -959,6 +968,9 @@ describe('Phase C1 Step R — the shape of the slice, read back as text (§3-F, 
     expect([...code.matchAll(/from '([^']+)'/g)].map((match) => match[1])).toEqual([
       '@nestjs/common',
       '../commerce-actor',
+      // Phase W2-B: the ONE new collaborator — the integration slice's service,
+      // which owns the durable posting plan and the post-commit attempt.
+      '../integration/inventory-integration.service',
       '../commerce-audit.gateway',
       '../commerce.constants',
       '../database/commerce-transaction',

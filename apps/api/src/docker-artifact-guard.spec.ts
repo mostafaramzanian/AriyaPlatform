@@ -74,6 +74,34 @@ describe('Docker runtime artifact completeness', () => {
     expect(runtimesWithImages).toEqual(['core', 'cms', 'combined']);
   });
 
+  /**
+   * The release lineage is not always the policy's declared one.
+   *
+   * `runtime-policy.json`/`RUNTIME_DOCKER_IMAGE` name `Dockerfile.backend` for the combined
+   * runtime, but the pinned release images have been built from the older
+   * `infrastructure/docker/Dockerfile.runtime` lineage. That is a legitimate second
+   * Dockerfile to keep — and it is exactly how the Inventory project went missing from a
+   * shipped image: `Dockerfile.backend` gained
+   * `prisma/inventory` (Phase W1) while `Dockerfile.runtime` did not, so the candidate
+   * image carried `inventory-client` (which connects eagerly at boot) and no Inventory
+   * schema/migration history at all. The runtime then required `INVENTORY_DATABASE_URL`
+   * with no way to migrate the database it points at.
+   *
+   * The guard below is the missing half of that check: whichever lineage is used to build
+   * the image, its Prisma project COPY list must equal the policy's expected set.
+   */
+  it('keeps the release lineage (Dockerfile.runtime) level with the policy-expected set', () => {
+    const releaseLineage = 'infrastructure/docker/Dockerfile.runtime';
+    const releaseLineagePath = path.join(repoRoot, releaseLineage);
+    if (!fs.existsSync(releaseLineagePath)) return;
+
+    const copied = copiedPrismaProjects(releaseLineagePath);
+    expect({ dockerfile: releaseLineage, copied }).toEqual({
+      dockerfile: releaseLineage,
+      copied: expectedPrismaProjects('combined'),
+    });
+  });
+
   for (const runtime of RUNTIME_IDS) {
     const dockerfile = RUNTIME_DOCKER_IMAGE[runtime].dockerfile;
     if (!dockerfile) continue;

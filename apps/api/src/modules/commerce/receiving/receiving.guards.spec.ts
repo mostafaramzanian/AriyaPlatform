@@ -330,7 +330,10 @@ describe('C1 step R: the receiving slice’s remaining boundaries (§3-F, §3-I,
     // Non-vacuity: the arrays were actually parsed and are the module's own.
     expect(controllers.length).toBeGreaterThanOrEqual(5);
     expect(providers.length).toBeGreaterThanOrEqual(12);
-    expect(exports.length).toBe(3);
+    // The three gateways PLUS W2-C's `CommerceOrderReferenceFacade` — the
+    // deliberately narrow seam the neutral bridge module consumes for
+    // Financial's purchase-order resolution. Still no slice provider.
+    expect(exports.length).toBe(4);
 
     expect(controllers).toContain('ReceivingHistoryController');
     expect(providers).toContain('ReceivingHistoryRepository');

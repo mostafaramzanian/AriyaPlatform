@@ -188,6 +188,65 @@ export class PaymentHistoryRepository {
    * compensating row can never be pointed at another document's payment, and a cross-
    * tenant id stays indistinguishable from an absent one (§3-E: 404, never 403).
    */
+  /**
+   * Phase W4-C (lock-order unification): the DOCUMENT row, LOCKED `FOR UPDATE`
+   * inside the caller's unit of work. Every path that mutates payment or
+   * lifecycle state of one purchase serializes on the SAME first lock —
+   * `PurchaseDocument` then `PaymentRecord` then the aggregates — so a
+   * manual compensation (payment lock → doc `FOR KEY SHARE` at INSERT) and a
+   * return refund (doc lock → payment lock) can never form a wait cycle.
+   * The lock doubles as the tenant-scoped 404 gate.
+   */
+  async lockDocumentForPayment(
+    tenantId: string,
+    documentId: string,
+    tx: CommerceTransactionHandle
+  ): Promise<{ id: string } | null> {
+    const rows = await unwrapCommerceTransaction(tx).$queryRaw<Array<{ id: string }>>`
+      SELECT "id" FROM "PurchaseDocument"
+      WHERE "tenant_id" = ${tenantId} AND "id" = ${documentId}::uuid
+      FOR UPDATE`;
+    return rows.length > 0 ? rows[0] : null;
+  }
+
+  /**
+   * Phase W4-B (repeated partial refunds): the ORIGINAL payment row, LOCKED
+   * `FOR UPDATE` inside the caller's unit of work. This is the replacement
+   * for the dropped one-compensation unique index: every compensation of a
+   * payment — manual or return-driven — serializes on its row, so two raced
+   * refunds cannot both observe the same remaining capacity. Scoping by
+   * tenant AND id doubles the lock as the cross-tenant gate (absent is
+   * indistinguishable from foreign).
+   */
+  async lockPaymentForCompensation(
+    tenantId: string,
+    paymentId: string,
+    tx: CommerceTransactionHandle
+  ): Promise<{ id: string } | null> {
+    const rows = await unwrapCommerceTransaction(tx).$queryRaw<Array<{ id: string }>>`
+      SELECT "id" FROM "PaymentRecord"
+      WHERE "tenant_id" = ${tenantId} AND "id" = ${paymentId}::uuid
+      FOR UPDATE`;
+    return rows.length > 0 ? rows[0] : null;
+  }
+
+  /**
+   * Σ of the compensation rows a payment already carries — negative figures.
+   * Read under `lockPaymentForCompensation`, so the capacity check
+   * `amount + Σcompensations >= 0` cannot be raced by a concurrent refund.
+   */
+  async sumCompensations(
+    tenantId: string,
+    reversesPaymentId: string,
+    tx: CommerceTransactionHandle
+  ) {
+    const aggregate = await unwrapCommerceTransaction(tx).paymentRecord.aggregate({
+      where: { tenantId, reversesPaymentId },
+      _sum: { amount: true },
+    });
+    return aggregate._sum.amount;
+  }
+
   async findPaymentForCompensation(
     tenantId: string,
     purchaseDocumentId: string,
@@ -197,22 +256,6 @@ export class PaymentHistoryRepository {
     const client = tx ? unwrapCommerceTransaction(tx) : this.prisma;
     return client.paymentRecord.findFirst({
       where: { id: paymentId, tenantId, purchaseDocumentId },
-    });
-  }
-
-  /**
-   * The compensating row of a target row, if one exists — the service's EARLY answer to
-   * a second compensation (409 naming the existing reversal). The unique index remains
-   * the authority; this read is only the courtesy that names the winner (Q4).
-   */
-  async findCompensation(
-    tenantId: string,
-    reversesPaymentId: string,
-    tx?: CommerceTransactionHandle
-  ) {
-    const client = tx ? unwrapCommerceTransaction(tx) : this.prisma;
-    return client.paymentRecord.findFirst({
-      where: { tenantId, reversesPaymentId },
     });
   }
 

@@ -452,4 +452,75 @@ describe('PlatformAuditService', () => {
       expect(Logger.prototype.error).toHaveBeenCalled();
     });
   });
+
+  describe('the actor foreign key (P2003) — the contract, not a suppression (P1)', () => {
+    /**
+     * `AuditLog.userId` is a real FK to `core_db."User"` (`onDelete: SetNull`), and
+     * `AuditEventInput.actorId` is declared as "The Core identity that acted; null for a
+     * machine context". An actorId no User row backs — a synthetic test principal, or a
+     * user deleted between auth and write — is therefore a CONTRACT VIOLATION by the
+     * producer, and this writer's answer to it is a rejection the caller can observe,
+     * not a row with the actor silently nulled (that would fabricate a machine context
+     * for a human act) and never a throw (a completed mutation must not 500).
+     */
+    it('rejects an event whose actorId no User row backs — logged, returned, never thrown', async () => {
+      table.auditLog.create.mockImplementationOnce(async () => {
+        throw Object.assign(
+          new Error(
+            'Foreign key constraint violated on the constraint: `AuditLog_userId_fkey`'
+          ),
+          { code: 'P2003' }
+        );
+      });
+
+      const result = await service.record(event({ actorId: 'user-that-does-not-exist' }));
+
+      expect(result).toEqual({
+        status: 'rejected',
+        auditId: event().auditId,
+        auditLogId: null,
+        code: 'AUDIT_WRITE_FAILED',
+      });
+      // Observable: the log carries the failing event's identity AND the raw error,
+      // which is where P2003 is visible to an operator.
+      expect(Logger.prototype.error).toHaveBeenCalledWith(
+        expect.objectContaining({ auditId: event().auditId, tenantId: 'tenant-north' }),
+        'Failed to persist a platform audit event'
+      );
+      // Nothing half-written, and no retry with a nulled actor either.
+      expect(table.auditLog.create).toHaveBeenCalledTimes(1);
+      expect(table.rows.size).toBe(0);
+    });
+
+    it('records the SAME event verbatim once a legitimate actor exists — no null-actor rewrite', async () => {
+      // The digest includes actorId, so a replay after the FK is repaired must classify
+      // as the identical event: the writer stores `actorId` as `userId` or not at all,
+      // never as a null that would fabricate a machine context and break replay dedup.
+      let foreignKeyHealthy = false;
+      table.auditLog.create.mockImplementation(async ({ data }) => {
+        if (!foreignKeyHealthy && data.userId !== null) {
+          throw Object.assign(new Error('fk violated'), { code: 'P2003' });
+        }
+        const stored = Object.fromEntries(
+          Object.entries(data).map(([column, value]) => [
+            column,
+            value === undefined ? null : value,
+          ])
+        );
+        const row: FakeRow = { id: `log-${table.rows.size + 1}`, ...stored } as FakeRow;
+        table.rows.set(row.auditId, row);
+        return row;
+      });
+
+      const failed = await service.record(event({ actorId: 'user-that-did-not-exist' }));
+      foreignKeyHealthy = true;
+      const replayed = await service.record(event({ actorId: 'user-that-did-not-exist' }));
+
+      expect(failed.status).toBe('rejected');
+      expect(replayed.status).toBe('recorded');
+      // The stored row carries the SAME actor — the repair is a producer fix, never a
+      // rewrite of who acted.
+      expect(table.rows.get(event().auditId)?.userId).toBe('user-that-did-not-exist');
+    });
+  });
 });

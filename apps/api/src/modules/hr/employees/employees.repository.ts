@@ -47,6 +47,8 @@ export class EmployeeRepository {
       search?: string;
       organizationUnitId?: string;
       positionId?: string;
+      /** `true` = has a linked Core identity; `false` = no system account. */
+      linked?: boolean;
     },
     window: { skip: number; take: number }
   ) {
@@ -73,6 +75,8 @@ export class EmployeeRepository {
       ...(filter.search
         ? { employeeCode: { contains: filter.search, mode: 'insensitive' as const } }
         : {}),
+      ...(filter.linked === true ? { userId: { not: null } } : {}),
+      ...(filter.linked === false ? { userId: null } : {}),
     };
 
     return this.prisma.$transaction([
@@ -84,6 +88,51 @@ export class EmployeeRepository {
       }),
       this.prisma.employee.count({ where }),
     ]);
+  }
+
+  /**
+   * The counters of the personnel-directory dashboard, in ONE round trip (ui-redesign).
+   *
+   * `monthlyHires` is the last six calendar months of `createdAt`, returned oldest-first
+   * as `{ month: 'YYYY-MM', count }[]` — months with no hire are absent rather than
+   * zeroed, and the caller fills the gaps so the sparkline never invents a value the
+   * table cannot show.
+   */
+  async directorySummary(tenantId: string) {
+    const since90 = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000);
+    const sixMonthsAgo = new Date();
+    sixMonthsAgo.setDate(1);
+    sixMonthsAgo.setHours(0, 0, 0, 0);
+    sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 5);
+
+    const [total, active, linked, withoutOpenInterval, hiredLast90Days, monthly] =
+      await this.prisma.$transaction([
+        this.prisma.employee.count({ where: { tenantId } }),
+        this.prisma.employee.count({ where: { tenantId, status: 'ACTIVE' } }),
+        this.prisma.employee.count({ where: { tenantId, userId: { not: null } } }),
+        this.prisma.employee.count({
+          where: { tenantId, employmentRecords: { none: { tenantId, endDate: null } } },
+        }),
+        this.prisma.employee.count({ where: { tenantId, createdAt: { gte: since90 } } }),
+        this.prisma.$queryRaw<Array<{ month: string; count: bigint }>>`
+          SELECT to_char(date_trunc('month', "created_at"), 'YYYY-MM') AS month,
+                 count(*)::bigint AS count
+          FROM "Employee"
+          WHERE "tenant_id" = ${tenantId} AND "created_at" >= ${sixMonthsAgo}
+          GROUP BY 1
+          ORDER BY 1
+        `,
+      ]);
+
+    return {
+      total,
+      active,
+      linked,
+      unlinked: total - linked,
+      withoutOpenInterval,
+      hiredLast90Days,
+      monthlyHires: monthly.map((row) => ({ month: row.month, count: Number(row.count) })),
+    };
   }
 
   /** The whole employee row, or `null` — another tenant's employee is indistinguishable. */
@@ -125,6 +174,25 @@ export class EmployeeRepository {
       where: { tenantId, employeeCode },
       select: { id: true },
     });
+  }
+
+  /**
+   * Every code the tenant owns that starts with `prefix` — the read behind
+   * `GET /hr/employees/next-code`.
+   *
+   * Codes only, never rows: the generator asks «what sequences already exist under this
+   * prefix», and shipping ids or statuses with the answer would be data the caller has no
+   * use for. The prefix is applied verbatim by the database (a `startsWith` on the unique
+   * `(tenant_id, employee_code)` index's leading column), and `tenantId` is the FIRST
+   * predicate, as every read in this layer requires.
+   */
+  async listCodesWithPrefix(tenantId: string, prefix: string) {
+    const rows = await this.prisma.employee.findMany({
+      where: { tenantId, employeeCode: { startsWith: prefix } },
+      select: { employeeCode: true },
+    });
+
+    return rows.map((row) => row.employeeCode);
   }
 
   /** The same pre-check on update, excluding the row being edited. */

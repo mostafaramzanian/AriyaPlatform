@@ -181,6 +181,25 @@ export const HR_AUDIT_ACTION = {
  */
 export const HR_EMPLOYEE_CODE_PATTERN = /^[A-Z0-9][A-Z0-9._/-]{0,63}$/;
 
+/**
+ * The auto-generated code's shape — `EMP-<jalali-year>-<sequence>` — as declared by the
+ * «تولید‌خودکار» action on the create form (`GET /hr/employees/next-code`).
+ *
+ * The prefix and separator are literals of the contract, not styling: the sequence is
+ * zero-padded to this width so the codes of one year sort lexicographically in the same
+ * order they sort numerically, and so a generated code is recognisable as generated
+ * rather than hand-authored.
+ */
+export const HR_EMPLOYEE_CODE_PREFIX = 'EMP';
+export const HR_EMPLOYEE_CODE_SEQUENCE_PAD = 4;
+/**
+ * The FIRST sequence the generator hands out. A new tenant's first code is
+ * `EMP-<jy>-1000`, not `EMP-<jy>-0001`: the numbering reads as a personnel number
+ * rather than a row counter, and it leaves room below for codes an operator may
+ * assign by hand without colliding with the generator's own floor.
+ */
+export const HR_EMPLOYEE_CODE_SEQUENCE_START = 1000;
+
 /** Shortest employment interval that is treated as plausible, in calendar years. */
 export const HR_MIN_EMPLOYMENT_YEAR = 1900;
 

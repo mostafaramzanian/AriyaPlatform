@@ -201,6 +201,36 @@ export const NAV_TARGETS: readonly NavTarget[] = [
   { href: '/admin/commerce', permission: Permissions.COMMERCE_READ },
   { href: '/admin/commerce/tasks', permission: Permissions.COMMERCE_APPROVE },
   { href: '/admin/commerce/purchases', permission: Permissions.COMMERCE_READ },
+// SUPPLIER MASTER DATA: the directory register's own target — same read remit
+// as the register; the writes behind it need `commerce.supplier.manage`.
+{ href: '/admin/commerce/suppliers', permission: Permissions.COMMERCE_READ },
+  /*
+   * Production: the BOM register and its change-request queue — both reads gated
+   * on `production.bom.read`, the grant each view enforces. Detail, edit and
+   * create routes carry ids or are page-internal affordances, so like every
+   * register above they stay off the allowlist.
+   */
+  { href: '/admin/production', permission: Permissions.PRODUCTION_BOM_READ },
+  { href: '/admin/production/changes', permission: Permissions.PRODUCTION_BOM_READ },
+  /*
+   * Financial: the check-request register — `financial.check.read`, the grant
+   * `CheckRequestListView` answers to. `/new` and `/[id]` are affordance/detail
+   * routes and are deliberately absent, the same rule as the other registers.
+   */
+  { href: '/admin/financial/check-requests', permission: Permissions.FINANCIAL_CHECK_READ },
+  /*
+   * Phase W1 — INVENTORY UI: the inventory home and its registers — all gated on
+   * `inventory.read`, the grant every GET route under `/inventory/*` enforces.
+   * Detail routes (transfer/count ids) are page-internal affordances and stay off
+   * the allowlist, the same rule as every register above.
+   */
+  { href: '/admin/inventory', permission: Permissions.INVENTORY_READ },
+  { href: '/admin/inventory/warehouses', permission: Permissions.INVENTORY_READ },
+  { href: '/admin/inventory/items', permission: Permissions.INVENTORY_READ },
+  { href: '/admin/inventory/stock', permission: Permissions.INVENTORY_READ },
+  { href: '/admin/inventory/movements', permission: Permissions.INVENTORY_READ },
+  { href: '/admin/inventory/transfers', permission: Permissions.INVENTORY_READ },
+  { href: '/admin/inventory/counts', permission: Permissions.INVENTORY_READ },
   // Phase KPI-RUNTIME. The ONE row gated on a UNION rather than a single permission: the five
   // approved KPIs read from Production, Commerce and Financial alike, so any one of the three
   // read remits is enough — mirroring `CoreNavItem.anyOfPermissions` on the shell side. A

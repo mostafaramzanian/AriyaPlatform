@@ -358,6 +358,13 @@ export const Permissions = {
   COMMERCE_CONFIGURE: 'commerce.configure',
   COMMERCE_WORKFLOW_MANAGE: 'commerce.workflow.manage',
   COMMERCE_COMMERCIAL_MANAGE: 'commerce.commercial.manage',
+  // SEVENTH (supplier master data): create/update the supplier directory and read
+  // its SENSITIVE BANKING projection. Seeded by
+  // `20261017140100_seed_commerce_supplier_permission` (core_db), granted to
+  // SUPER_ADMIN and ADMIN. Deliberately NOT folded into
+  // `commerce.commercial.manage`: supplier banking details are ring-fenced by the
+  // business requirements, and the quotation/assignment remit must not carry them.
+  COMMERCE_SUPPLIER_MANAGE: 'commerce.supplier.manage',
 
   // Production (Phase PRODUCTION-BOM-HEADER)
   //
@@ -425,6 +432,22 @@ export const Permissions = {
   FINANCIAL_CHECK_READ: 'financial.check.read',
   FINANCIAL_CHECK_MANAGE: 'financial.check.manage',
   FINANCIAL_CHECK_APPROVE: 'financial.check.approve',
+
+  // Inventory (Phase W1 — WAREHOUSE / INVENTORY FOUNDATION)
+  //
+  //   inventory.read    — every register, balance, movement and report read;
+  //   inventory.manage  — warehouses, locations, items/units, receipts, issues,
+  //                       adjustments, reversals, transfers, count data-entry;
+  //   inventory.approve — posting a stock count's variances: the counter and
+  //                       the poster are not the same privilege, because a
+  //                       variance writes ledger rows with a balance effect.
+  //
+  // Domain is INVENTORY — added in its OWN companion Core migration before the
+  // grant seed (PostgreSQL 55P04 rule, the same reason every earlier domain got
+  // a standalone enum migration). Granted to SUPER_ADMIN and ADMIN only.
+  INVENTORY_READ: 'inventory.read',
+  INVENTORY_MANAGE: 'inventory.manage',
+  INVENTORY_APPROVE: 'inventory.approve',
   // Phase CHECK-ISSUATION: FOUR stage remits, added with the stages they gate. The
   // Preflight §17 candidate list proposed exactly these four (plus a separate executive
   // permission this phase deliberately does NOT create — see below), and each names a
@@ -544,6 +567,7 @@ export const PermissionToDomain = {
   [Permissions.COMMERCE_CONFIGURE]: 'COMMERCE',
   [Permissions.COMMERCE_WORKFLOW_MANAGE]: 'COMMERCE',
   [Permissions.COMMERCE_COMMERCIAL_MANAGE]: 'COMMERCE',
+  [Permissions.COMMERCE_SUPPLIER_MANAGE]: 'COMMERCE',
 
   [Permissions.PRODUCTION_BOM_READ]: 'PRODUCTION',
   [Permissions.PRODUCTION_BOM_MANAGE]: 'PRODUCTION',
@@ -658,9 +682,10 @@ export const PermissionsByDomain = {
   CUSTOMER: [Permissions.CUSTOMER_DASHBOARD, Permissions.CUSTOMER_PROFILE],
   SUPPORT: [Permissions.SUPPORT_TICKETS, Permissions.SUPPORT_DOWNLOADS],
   COMMERCE: [
-    // Procurement remits (Phase C1 §10): reading the purchase register, running it,
-    // deciding steps, authoring workflow configuration, and the commercial acts —
-    // six distinct strings under the ONE `COMMERCE` domain, exactly as HR's remits
+    // Procurement remits (Phase C1 §10 + the supplier-directory permission): reading
+    // the purchase register, running it, deciding steps, authoring workflow
+    // configuration, the commercial acts, and administering the supplier directory —
+    // seven distinct strings under the ONE `COMMERCE` domain, exactly as HR's remits
     // share the `HR` tag.
     Permissions.COMMERCE_READ,
     Permissions.COMMERCE_MANAGE,
@@ -668,6 +693,7 @@ export const PermissionsByDomain = {
     Permissions.COMMERCE_CONFIGURE,
     Permissions.COMMERCE_WORKFLOW_MANAGE,
     Permissions.COMMERCE_COMMERCIAL_MANAGE,
+    Permissions.COMMERCE_SUPPLIER_MANAGE,
   ],
   PRODUCTION: [
     // The BOM remits (Phase PRODUCTION-BOM-HEADER): reading the BOM register, authoring and

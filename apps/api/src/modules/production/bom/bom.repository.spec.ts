@@ -54,6 +54,12 @@ function build(updateCount = 1) {
     groupBy: jest.fn().mockResolvedValue([{ status: 'DRAFT', _count: { _all: 1 } }]),
     updateMany: jest.fn().mockResolvedValue({ count: updateCount }),
   };
+  const bomItem = {
+    count: jest.fn().mockResolvedValue(7),
+  };
+  const bomChangeRequest = {
+    count: jest.fn().mockResolvedValue(3),
+  };
   const auditOutbox = {
     create: jest.fn().mockResolvedValue({}),
   };
@@ -61,6 +67,8 @@ function build(updateCount = 1) {
   // with the transaction client that exposes the same delegates as `prisma`.
   const prisma = {
     bomHeader,
+    bomItem,
+    bomChangeRequest,
     auditOutbox,
     $transaction: jest.fn(
       async (fn: (tx: { bomHeader: typeof bomHeader; auditOutbox: typeof auditOutbox }) => Promise<unknown>) =>
@@ -68,8 +76,15 @@ function build(updateCount = 1) {
     ),
   } as unknown as ConstructorParameters<typeof BomHeaderRepository>[0];
 
-  return { repository: new BomHeaderRepository(prisma), bomHeader, auditOutbox };
+  return { repository: new BomHeaderRepository(prisma), bomHeader, bomItem, bomChangeRequest, auditOutbox };
 }
+
+/** The OR clause the omni search expands to — title AND both opaque ref columns. */
+const SEARCH_OR = [
+  { title: { contains: 'boiler' } },
+  { projectRef: { contains: 'boiler' } },
+  { productTreeRef: { contains: 'boiler' } },
+];
 
 describe('BomHeaderRepository.create', () => {
   it('stamps the acting tenant and lets the schema default the status', async () => {
@@ -150,7 +165,7 @@ describe('BomHeaderRepository.findById', () => {
       });
 
       expect(result).toEqual({ items: [ROW], total: 1 });
-      const where = { tenantId: 'tenant-a', status: 'SUBMITTED', title: { contains: 'boiler' } };
+      const where = { tenantId: 'tenant-a', status: 'SUBMITTED', OR: SEARCH_OR };
       expect(bomHeader.findMany).toHaveBeenCalledWith({
         where,
         orderBy: { updatedAt: 'desc' },
@@ -284,7 +299,7 @@ describe('BomHeaderRepository.listWithItemCount — the reporting page read', ()
     });
 
     expect(result).toEqual({ items: [ROW], total: 1 });
-    const where = { tenantId: 'tenant-a', status: 'SUBMITTED', title: { contains: 'boiler' } };
+    const where = { tenantId: 'tenant-a', status: 'SUBMITTED', OR: SEARCH_OR };
     // Identical to what `list` issues — one builder produces both (page and summary can
     // never disagree about which rows exist).
     expect(bomHeader.findMany).toHaveBeenCalledWith({
@@ -391,7 +406,7 @@ describe('BomHeaderRepository.countByStatus — the reporting summary aggregatio
 
     expect(bomHeader.groupBy).toHaveBeenCalledWith({
       by: ['status'],
-      where: { tenantId: 'tenant-a', status: 'DRAFT', title: { contains: 'boiler' } },
+      where: { tenantId: 'tenant-a', status: 'DRAFT', OR: SEARCH_OR },
       _count: { _all: true },
     });
     expect(counts.get('DRAFT')).toBe(3);
@@ -407,5 +422,59 @@ describe('BomHeaderRepository.countByStatus — the reporting summary aggregatio
     await repository.countByStatus('tenant-a', {});
 
     expect(bomHeader.groupBy.mock.calls[0][0].where).toEqual({ tenantId: 'tenant-a' });
+  });
+});
+
+describe('BomHeaderRepository.registerSummary — the register KPI aggregation', () => {
+  it('carries the tenant into EVERY aggregation, and counts items only under APPROVED headers', async () => {
+    const { repository, bomHeader, bomItem, bomChangeRequest } = build();
+    bomHeader.groupBy
+      .mockResolvedValueOnce([
+        { status: 'DRAFT', _count: { _all: 2 } },
+        { status: 'APPROVED', _count: { _all: 5 } },
+      ])
+      .mockResolvedValueOnce([{ projectRef: 'proj-a' }, { projectRef: 'proj-b' }])
+      .mockResolvedValueOnce([{ productTreeRef: 'tree-1' }]);
+
+    const summary = await repository.registerSummary('tenant-a');
+
+    expect(bomHeader.groupBy).toHaveBeenNthCalledWith(1, {
+      by: ['status'],
+      where: { tenantId: 'tenant-a' },
+      _count: { _all: true },
+    });
+    // An item is "active" only while its header is APPROVED — the lifecycle fact the
+    // schema states, not a guess.
+    expect(bomItem.count).toHaveBeenCalledWith({
+      where: { tenantId: 'tenant-a', bom: { status: 'APPROVED' } },
+    });
+    expect(bomHeader.groupBy).toHaveBeenNthCalledWith(2, {
+      by: ['projectRef'],
+      where: { tenantId: 'tenant-a' },
+      orderBy: { projectRef: 'asc' },
+    });
+    // Same distinct treatment for the tree ref — the form's WBS select and the register
+    // filter must never offer values the tenant does not actually store.
+    expect(bomHeader.groupBy).toHaveBeenNthCalledWith(3, {
+      by: ['productTreeRef'],
+      where: { tenantId: 'tenant-a' },
+      orderBy: { productTreeRef: 'asc' },
+    });
+    // In-flight = still inside the lifecycle; a decided change has left the strip's scope.
+    expect(bomChangeRequest.count).toHaveBeenCalledWith({
+      where: { tenantId: 'tenant-a', status: { in: ['DRAFT', 'SUBMITTED'] } },
+    });
+
+    expect(summary).toEqual({
+      total: 7,
+      statusCounts: new Map([
+        ['DRAFT', 2],
+        ['APPROVED', 5],
+      ]),
+      activeItems: 7,
+      inFlightChanges: 3,
+      projectRefs: ['proj-a', 'proj-b'],
+      productTreeRefs: ['tree-1'],
+    });
   });
 });

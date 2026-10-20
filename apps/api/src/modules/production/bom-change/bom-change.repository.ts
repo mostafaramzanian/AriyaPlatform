@@ -306,6 +306,62 @@ export class BomChangeRequestRepository {
   }
 
   /**
+   * Phase PRODUCTION-CHANGES-REDESIGN: the register summary — the bounded aggregations the
+   * redesigned `/admin/production/changes` KPI strip and status pills are built from.
+   *
+   * UNFILTERED ON PURPOSE. Unlike `countByStatus`, this read takes NO query — a KPI strip
+   * that shrank to whatever filters happened to be applied would lie about the register.
+   * Three statements, all tenant-scoped and bounded:
+   *   * one `groupBy` over the tenant's requests → per-status counts AND the total;
+   *   * `approvedLast30Days` — decided APPROVED rows whose `decidedAt` falls inside a
+   *     rolling 30-day window (`gte`), because «تصویب‌شده در ۳۰ روز اخیر» is a question
+   *     about the DECISION instant, not the registration;
+   *   * `rework` — rows the approver sent back: REJECTED, plus DRAFTs stamped
+   *     `NEEDS_CORRECTION` (a returned-for-correction request sits back in DRAFT, so a
+   *     status-only count would miss it — the opinion column is the other half of the
+   *     fact, exactly as the schema comment at `ManagerOpinion` states).
+   */
+  async registerSummary(tenantId: string): Promise<{
+    total: number;
+    statusCounts: Map<string, number>;
+    approvedLast30Days: number;
+    rework: number;
+  }> {
+    const [statusGroups, approvedLast30Days, rework] = await Promise.all([
+      this.prisma.bomChangeRequest.groupBy({
+        by: ['status'],
+        where: { tenantId },
+        _count: { _all: true },
+      }),
+      this.prisma.bomChangeRequest.count({
+        where: {
+          tenantId,
+          status: 'APPROVED',
+          decidedAt: { gte: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000) },
+        },
+      }),
+      this.prisma.bomChangeRequest.count({
+        where: {
+          tenantId,
+          OR: [
+            { status: 'REJECTED' },
+            { status: 'DRAFT', managerOpinion: 'NEEDS_CORRECTION' },
+          ],
+        },
+      }),
+    ]);
+
+    return {
+      total: statusGroups.reduce((sum, group) => sum + group._count._all, 0),
+      statusCounts: new Map(
+        statusGroups.map((group) => [group.status, group._count._all])
+      ),
+      approvedLast30Days,
+      rework,
+    };
+  }
+
+  /**
    * Applies a DRAFT-only patch and returns the updated row.
    *
    * The `status: 'DRAFT'` predicate travels WITH the write, so a request a concurrent act

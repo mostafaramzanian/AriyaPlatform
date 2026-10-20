@@ -61,6 +61,9 @@ const DOMAIN_MIGRATION = '20260926100000_add_commerce_permission_domain';
 const PERMISSIONS_MIGRATION = '20260926100100_seed_commerce_permission_grants';
 const MEMBERSHIP_MIGRATION = '20260926100200_seed_commerce_module_tenant_membership';
 const FEATURE_MIGRATION = '20260926100300_seed_commerce_purchase_feature_entitlement';
+// SUPPLIER MASTER DATA: the seventh `commerce.*` permission's own seed — the same
+// idempotent shape as the original seed, added later because the remit arrived later.
+const SUPPLIER_PERMISSION_MIGRATION = '20261017140100_seed_commerce_supplier_permission';
 const HR_MEMBERSHIP_MIGRATION = '20260921120300_seed_hr_module_tenant_membership';
 
 const COMMERCE_MIGRATIONS = [
@@ -68,17 +71,20 @@ const COMMERCE_MIGRATIONS = [
   PERMISSIONS_MIGRATION,
   MEMBERSHIP_MIGRATION,
   FEATURE_MIGRATION,
+  SUPPLIER_PERMISSION_MIGRATION,
 ];
 
-// The §10 list, verbatim from the authoritative specification — the names this suite
-// pins. This DECLARES the namespace; section D proves the catalogue, the maps, the
-// schema enum and the seed SQL all agree with it.
+// The §10 list plus the supplier-directory permission the requirements' module 7
+// (supplier master data) added — the names this suite pins. This DECLARES the
+// namespace; section D proves the catalogue, the maps, the schema enum and the
+// seed SQL all agree with it.
 const EXPECTED_NAMESPACE = [
   'commerce.approve',
   'commerce.commercial.manage',
   'commerce.configure',
   'commerce.manage',
   'commerce.read',
+  'commerce.supplier.manage',
   'commerce.workflow.manage',
 ];
 
@@ -104,7 +110,11 @@ const declaredNamespace = Object.values(Permissions)
   .filter((value) => value.startsWith('commerce.'))
   .sort();
 
-const permissionSql = readSql(PERMISSIONS_MIGRATION);
+// BOTH permission seeds together: the original six strings and the supplier
+// directory's seventh — D and J read the pair as the ONE catalogue SQL, so a
+// string seeded in one file and declared in the constants cannot drift.
+const permissionSql =
+  readSql(PERMISSIONS_MIGRATION) + '\n' + readSql(SUPPLIER_PERMISSION_MIGRATION);
 const membershipSql = readSql(MEMBERSHIP_MIGRATION);
 const featureSql = readSql(FEATURE_MIGRATION);
 
@@ -123,7 +133,7 @@ describe('C1 step J: permission & entitlement wiring (§14 A-J, gate G13)', () =
     );
   });
 
-  it('B. the four Core migrations exist under their pinned names and stay additive', () => {
+  it('B. the five Core migrations exist under their pinned names and stay additive', () => {
     for (const migration of COMMERCE_MIGRATIONS) {
       expect(existsSync(join(CORE_MIGRATIONS, migration, 'migration.sql'))).toBe(true);
       const sql = readSql(migration);
@@ -193,7 +203,7 @@ describe('C1 step J: permission & entitlement wiring (§14 A-J, gate G13)', () =
     expect(readSql(DOMAIN_MIGRATION)).toContain(
       `ALTER TYPE "PermissionDomain" ADD VALUE IF NOT EXISTS 'COMMERCE';`
     );
-    // The seed SQL holds the SAME six strings, checked in BOTH directions: every
+    // The seed SQL holds the SAME seven strings, checked in BOTH directions: every
     // declared name appears in the SQL, and every quoted commerce.* literal in the SQL
     // is a declared name — neither side can drift alone.
     for (const value of declaredNamespace) expect(permissionSql).toContain(`'${value}'`);
@@ -333,7 +343,7 @@ describe('C1 step J: permission & entitlement wiring (§14 A-J, gate G13)', () =
     expect(permissionStatements).not.toMatch(
       /ModuleRegistration|ModuleFeature|ModuleFeatureGrant|ModuleRegistrationTenant/
     );
-    expect(permissionSql.match(/^INSERT INTO "(?:Permission|RolePermission)"/gm)).toHaveLength(3);
+    expect(permissionSql.match(/^INSERT INTO "(?:Permission|RolePermission)"/gm)).toHaveLength(6);
     for (const migration of [MEMBERSHIP_MIGRATION, FEATURE_MIGRATION]) {
       const sql = readSql(migration);
       const entitlementStatements = (sql.match(/^INSERT INTO .*$/gm) ?? []).join('\n');

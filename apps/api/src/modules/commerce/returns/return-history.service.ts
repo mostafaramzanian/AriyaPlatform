@@ -7,8 +7,12 @@ import {
   type CommerceTransactionHandle,
 } from '../database/commerce-transaction';
 import { PaymentHistoryService } from '../payment/payment-history.service';
+import { InventoryIntegrationService } from '../integration/inventory-integration.service';
 import { addMoney, compareMoney, moneyFromNumber, sumMoney } from '../purchase/purchase-money';
-import { ReturnHistoryRepository } from './return-history.repository';
+import {
+  RefundCompensationClaimedError,
+  ReturnHistoryRepository,
+} from './return-history.repository';
 import { CreateReturnDto, RefundReturnDto, ReturnDecisionDto } from './return.dto';
 import {
   canTransition,
@@ -240,7 +244,8 @@ export class ReturnHistoryService {
     private readonly repository: ReturnHistoryRepository,
     private readonly audit: CommerceAuditGateway,
     private readonly unitOfWork: CommerceUnitOfWork,
-    private readonly payments: PaymentHistoryService
+    private readonly payments: PaymentHistoryService,
+    private readonly inventoryIntegration: InventoryIntegrationService
   ) {}
 
   /**
@@ -424,7 +429,18 @@ export class ReturnHistoryService {
     command: string,
     reason: string | null,
     action: string,
-    beforeAppend?: (tx: CommerceTransactionHandle) => Promise<void>
+    beforeAppend?: (tx: CommerceTransactionHandle) => Promise<void>,
+    // PHASE W3.1/W4-B: the `REFUNDED` row's settlement links — a MUTABLE
+    // holder, because `compensationPaymentId` is only known after `beforeAppend`
+    // runs Q's compensate inside the unit of work: the transition append reads
+    // the holder at write time. `paymentId` is the original payment funded;
+    // `compensationPaymentId` the actual refund row appended.
+    refundLink?: { paymentId: string; compensationPaymentId?: string | null },
+    afterCommit?: (outcome: {
+      ret: ReturnDocumentBearing;
+      transition: TransitionBearing;
+      previous: ReturnState;
+    }) => Promise<void>
   ) {
     const outcome = await this.unitOfWork.run(async (tx) => {
       // 1. The document, LOCKED — the same gate as create (§9): this is what
@@ -473,21 +489,44 @@ export class ReturnHistoryService {
 
       // 5. ONE immutable row: the transition itself (S-D2). No document
       //    column changes; nothing else in the database learns about it.
-      // The outbox row commits atomically with the transition.
-      const transition = await this.repository.appendTransition(
-        actor.tenantId,
-        tx,
-        {
-          returnDocumentId: ret.id,
-          state: target,
-          actorUserId: actor.userId,
-          reason,
-        },
-        outbox
-      );
+      // The outbox row commits atomically with the transition. PHASE W3.1:
+      // `refundedPaymentId` rides ONLY the REFUNDED row — the persisted link
+      // between this resolved return and the payment its refund settled.
+      const transition = await this.repository
+        .appendTransition(
+          actor.tenantId,
+          tx,
+          {
+            returnDocumentId: ret.id,
+            state: target,
+            actorUserId: actor.userId,
+            reason,
+            refundedPaymentId: target === 'REFUNDED' ? (refundLink?.paymentId ?? null) : null,
+            refundCompensationPaymentId:
+              target === 'REFUNDED' ? (refundLink?.compensationPaymentId ?? null) : null,
+          },
+          outbox
+        )
+        .catch((error: unknown) => {
+          // W4-D: the refund-link partial unique — one compensation settles
+          // one return; a raced double-claim is a domain 409 whose rollback
+          // removes the compensation row with it.
+          if (error instanceof RefundCompensationClaimedError) {
+            throw new ConflictException({
+              code: RETURN_FAILURE.REFUND_COMPENSATION_FAILED,
+              message: 'the refund compensation is already claimed by another transition',
+            });
+          }
+          throw error;
+        });
 
       return { ret, transition, previous: current };
     });
+
+    // 6. The command's post-commit effect — only RECEIVED_BACK passes one
+    //    (the durable inventory dispatch postings of its lines), and its
+    //    refusals land on the posting rows, never on this transition.
+    if (afterCommit) await afterCommit(outcome);
 
     // 7. The document view AFTER the appended row — the same
     //    201-with-the-stored-row precedent as Q's compensate: `state` is the
@@ -555,6 +594,13 @@ export class ReturnHistoryService {
    * nothing and accept nothing.
    */
   async receiveBack(actor: CommerceActor, documentId: string, returnId: string) {
+    // Phase W2-B: physical handover is the point stock LEAVES the inventory
+    // ledger — not request, not approval, not refund. The dispatch postings
+    // are planned INSIDE the transition's unit of work (each return line
+    // inherits the cell and item its origin receipt posting recorded) and
+    // attempted after the commit; a refusal is a FAILED posting row, not a
+    // rolled-back transition.
+    let plannedPostingIds: string[] = [];
     return this.runTransition(
       actor,
       documentId,
@@ -562,7 +608,23 @@ export class ReturnHistoryService {
       'RECEIVED_BACK',
       'received back',
       null,
-      RETURN_AUDIT_ACTION.RECEIVE_BACK
+      RETURN_AUDIT_ACTION.RECEIVE_BACK,
+      async (tx) => {
+        const ret = await this.repository.findReturnDocument(
+          actor.tenantId,
+          documentId,
+          returnId,
+          tx
+        );
+        plannedPostingIds = ret
+          ? await this.inventoryIntegration.planReturnDispatchPostings(tx, actor.tenantId, ret.lines)
+          : [];
+      },
+      undefined,
+      async () => {
+        await this.inventoryIntegration.attemptPostings(actor, plannedPostingIds);
+        plannedPostingIds = [];
+      }
     );
   }
 
@@ -597,6 +659,13 @@ export class ReturnHistoryService {
    * assumed).
    */
   async refund(actor: CommerceActor, documentId: string, returnId: string, dto: RefundReturnDto) {
+    // W4-B: the compensation's OWN row id — captured inside the unit of work
+    // so the REFUNDED transition can name the actual refund ledger row, not
+    // just the original payment it reversed.
+    const refundLink: { paymentId: string; compensationPaymentId?: string | null } = {
+      paymentId: dto.paymentId,
+      compensationPaymentId: null,
+    };
     return this.runTransition(
       actor,
       documentId,
@@ -607,13 +676,17 @@ export class ReturnHistoryService {
       RETURN_AUDIT_ACTION.REFUND,
       async (tx) => {
         try {
-          await this.payments.compensate(
+          const compensation = await this.payments.compensate(
             actor,
             documentId,
             dto.paymentId,
-            { ...(dto.reason ? { reason: dto.reason } : {}) },
+            {
+              ...(dto.amount !== undefined ? { amount: dto.amount } : {}),
+              ...(dto.reason ? { reason: dto.reason } : {}),
+            },
             tx
           );
+          refundLink.compensationPaymentId = compensation.id;
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
           throw new ConflictException({
@@ -621,7 +694,10 @@ export class ReturnHistoryService {
             message: `Refund compensation failed: ${message}`,
           });
         }
-      }
+      },
+      // PHASE W3.1/W4-B: the payment funded AND the compensation row appended —
+      // the precise refund links the closure evaluator reads.
+      refundLink
     );
   }
 }

@@ -132,6 +132,14 @@ enum HrRecordStatus {
   INACTIVE
 }
 
+/// The organizational role of a unit: OPERATIONAL units run the line work
+/// (عملیاتی), STAFF units are advisory/supporting (ستادی). Shown as the chart
+/// legend; it has no authorization effect.
+enum OrganizationUnitKind {
+  OPERATIONAL
+  STAFF
+}
+
 // ===========================================================================
 // ORGANIZATION UNIT — HR owns the organisation hierarchy (§11)
 // ===========================================================================
@@ -171,6 +179,21 @@ model OrganizationUnit {
   name      String         @db.VarChar(200)
   parentId  String?        @map("parent_id") @db.Uuid
   status    HrRecordStatus @default(ACTIVE)
+  /// Chart-profile fields the org-chart screen renders. All optional: a unit is
+  /// still a valid row with only code/name/parent — the card shows «—» for an
+  /// unset profile rather than refusing to draw.
+  kind          OrganizationUnitKind @default(OPERATIONAL)
+  /// Free-text supervisor label (سرپرست دپارتمان). NOT an Employee reference:
+  /// the screen only displays it and an FK would forbid naming a person who has
+  /// no HR record yet.
+  managerName   String?              @map("manager_name") @db.VarChar(200)
+  /// Physical location label (موقعیت فیزیکی/استقرار), e.g. «برج نگین، طبقه ۸».
+  location      String?              @map("location") @db.VarChar(200)
+  /// Monthly budget ceiling in whole tomans (سقف بودجه ماهانه). Decimal(20,0)
+  /// because تومان figures exceed int4; NULL means "no ceiling recorded".
+  monthlyBudget Decimal?             @map("monthly_budget") @db.Decimal(20, 0)
+  /// One-line remit (مسئولیت اصلی) the detail card renders as a note.
+  responsibility String?             @map("responsibility") @db.VarChar(500)
   createdAt DateTime       @default(now()) @map("created_at") @db.Timestamptz(6)
   updatedAt DateTime       @updatedAt @map("updated_at") @db.Timestamptz(6)
 

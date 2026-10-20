@@ -98,10 +98,17 @@ function build() {
   type DocumentMocks = {
     findDocumentById: jest.Mock;
     writeCompletedIn: jest.Mock;
+    lockDocumentIn: jest.Mock;
+    readDocumentStatusIn: jest.Mock;
   };
   const documents: DocumentMocks = {
     findDocumentById: jest.fn(),
     writeCompletedIn: jest.fn(),
+    lockDocumentIn: jest.fn().mockResolvedValue({ id: 'd1' }),
+    // The row the close transaction's lock froze: APPROVED, total stated.
+    readDocumentStatusIn: jest
+      .fn()
+      .mockResolvedValue({ id: 'd1', status: 'APPROVED', totalAmount: '100.0000' }),
   };
   const policies: { findPublished: jest.Mock } = {
     findPublished: jest.fn(),
@@ -122,6 +129,31 @@ function build() {
       work({} as CommerceTransactionHandle)
     ),
   };
+  // W2-C: the integration gate — no unresolved postings by default; a test
+  // overrides this to exercise the INTEGRATION_UNRESOLVED refusal.
+  const postings: { listUnresolvedForLines: jest.Mock } = {
+    listUnresolvedForLines: jest.fn().mockResolvedValue([]),
+  };
+  // PHASE W3 (confirmed closure rule): the fact readers the eligibility
+  // evaluator consumes — all under the document lock inside the close tx.
+  // DEFAULTS: one line ordered 10, fully received 10; no returns; paid sum
+  // equals the stated total (PAID); no plans.
+  const receiving: { listLines: jest.Mock; listByDocument: jest.Mock } = {
+    listLines: jest
+      .fn()
+      .mockResolvedValue([{ id: 'line-1', lineNumber: 1, quantity: '10.0000' }]),
+    listByDocument: jest.fn().mockResolvedValue([
+      { id: 'r1', lines: [{ id: 'rl1', purchaseLineId: 'line-1', quantity: '10.0000', reversesReceiptLineId: null }] },
+    ]),
+  };
+  const returns: { listReturnDocuments: jest.Mock } = {
+    listReturnDocuments: jest.fn().mockResolvedValue([]),
+  };
+  const plans: { sumPayments: jest.Mock; listPlans: jest.Mock; listPayments: jest.Mock } = {
+    sumPayments: jest.fn().mockResolvedValue('100.0000'),
+    listPlans: jest.fn().mockResolvedValue([]),
+    listPayments: jest.fn().mockResolvedValue([]),
+  };
 
   // DEFAULTS: a document that exists and is APPROVED, a policy that allows exactly that,
   // a write that succeeded (and therefore answers the row as it now stands — the
@@ -132,12 +164,19 @@ function build() {
   policies.findPublished.mockResolvedValue(publishedPolicy());
   purchases.getOne.mockResolvedValue({ id: 'd1', status: 'CLOSED' });
 
+  const notification = { notifyUsers: jest.fn().mockResolvedValue(undefined) };
+
   const service = new PurchaseCompletionService(
     documents as unknown as PurchaseRepository,
     policies as unknown as PurchaseCompletionPolicyRepository,
     purchases as unknown as PurchaseService,
     audit as unknown as CommerceAuditGateway,
-    unitOfWork as unknown as CommerceUnitOfWork
+    unitOfWork as unknown as CommerceUnitOfWork,
+    notification as never,
+    postings as never,
+    receiving as never,
+    returns as never,
+    plans as never
   );
 
   return {
@@ -147,6 +186,11 @@ function build() {
     purchases,
     audit,
     unitOfWork,
+    postings,
+    receiving,
+    returns,
+    plans,
+    notification,
     calls: {
       findDocumentById: documents.findDocumentById.mock.calls,
       writeCompletedIn: documents.writeCompletedIn.mock.calls,
@@ -253,6 +297,30 @@ describe('Phase C4-R GAP-3 — PurchaseCompletionService.close: the refusals', (
     expect(calls.audit).toEqual([]);
   });
 
+  it('refuses while inventory postings are unresolved — INTEGRATION_UNRESOLVED, no write, no trail (W2-C)', async () => {
+    const { service, documents, postings, calls } = build();
+    documents.findDocumentById.mockResolvedValue(
+      storedDocument({ lines: [{ id: 'line-1' }] as never })
+    );
+    postings.listUnresolvedForLines.mockResolvedValue([
+      { id: 'p1', kind: 'RECEIPT', status: 'FAILED', purchaseLineId: 'line-1', lastError: 'unknown SKU' },
+    ]);
+
+    expect(await codeOf(service.close(actor, 'd1'))).toBe(
+      PURCHASE_COMPLETION_FAILURE.INTEGRATION_UNRESOLVED
+    );
+
+    // Read under the lock, inside the close transaction, on the locked line set.
+    expect(postings.listUnresolvedForLines).toHaveBeenCalledWith(
+      't1',
+      ['line-1'],
+      expect.anything()
+    );
+    expect(calls.writeCompletedIn).toEqual([]);
+    expect(calls.audit).toEqual([]);
+    expect(calls.getOne).toEqual([]);
+  });
+
   it('refuses when the conditional write loses the race, and records NOTHING', async () => {
     const { service, documents, calls } = build();
     documents.writeCompletedIn.mockResolvedValue(null);
@@ -356,10 +424,10 @@ describe('Phase C4-R GAP-3 — PurchaseCompletionService.close: a permitted comp
     expect(calls.getOne).toEqual([[other, 'd1']]);
   });
 
-  it('performs exactly four decisions — document, policy, write, projection — in that order', async () => {
-    // The service's whole dependency surface is the two repositories plus the projection:
-    // nothing else exists to consult, which is how "payment, receiving, workflow and
-    // return state are read nowhere in completion" is a MEASURED fact rather than a claim.
+  it('orders its phases — document, policy, then facts UNDER THE LOCK, then write — in that order', async () => {
+    // PHASE W3 changed the middle: between "policy" and "write" the service now
+    // locks the row and reads the eligibility facts inside the transaction. The
+    // order below is the measured contract: nothing is evaluated before the lock.
     const traced = build();
     const order: string[] = [];
     traced.documents.findDocumentById.mockImplementation(async () => {
@@ -369,6 +437,16 @@ describe('Phase C4-R GAP-3 — PurchaseCompletionService.close: a permitted comp
     traced.policies.findPublished.mockImplementation(async () => {
       order.push('policy');
       return publishedPolicy();
+    });
+    traced.documents.lockDocumentIn.mockImplementation(async () => {
+      order.push('lock');
+      return { id: 'd1' };
+    });
+    traced.receiving.listByDocument.mockImplementation(async () => {
+      order.push('facts');
+      return [
+        { id: 'r1', lines: [{ id: 'rl1', purchaseLineId: 'line-1', quantity: '10.0000', reversesReceiptLineId: null }] },
+      ];
     });
     traced.documents.writeCompletedIn.mockImplementation(async () => {
       order.push('write');
@@ -381,6 +459,120 @@ describe('Phase C4-R GAP-3 — PurchaseCompletionService.close: a permitted comp
 
     await traced.service.close(actor, 'd1');
 
-    expect(order).toEqual(['document', 'policy', 'write', 'projection']);
+    expect(order).toEqual(['document', 'policy', 'lock', 'facts', 'write', 'projection']);
+  });
+});
+
+describe('Phase W3 — the confirmed closure rule (fulfilment AND settlement)', () => {
+  it('refuses when a line is not fully received — FULFILLMENT_INCOMPLETE with the line named', async () => {
+    const { service, receiving, calls } = build();
+    // 6 of 10 net received — PARTIALLY_RECEIVED, never a sliver of tolerance.
+    receiving.listByDocument.mockResolvedValue([
+      { id: 'r1', lines: [{ id: 'rl1', purchaseLineId: 'line-1', quantity: '6.0000', reversesReceiptLineId: null }] },
+    ]);
+
+    const refusal = await service.close(actor, 'd1').then(
+      () => null,
+      (error: ConflictException) => error.getResponse() as { code: string; reasons: unknown[] }
+    );
+
+    expect(refusal?.code).toBe('PURCHASE_FULFILLMENT_INCOMPLETE');
+    expect(refusal?.reasons).toHaveLength(1);
+    expect(calls.writeCompletedIn).toEqual([]);
+    expect(calls.auditOutbox).toHaveLength(1); // built but never committed — the tx refused
+    expect(calls.getOne).toEqual([]);
+  });
+
+  it('does not count a compensated receipt toward fulfilment', async () => {
+    const { service, receiving, calls } = build();
+    // +10 received, −10 compensated: the append-only history nets to zero.
+    receiving.listByDocument.mockResolvedValue([
+      {
+        id: 'r1',
+        lines: [
+          { id: 'rl1', purchaseLineId: 'line-1', quantity: '10.0000', reversesReceiptLineId: null },
+          { id: 'rl2', purchaseLineId: 'line-1', quantity: '-10.0000', reversesReceiptLineId: 'rl1' },
+        ],
+      },
+    ]);
+
+    expect(await codeOf(service.close(actor, 'd1'))).toBe('PURCHASE_FULFILLMENT_INCOMPLETE');
+    expect(calls.writeCompletedIn).toEqual([]);
+  });
+
+  it('refuses complete fulfilment with an outstanding payment — SETTLEMENT_INCOMPLETE', async () => {
+    const { service, plans, calls } = build();
+    plans.sumPayments.mockResolvedValue('40.0000'); // PARTIAL against 100.0000
+
+    expect(await codeOf(service.close(actor, 'd1'))).toBe(
+      'PURCHASE_PAYMENT_SETTLEMENT_INCOMPLETE'
+    );
+    expect(calls.writeCompletedIn).toEqual([]);
+  });
+
+  it('refuses an OVERPAID document as PAYMENT_INCONSISTENT, not success', async () => {
+    const { service, plans, calls } = build();
+    plans.sumPayments.mockResolvedValue('150.0000');
+
+    expect(await codeOf(service.close(actor, 'd1'))).toBe('PURCHASE_PAYMENT_INCONSISTENT');
+    expect(calls.writeCompletedIn).toEqual([]);
+  });
+
+  it('refuses an unresolved return even with fulfilment and payment complete', async () => {
+    const { service, returns, calls } = build();
+    returns.listReturnDocuments.mockResolvedValue([
+      { id: 'ret-1', transitions: [{ state: 'REQUESTED', createdAt: new Date() }] },
+    ]);
+
+    expect(await codeOf(service.close(actor, 'd1'))).toBe('PURCHASE_RETURN_UNRESOLVED');
+    expect(calls.writeCompletedIn).toEqual([]);
+  });
+
+  it('treats a terminal return as resolved — REFUNDED does not block', async () => {
+    const { service, returns } = build();
+    returns.listReturnDocuments.mockResolvedValue([
+      {
+        id: 'ret-1',
+        transitions: [
+          { state: 'REQUESTED', createdAt: new Date('2026-01-01') },
+          { state: 'APPROVED', createdAt: new Date('2026-01-02') },
+          { state: 'RECEIVED_BACK', createdAt: new Date('2026-01-03') },
+          { state: 'REFUNDED', createdAt: new Date('2026-01-04') },
+        ],
+      },
+    ]);
+
+    await expect(service.close(actor, 'd1')).resolves.toEqual({ id: 'd1', status: 'CLOSED' });
+  });
+
+  it('refuses open APPROVED-plan installments beside a PAID sum — PAYMENT_INCONSISTENT', async () => {
+    const { service, plans, calls } = build();
+    plans.listPlans.mockResolvedValue([
+      {
+        id: 'plan-1',
+        status: 'APPROVED',
+        installments: [
+          { seq: 1, amount: '60.0000', status: 'PENDING', executedPaymentId: null },
+          { seq: 2, amount: '40.0000', status: 'APPROVED', executedPaymentId: 'pay-2' },
+        ],
+      },
+    ]);
+
+    expect(await codeOf(service.close(actor, 'd1'))).toBe('PURCHASE_PAYMENT_INCONSISTENT');
+    expect(calls.writeCompletedIn).toEqual([]);
+  });
+
+  it('re-reads status under the lock — a document closed mid-race answers ALREADY_COMPLETED', async () => {
+    const { service, documents, calls } = build();
+    documents.readDocumentStatusIn.mockResolvedValue({
+      id: 'd1',
+      status: 'CLOSED',
+      totalAmount: '100.0000',
+    });
+
+    expect(await codeOf(service.close(actor, 'd1'))).toBe(
+      PURCHASE_COMPLETION_FAILURE.DOCUMENT_ALREADY_COMPLETED
+    );
+    expect(calls.writeCompletedIn).toEqual([]);
   });
 });

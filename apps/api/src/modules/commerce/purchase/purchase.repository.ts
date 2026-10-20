@@ -90,12 +90,14 @@ export interface PurchaseDocumentScalars {
   requesterId?: string;
   supplierId?: string | null;
   currency?: string | null;
+  costCenter?: string | null;
 }
 
 /** The filter one list read applies, always inside the acting tenant. */
 export interface PurchaseDocumentFilter {
   status?: PurchaseDocumentStatus;
   requesterId?: string;
+  costCenter?: string;
   search?: string;
   /**
    * Phase KPI-RUNTIME: half-open instant windows on `createdAt` and `completedAt` — ISO 8601
@@ -107,6 +109,18 @@ export interface PurchaseDocumentFilter {
   createdTo?: string;
   completedFrom?: string;
   completedTo?: string;
+}
+
+/** The task-card document projection `findDocumentSummariesByIds` returns per id. */
+export interface PurchaseDocumentSummaryRow {
+  id: string;
+  documentNumber: string;
+  status: PurchaseDocumentStatus;
+  requesterId: string;
+  costCenter: string | null;
+  totalAmount: unknown;
+  currency: string | null;
+  createdAt: Date;
 }
 
 @Injectable()
@@ -142,6 +156,7 @@ export class PurchaseRepository {
     return {
       ...(filter.status ? { status: filter.status } : {}),
       ...(filter.requesterId ? { requesterId: filter.requesterId } : {}),
+      ...(filter.costCenter ? { costCenter: filter.costCenter } : {}),
       ...(filter.search
         ? { documentNumber: { contains: filter.search, mode: 'insensitive' as const } }
         : {}),
@@ -223,6 +238,38 @@ export class PurchaseRepository {
   }
 
   /**
+   * The spend window the home summary aggregates: every document the tenant created
+   * at or after `since`, projected to the THREE columns the bucketing needs. A
+   * bounded projection (not the whole row, not the lines) because the sum is the
+   * question and the document content is not. CANCELLED rows are still returned —
+   * excluding them is a lifecycle decision that belongs to the service, not to the
+   * statement that reads the table.
+   */
+  async findSpendSince(tenantId: string, since: Date) {
+    return this.prisma.purchaseDocument.findMany({
+      where: { tenantId, createdAt: { gte: since } },
+      select: { createdAt: true, totalAmount: true, status: true },
+      orderBy: { createdAt: 'asc' },
+    });
+  }
+
+  /**
+   * The DISTINCT cost-center values this tenant actually stores — the register's
+   * «واحد سازمانی» filter options. `groupBy` keeps the read a projection (no rows
+   * materialised), nulls are excluded because a filter can only name a real value.
+   */
+  async findCostCenters(tenantId: string): Promise<string[]> {
+    const rows = await this.prisma.purchaseDocument.groupBy({
+      by: ['costCenter'],
+      where: { tenantId, costCenter: { not: null } },
+    });
+    return rows
+      .map((row) => row.costCenter)
+      .filter((value): value is string => value !== null)
+      .sort();
+  }
+
+  /**
    * One document plus its lines, or `null` for an id this tenant does not hold.
    *
    * The optional handle is step P's: every commercial act runs INSIDE a unit of work
@@ -236,6 +283,87 @@ export class PurchaseRepository {
     return client.purchaseDocument.findFirst({
       where: { id, tenantId },
       include: PurchaseRepository.DOCUMENT_LABEL,
+    });
+  }
+
+  /**
+   * PHASE W2-C (pending-aging report): the tenant's IN-CIRCULATION documents —
+   * the three non-terminal statuses a purchase can still act in (`DRAFT`,
+   * `SUBMITTED`, `APPROVED`) — as the light projection aging needs, oldest
+   * state-entry first. `REJECTED`, `CANCELLED` and `CLOSED` are terminal and
+   * cannot be "pending", so they never appear.
+   *
+   * `statusChangedAt` is the authoritative state-entry instant, written by the
+   * same conditional statement that moved the status; `createdAt` rides along
+   * as the fallback for rows predating the column. No `total` is aggregated
+   * here — the report's bucket strip is computed by the reader over this SAME
+   * list, so the page and the strip can never describe different moments.
+   */
+  async listPendingForAging(tenantId: string) {
+    return this.prisma.purchaseDocument.findMany({
+      where: { tenantId, status: { in: ['DRAFT', 'SUBMITTED', 'APPROVED'] } },
+      orderBy: [
+        { statusChangedAt: 'asc' },
+        { createdAt: 'asc' },
+        { id: 'asc' },
+      ],
+      select: {
+        id: true,
+        documentNumber: true,
+        status: true,
+        statusChangedAt: true,
+        createdAt: true,
+        totalAmount: true,
+        currency: true,
+      },
+    });
+  }
+
+  /**
+   * PHASE W2-C (cost report): the tenant's cost-bearing documents — every row
+   * whose `costCenter` is stated — projected to the exact columns the
+   * aggregation needs, plus each row's append-only payment amounts. No summing
+   * happens here: committed vs paid is a READER-side distinction (a CANCELLED
+   * row's `totalAmount` is not a commitment, but its net payments still are —
+   * money that moved does not un-move because the document was cancelled).
+   */
+  async listCostBasis(tenantId: string) {
+    return this.prisma.purchaseDocument.findMany({
+      where: { tenantId, costCenter: { not: null } },
+      orderBy: [{ costCenter: 'asc' }, { id: 'asc' }],
+      select: {
+        id: true,
+        costCenter: true,
+        currency: true,
+        status: true,
+        totalAmount: true,
+        payments: { select: { amount: true } },
+      },
+    });
+  }
+
+  /**
+   * PHASE W2-C: resolves the OPAQUE order reference the Financial check-request
+   * carries — the row id OR the issued `documentNumber` — to this tenant's
+   * document, or `null` when the reference names no document this tenant holds.
+   * A reference another tenant owns returns `null` identically: the caller can
+   * never tell "no such order" from "someone else's order", so cross-tenant
+   * probing leaks nothing.
+   *
+   * The id branch is uuid-gated because `id` is `@db.Uuid`: handing Prisma a
+   * non-uuid string would be a driver error, not a clean miss. The
+   * `documentNumber` branch is the TEXT equality the numbering strategy owns.
+   */
+  async findOrderReference(tenantId: string, reference: string) {
+    const trimmed = reference.trim();
+    if (trimmed.length === 0) return null;
+    const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(trimmed);
+    return this.prisma.purchaseDocument.findFirst({
+      where: {
+        tenantId,
+        ...(isUuid ? { id: trimmed } : { documentNumber: trimmed }),
+      },
+      select: { id: true, documentNumber: true, status: true, kind: true },
     });
   }
 
@@ -283,6 +411,33 @@ export class PurchaseRepository {
       select: { id: true, documentNumber: true },
     });
     return new Map(rows.map((row) => [row.id, row.documentNumber]));
+  }
+
+  /**
+   * The inbox task-card projection: the display columns the pending-decisions
+   * read renders per document — number, lifecycle, requester id, cost center,
+   * total and the document's own registration instant — in ONE tenant-scoped
+   * statement, never one per task row (the same N+1 rule as the number lookup
+   * above). Money crosses as the stored Decimal; rendering is the client's.
+   */
+  async findDocumentSummariesByIds(tenantId: string, documentIds: readonly string[]) {
+    const unique = [...new Set(documentIds)];
+    if (unique.length === 0) return new Map<string, PurchaseDocumentSummaryRow>();
+
+    const rows = await this.prisma.purchaseDocument.findMany({
+      where: { tenantId, id: { in: unique } },
+      select: {
+        id: true,
+        documentNumber: true,
+        status: true,
+        requesterId: true,
+        costCenter: true,
+        totalAmount: true,
+        currency: true,
+        createdAt: true,
+      },
+    });
+    return new Map(rows.map((row) => [row.id, row as PurchaseDocumentSummaryRow]));
   }
 
   /**
@@ -359,8 +514,11 @@ export class PurchaseRepository {
       requesterId: string;
       supplierId?: string | null;
       currency?: string | null;
+      costCenter?: string | null;
       totals: PurchaseDocumentTotals;
       lines: PurchaseLineWrite[];
+      /** PHASE W3: the acting session's user for the creation status event. */
+      actorUserId?: string | null;
     },
     now: Date = new Date()
   ) {
@@ -375,13 +533,24 @@ export class PurchaseRepository {
           requesterId: data.requesterId,
           supplierId: data.supplierId ?? null,
           currency: data.currency ?? null,
+          costCenter: data.costCenter ?? null,
           subtotalAmount: data.totals.subtotalAmount,
           taxAmount: data.totals.taxAmount,
           totalAmount: data.totals.totalAmount,
+          // W2-C: DRAFT was entered NOW — the aging clock starts at creation.
+          statusChangedAt: now,
         },
       });
 
       await PurchaseRepository.writeLines(tx, tenantId, created.id, data.lines);
+      // PHASE W3: the document's first status event — entry into DRAFT, with no
+      // `fromStatus` (the one row per document where it is NULL by contract).
+      await PurchaseRepository.writeStatusEvent(tx, tenantId, created.id, {
+        fromStatus: null,
+        toStatus: 'DRAFT',
+        actorUserId: data.actorUserId ?? null,
+        occurredAt: now,
+      });
       return PurchaseRepository.readDocument(tx, tenantId, created.id);
     });
   }
@@ -417,6 +586,9 @@ export class PurchaseRepository {
             : {}),
           ...(edit.scalars.supplierId !== undefined ? { supplierId: edit.scalars.supplierId } : {}),
           ...(edit.scalars.currency !== undefined ? { currency: edit.scalars.currency } : {}),
+          ...(edit.scalars.costCenter !== undefined
+            ? { costCenter: edit.scalars.costCenter }
+            : {}),
           ...(edit.totals
             ? {
                 subtotalAmount: edit.totals.subtotalAmount,
@@ -453,8 +625,10 @@ export class PurchaseRepository {
    * workflow's hands — and the caller answers 409 rather than reporting a success it did
    * not cause.
    */
-  async markDocumentSubmitted(tenantId: string, id: string) {
-    return this.prisma.$transaction((tx) => PurchaseRepository.writeSubmitted(tx, tenantId, id));
+  async markDocumentSubmitted(tenantId: string, id: string, actorUserId: string | null) {
+    return this.prisma.$transaction((tx) =>
+      PurchaseRepository.writeSubmitted(tx, tenantId, id, actorUserId)
+    );
   }
 
   /**
@@ -484,10 +658,11 @@ export class PurchaseRepository {
     tenantId: string,
     handle: CommerceTransactionHandle,
     id: string,
+    actorUserId: string | null,
     outbox?: CommerceAuditOutboxPayload
   ) {
     const tx = unwrapCommerceTransaction(handle);
-    const result = await PurchaseRepository.writeSubmitted(tx, tenantId, id);
+    const result = await PurchaseRepository.writeSubmitted(tx, tenantId, id, actorUserId);
     if (result && outbox) {
       await tx.auditOutbox.create({ data: outbox });
     }
@@ -544,6 +719,56 @@ export class PurchaseRepository {
   }
 
   /**
+   * PHASE W3: the document's append-only status-event history, oldest first
+   * with the deterministic `id` tie-break the index is built for. READ-ONLY —
+   * events are written only by `writeStatusEvent` inside the writers above.
+   */
+  async listStatusEvents(tenantId: string, purchaseDocumentId: string) {
+    return this.prisma.purchaseStatusEvent.findMany({
+      where: { tenantId, purchaseDocumentId },
+      orderBy: [{ occurredAt: 'asc' as const }, { id: 'asc' as const }],
+    });
+  }
+
+  /**
+   * PHASE W3: the document row lock for the completion act — `SELECT … FOR
+   * UPDATE` inside the caller's unit of work, the same mechanism
+   * `lockDocumentForReceipt`/`lockDocumentForReturn` already use. Receipt,
+   * return and close writers all serialise on THIS row, and the `FOR KEY
+   * SHARE` every `PaymentRecord`/`PaymentInstallment` insert takes on it
+   * conflicts with `FOR UPDATE`, so payment writers serialise too — under
+   * this lock the eligibility evaluation reads a frozen committed state.
+   */
+  async lockDocumentIn(
+    tenantId: string,
+    handle: CommerceTransactionHandle,
+    id: string
+  ): Promise<{ id: string } | null> {
+    const rows = await unwrapCommerceTransaction(handle).$queryRaw<Array<{ id: string }>>`
+      SELECT "id" FROM "PurchaseDocument"
+      WHERE "tenant_id" = ${tenantId} AND "id" = ${id}::uuid
+      FOR UPDATE`;
+    return rows.length > 0 ? rows[0] : null;
+  }
+
+  /**
+   * PHASE W3: re-read the document's status inside the lock — the completion
+   * act decides on the state the lock froze, never on a pre-transaction read.
+   */
+  async readDocumentStatusIn(
+    tenantId: string,
+    handle: CommerceTransactionHandle,
+    id: string
+  ) {
+    return unwrapCommerceTransaction(handle).purchaseDocument.findFirst({
+      where: { id, tenantId },
+      // `totalAmount` rides the same read: settlement is evaluated against the
+      // total the lock froze, never a pre-transaction value.
+      select: { id: true, status: true, totalAmount: true },
+    });
+  }
+
+  /**
    * STEP P (§3-F): the projection writer's ONLY document-status statement —
    * the conditional `SUBMITTED → APPROVED` and `SUBMITTED → REJECTED` edges,
    * asked of the table rather than decided by the caller. `null` means the
@@ -558,14 +783,22 @@ export class PurchaseRepository {
     tenantId: string,
     handle: CommerceTransactionHandle,
     id: string,
-    to: 'APPROVED' | 'REJECTED'
+    to: 'APPROVED' | 'REJECTED',
+    actorUserId: string | null
   ) {
     const tx = unwrapCommerceTransaction(handle);
+    const now = new Date();
     const { count } = await tx.purchaseDocument.updateMany({
       where: { id, tenantId, status: 'SUBMITTED' },
-      data: { status: to },
+      data: { status: to, statusChangedAt: now },
     });
     if (count === 0) return null;
+    await PurchaseRepository.writeStatusEvent(tx, tenantId, id, {
+      fromStatus: 'SUBMITTED',
+      toStatus: to,
+      actorUserId,
+      occurredAt: now,
+    });
     return PurchaseRepository.readDocument(tx, tenantId, id);
   }
 
@@ -603,6 +836,8 @@ export class PurchaseRepository {
     id: string,
     completion: {
       fromStatuses: readonly PurchaseDocumentStatus[];
+      /** The status the service read under its lock — the event's `fromStatus`. */
+      fromStatus: PurchaseDocumentStatus;
       completedByUserId: string | null;
       completedAt: Date;
       completionPolicyVersionId: string;
@@ -622,12 +857,58 @@ export class PurchaseRepository {
         completedByUserId: completion.completedByUserId,
         completedAt: completion.completedAt,
         completionPolicyVersionId: completion.completionPolicyVersionId,
+        statusChangedAt: completion.completedAt,
       },
     });
     if (count === 0) return null;
     if (outbox) {
       await tx.auditOutbox.create({ data: outbox });
     }
+    await PurchaseRepository.writeStatusEvent(tx, tenantId, id, {
+      fromStatus: completion.fromStatus,
+      toStatus: 'CLOSED',
+      actorUserId: completion.completedByUserId,
+      occurredAt: completion.completedAt,
+    });
+    return PurchaseRepository.readDocument(tx, tenantId, id);
+  }
+
+  /**
+   * REACTIVATION (GAP-6 follow-up): the ONE statement that returns a REJECTED
+   * document to DRAFT — the fourth conditional document-status statement in this
+   * file, written only by `PurchaseService.reopen`.
+   *
+   * THE `status: 'REJECTED'` PREDICATE IS THE WHOLE RACE ANSWER, the same
+   * mechanism as `writeCompletedIn`: a second concurrent reopen, or any actor
+   * that moved the document meanwhile, matches nothing and the service answers
+   * 409 rather than reporting a transition it did not cause. Only the status
+   * moves — the settled workflow instance, the rejection decision and every
+   * audit row stay exactly where they are: reopening makes the document
+   * editable again, it never erases why it was rejected.
+   */
+  async reopenDocumentIn(
+    tenantId: string,
+    handle: CommerceTransactionHandle,
+    id: string,
+    actorUserId: string | null,
+    outbox?: CommerceAuditOutboxPayload
+  ) {
+    const tx = unwrapCommerceTransaction(handle);
+    const now = new Date();
+    const { count } = await tx.purchaseDocument.updateMany({
+      where: { id, tenantId, status: 'REJECTED' },
+      data: { status: 'DRAFT', statusChangedAt: now },
+    });
+    if (count === 0) return null;
+    if (outbox) {
+      await tx.auditOutbox.create({ data: outbox });
+    }
+    await PurchaseRepository.writeStatusEvent(tx, tenantId, id, {
+      fromStatus: 'REJECTED',
+      toStatus: 'DRAFT',
+      actorUserId,
+      occurredAt: now,
+    });
     return PurchaseRepository.readDocument(tx, tenantId, id);
   }
 
@@ -640,14 +921,62 @@ export class PurchaseRepository {
    * answers 409 and creates no run, which is why the return type is `| null` rather than a
    * thrown error nobody can attribute.
    */
-  private static async writeSubmitted(tx: Prisma.TransactionClient, tenantId: string, id: string) {
+  private static async writeSubmitted(
+    tx: Prisma.TransactionClient,
+    tenantId: string,
+    id: string,
+    actorUserId: string | null
+  ) {
+    const now = new Date();
     const { count } = await tx.purchaseDocument.updateMany({
       where: { id, tenantId, status: 'DRAFT' },
-      data: { status: 'SUBMITTED' },
+      data: { status: 'SUBMITTED', statusChangedAt: now },
     });
 
     if (count === 0) return null;
+    await PurchaseRepository.writeStatusEvent(tx, tenantId, id, {
+      fromStatus: 'DRAFT',
+      toStatus: 'SUBMITTED',
+      actorUserId,
+      occurredAt: now,
+    });
     return PurchaseRepository.readDocument(tx, tenantId, id);
+  }
+
+  /**
+   * PHASE W3: THE ONE STATUS-EVENT APPEND — every conditional status statement
+   * above calls this INSIDE the same transaction, immediately after its own
+   * `count > 0`, so a committed status transition and its history row are
+   * atomic (a rolled-back transition never leaves an orphan event, and a
+   * committed transition never lacks one).
+   *
+   * `fromStatus`/`toStatus`/`occurredAt` are stated BY THE WRITER from the
+   * write it just performed — never re-read, never inferred — and `actorUserId`
+   * arrives already resolved by the calling service (server-side actor, NULL
+   * for a machine context). The row carries no `source` argument because
+   * LIFECYCLE is the column default and the only member today.
+   */
+  private static async writeStatusEvent(
+    tx: Prisma.TransactionClient,
+    tenantId: string,
+    purchaseDocumentId: string,
+    event: {
+      fromStatus: PurchaseDocumentStatus | null;
+      toStatus: PurchaseDocumentStatus;
+      actorUserId: string | null;
+      occurredAt: Date;
+    }
+  ) {
+    await tx.purchaseStatusEvent.create({
+      data: {
+        tenantId,
+        purchaseDocumentId,
+        fromStatus: event.fromStatus,
+        toStatus: event.toStatus,
+        actorUserId: event.actorUserId,
+        occurredAt: event.occurredAt,
+      },
+    });
   }
 
   // ---------------------------------------------------------------------------

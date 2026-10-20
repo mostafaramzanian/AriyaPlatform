@@ -1,0 +1,463 @@
+// WAREHOUSE / INVENTORY FOUNDATION: the Inventory datasource's own Prisma project.
+//
+// Inventory owns `inventory_db`, reached only through INVENTORY_DATABASE_URL. Same
+// independent-owner sequence every other context followed: independent datasource,
+// independent generator, independent schema, independent generated client target
+// (`src/generated/inventory-client`) and independent migration history
+// (`prisma/inventory/migrations/`).
+//
+// THE BOUNDARY THIS FILE DRAWS
+// ----------------------------
+// Inventory owns its database and NOTHING else:
+//
+//   * There is NO cross-database foreign key. `tenantId`, `recordedByUserId` and the
+//     `sourceType`/`sourceId` pair are PLAIN STRINGS holding opaque references —
+//     PostgreSQL cannot express a FK across databases, and Inventory must not try to.
+//     A Commerce receipt or purchase document is referenced by the `sourceType` +
+//     `sourceId` pair ONLY; identity is validated by the caller's own context, never
+//     by a join into Commerce tables.
+//   * Inventory does NOT duplicate authoritative state. No Purchase Document, no
+//     Receipt, no Supplier, no User, no Tenant, no Project — those are opaque
+//     references, not second copies of another module's tables.
+//   * Commerce, Financial, Production, Core, HR and Correspondence Prisma clients are
+//     NEVER imported here.
+//
+// THE LEDGER IS THE TRUTH
+// -----------------------
+// `StockMovement` is the append-only ledger: a posted movement is never updated or
+// deleted, and a correction is a `REVERSAL` row pointing at the movement it reverses.
+// `StockBalance` is a DERIVED projection kept consistent in the same transaction —
+// it exists so reads are fast; the ledger can always rebuild it and the
+// reconciliation read reports any drift. `available = onHand - reserved - blocked`
+// is defined ONCE here and nowhere else.
+//
+// QUANTITY AND UNIT RULES
+// -----------------------
+// `quantity` is expressed in `unit` (the unit the operator entered); `baseQuantity`
+// is the same amount in the item's `baseUnit`, computed through `ItemUnit`
+// `ratioToBase` — the ONLY conversion mechanism. A unit without a declared ratio is
+// refused, never silently reinterpreted. Balance rows accumulate `baseQuantity`.
+//
+// IDEMPOTENCY
+// -----------
+// `(tenantId, sourceType, sourceId, kind)` is unique: one business operation posts
+// one ledger row of its kind, so a retried receipt/transfer/issue cannot double-post.
+// `(tenantId, reversesMovementId)` is unique: a movement is compensated at most once.
+//
+// TENANT-FIRST KEYS
+// -----------------
+// Every table's natural unique key starts with `tenantId`; every FK is the composite
+// `(tenantId, id)` pair, so a cross-tenant reference cannot exist even by accident.
+
+generator client {
+  provider = "prisma-client-js"
+  output   = "../../src/generated/inventory-client"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("INVENTORY_DATABASE_URL")
+}
+
+enum WarehouseStatus {
+  ACTIVE
+  INACTIVE
+}
+
+enum LocationStatus {
+  ACTIVE
+  INACTIVE
+}
+
+enum ItemType {
+  /// Physically stocked goods — the only type that may appear on a movement.
+  STOCKED
+  /// Goods bought but not stocked (e.g. direct-consumption); movements refused.
+  NON_STOCKED
+  /// Services — never stockable, never movable.
+  SERVICE
+}
+
+enum ItemTrackingMode {
+  NONE
+  /// Every movement must carry a lot/batch number.
+  LOT
+  /// Every movement must carry a serial number and quantity exactly 1.
+  SERIAL
+}
+
+enum InventoryItemStatus {
+  ACTIVE
+  INACTIVE
+}
+
+enum StockMovementKind {
+  /// Goods received into stock (from a Commerce receipt or a manual intake).
+  RECEIPT
+  /// Stock issued to an internal consumer.
+  ISSUE
+  /// Stock left the source location for a transfer.
+  TRANSFER_OUT
+  /// Stock arrived at the destination location of a transfer.
+  TRANSFER_IN
+  /// Previously issued stock returned to stock.
+  RETURN_TO_STOCK
+  /// Stock dispatched back to the supplier.
+  SUPPLIER_RETURN
+  /// Controlled positive or negative adjustment.
+  ADJUSTMENT
+  /// Variance posted by an approved stock count.
+  COUNT_VARIANCE
+  /// A compensating row reversing an earlier movement.
+  REVERSAL
+}
+
+enum StockTransferStatus {
+  /// Created, not yet dispatched; cancellable.
+  DRAFT
+  /// Source stock decremented, in transit; destination not yet increased.
+  DISPATCHED
+  /// Destination stock incremented; terminal.
+  RECEIVED
+  /// Cancelled before dispatch; terminal.
+  CANCELLED
+}
+
+enum StockAdjustmentReason {
+  DAMAGE
+  EXPIRY
+  LOSS
+  FOUND
+  CORRECTION
+  /// Controlled go-live opening balance — auditable, no fabricated history.
+  OPENING_BALANCE
+}
+
+enum StockCountStatus {
+  /// Lines snapshot expected balances; counted quantities being entered.
+  OPEN
+  /// Variances posted as COUNT_VARIANCE movements; terminal.
+  POSTED
+  CANCELLED
+}
+
+// =============================================================================
+// MASTER DATA
+// =============================================================================
+
+model Warehouse {
+  id             String          @id @default(uuid())
+  tenantId       String
+  /// Warehouse code — unique per tenant (e.g. "WH-TEH-01").
+  code           String          @db.VarChar(32)
+  name           String          @db.VarChar(256)
+  description    String?         @db.VarChar(1000)
+  address        String?         @db.VarChar(500)
+  status         WarehouseStatus @default(ACTIVE)
+  createdByUserId String
+  updatedByUserId String?
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+
+  locations      StorageLocation[]
+  movements      StockMovement[]
+  balances       StockBalance[]
+  outboundTransfers StockTransfer[] @relation("TransferFrom")
+  inboundTransfers  StockTransfer[] @relation("TransferTo")
+  issues         StockIssue[]
+  adjustments    StockAdjustment[]
+  counts         StockCount[]
+
+  @@unique([tenantId, code])
+  @@unique([tenantId, id])
+  @@index([tenantId, status])
+  @@map("inventory_warehouses")
+}
+
+model StorageLocation {
+  id          String         @id @default(uuid())
+  tenantId    String
+  warehouseId String
+  /// Location code — unique within its warehouse (e.g. "A-01-03").
+  code        String         @db.VarChar(64)
+  name        String?        @db.VarChar(256)
+  status      LocationStatus @default(ACTIVE)
+  createdAt   DateTime       @default(now())
+  updatedAt   DateTime       @updatedAt
+
+  warehouse   Warehouse      @relation(fields: [tenantId, warehouseId], references: [tenantId, id], onDelete: Restrict)
+
+  @@unique([tenantId, warehouseId, code])
+  @@unique([tenantId, id])
+  @@index([tenantId, warehouseId, status])
+  @@map("inventory_storage_locations")
+}
+
+model InventoryItem {
+  id            String              @id @default(uuid())
+  tenantId      String
+  /// SKU — unique per tenant. The authoritative stock identity; a purchase
+  /// line description is never used as one.
+  sku           String              @db.VarChar(64)
+  name          String              @db.VarChar(256)
+  description   String?             @db.VarChar(2000)
+  itemType      ItemType
+  /// The unit balances and movements are normalised to (e.g. "عدد", "kg").
+  /// Free text is allowed as the BASE declaration only — conversion INTO it
+  /// requires an ItemUnit row, so a typo'd purchase unit is refused, not read.
+  baseUnit      String              @db.VarChar(32)
+  trackingMode  ItemTrackingMode    @default(NONE)
+  /// When true, inbound movements must carry `expiryDate`.
+  expiryTracked Boolean             @default(false)
+  status        InventoryItemStatus @default(ACTIVE)
+  createdByUserId String
+  updatedByUserId String?
+  createdAt     DateTime            @default(now())
+  updatedAt     DateTime            @updatedAt
+
+  units         ItemUnit[]
+  movements     StockMovement[]
+  balances      StockBalance[]
+  transfers     StockTransfer[]
+  issues        StockIssue[]
+  adjustments   StockAdjustment[]
+  countLines    StockCountLine[]
+
+  @@unique([tenantId, sku])
+  @@unique([tenantId, id])
+  @@index([tenantId, status, itemType])
+  @@map("inventory_items")
+}
+
+/// An approved alternative unit for an item and its ratio to `baseUnit`.
+/// `1 unit = ratioToBase × baseUnit`. Deleting a ratio while movements exist in
+/// that unit is refused by the service; the row is the auditable conversion.
+model ItemUnit {
+  id          String   @id @default(uuid())
+  tenantId    String
+  itemId      String
+  unit        String   @db.VarChar(32)
+  ratioToBase Decimal  @db.Decimal(18, 6)
+  createdByUserId String
+  createdAt   DateTime @default(now())
+
+  item        InventoryItem @relation(fields: [tenantId, itemId], references: [tenantId, id], onDelete: Restrict)
+
+  @@unique([tenantId, itemId, unit])
+  @@map("inventory_item_units")
+}
+
+// =============================================================================
+// THE LEDGER — append-only, never updated, never deleted
+// =============================================================================
+
+model StockMovement {
+  id          String            @id @default(uuid())
+  tenantId    String
+  kind        StockMovementKind
+  itemId      String
+  warehouseId String
+  /// Location within the warehouse; `""` means warehouse-level stock (no
+  /// location). A sentinel, not NULL, so composite uniqueness works.
+  locationId  String            @default("") @db.VarChar(64)
+  /// Signed quantity in `unit`. Inbound kinds positive, outbound negative —
+  /// stored signed so the ledger sums directly.
+  quantity    Decimal           @db.Decimal(18, 4)
+  unit        String            @db.VarChar(32)
+  /// `quantity` expressed in the item's `baseUnit` (signed the same way) —
+  /// the value the balance projection accumulates.
+  baseQuantity Decimal          @db.Decimal(18, 4)
+  lotNumber   String?           @db.VarChar(64)
+  serialNumber String?          @db.VarChar(128)
+  expiryDate  DateTime?
+  /// What business operation caused this movement — e.g. `commerce.receipt`,
+  /// `inventory.transfer`, `inventory.adjustment`, `inventory.issue`,
+  /// `inventory.count`. Opaque by design (no cross-DB FK).
+  sourceType  String            @db.VarChar(64)
+  sourceId    String            @db.VarChar(64)
+  /// For REVERSAL rows: the movement this one compensates. Unique → a
+  /// movement is compensated at most once.
+  reversesMovementId String?
+  note        String?           @db.VarChar(500)
+  recordedByUserId String
+  /// When the business says this took effect (defaults to posting time).
+  postedAt    DateTime          @default(now())
+  createdAt   DateTime          @default(now())
+
+  item        InventoryItem     @relation(fields: [tenantId, itemId], references: [tenantId, id], onDelete: Restrict)
+  warehouse   Warehouse         @relation(fields: [tenantId, warehouseId], references: [tenantId, id], onDelete: Restrict)
+  reverses    StockMovement?    @relation("MovementReversal", fields: [tenantId, reversesMovementId], references: [tenantId, id])
+  reversedBy  StockMovement?    @relation("MovementReversal")
+
+  @@unique([tenantId, sourceType, sourceId, kind])
+  @@unique([tenantId, reversesMovementId])
+  @@unique([tenantId, id])
+  @@unique([tenantId, itemId, serialNumber])
+  @@index([tenantId, itemId, warehouseId, postedAt])
+  @@index([tenantId, warehouseId, postedAt])
+  @@map("inventory_stock_movements")
+}
+
+/// DERIVED PROJECTION — never the source of truth. Every write that posts a
+/// movement updates this row inside the same transaction; the reconciliation
+/// read recomputes Σ ledger per cell and reports drift honestly.
+model StockBalance {
+  tenantId    String
+  itemId      String
+  warehouseId String
+  locationId  String  @default("") @db.VarChar(64)
+  /// Physical quantity on hand, in the item's `baseUnit`.
+  onHand      Decimal @default(0) @db.Decimal(18, 4)
+  /// Reserved for confirmed consumers (reservations land in a later phase —
+  /// the column exists so the availability contract is already honest).
+  reserved    Decimal @default(0) @db.Decimal(18, 4)
+  /// Quarantined / non-issuable quantity.
+  blocked     Decimal @default(0) @db.Decimal(18, 4)
+  updatedAt   DateTime @updatedAt
+
+  item        InventoryItem @relation(fields: [tenantId, itemId], references: [tenantId, id], onDelete: Restrict)
+  warehouse   Warehouse     @relation(fields: [tenantId, warehouseId], references: [tenantId, id], onDelete: Restrict)
+
+  @@id([tenantId, itemId, warehouseId, locationId])
+  @@index([tenantId, warehouseId])
+  @@index([tenantId, itemId])
+  @@map("inventory_stock_balances")
+}
+
+// =============================================================================
+// OPERATIONS — each is the sourceType of its ledger rows
+// =============================================================================
+
+model StockTransfer {
+  id            String              @id @default(uuid())
+  tenantId      String
+  itemId        String
+  quantity      Decimal             @db.Decimal(18, 4)
+  unit          String              @db.VarChar(32)
+  baseQuantity  Decimal             @db.Decimal(18, 4)
+  lotNumber     String?             @db.VarChar(64)
+  serialNumber  String?             @db.VarChar(128)
+  fromWarehouseId String
+  fromLocationId String             @default("") @db.VarChar(64)
+  toWarehouseId  String
+  toLocationId   String             @default("") @db.VarChar(64)
+  status        StockTransferStatus @default(DRAFT)
+  note          String?             @db.VarChar(500)
+  createdByUserId String
+  dispatchedByUserId String?
+  dispatchedAt  DateTime?
+  receivedByUserId String?
+  receivedAt    DateTime?
+  cancelledAt   DateTime?
+  createdAt     DateTime            @default(now())
+  updatedAt     DateTime            @updatedAt
+
+  item          InventoryItem       @relation(fields: [tenantId, itemId], references: [tenantId, id], onDelete: Restrict)
+  fromWarehouse Warehouse           @relation("TransferFrom", fields: [tenantId, fromWarehouseId], references: [tenantId, id], onDelete: Restrict)
+  toWarehouse   Warehouse           @relation("TransferTo", fields: [tenantId, toWarehouseId], references: [tenantId, id], onDelete: Restrict)
+
+  @@unique([tenantId, id])
+  @@index([tenantId, status])
+  @@index([tenantId, fromWarehouseId, status])
+  @@map("inventory_stock_transfers")
+}
+
+model StockIssue {
+  id          String   @id @default(uuid())
+  tenantId    String
+  itemId      String
+  warehouseId String
+  locationId  String   @default("") @db.VarChar(64)
+  quantity    Decimal  @db.Decimal(18, 4)
+  unit        String   @db.VarChar(32)
+  baseQuantity Decimal @db.Decimal(18, 4)
+  /// Who/what consumed it — an opaque reference (no Department/Project model
+  /// is invented inside Inventory to display an id).
+  issuedTo    String   @db.VarChar(128)
+  lotNumber   String?  @db.VarChar(64)
+  serialNumber String? @db.VarChar(128)
+  note        String?  @db.VarChar(500)
+  /// The ledger row posted for this issue.
+  movementId  String?
+  createdByUserId String
+  createdAt   DateTime @default(now())
+
+  item        InventoryItem @relation(fields: [tenantId, itemId], references: [tenantId, id], onDelete: Restrict)
+  warehouse   Warehouse     @relation(fields: [tenantId, warehouseId], references: [tenantId, id], onDelete: Restrict)
+
+  @@unique([tenantId, id])
+  @@unique([tenantId, movementId])
+  @@index([tenantId, warehouseId, createdAt])
+  @@map("inventory_stock_issues")
+}
+
+model StockAdjustment {
+  id          String                @id @default(uuid())
+  tenantId    String
+  itemId      String
+  warehouseId String
+  locationId  String                @default("") @db.VarChar(64)
+  /// Signed: positive adds, negative removes. Stored in `unit`; baseQuantity
+  /// is the normalised form the ledger and balance use.
+  quantity    Decimal               @db.Decimal(18, 4)
+  unit        String                @db.VarChar(32)
+  baseQuantity Decimal              @db.Decimal(18, 4)
+  reason      StockAdjustmentReason
+  note        String?               @db.VarChar(500)
+  lotNumber   String?               @db.VarChar(64)
+  serialNumber String?              @db.VarChar(128)
+  movementId  String?
+  createdByUserId String
+  createdAt   DateTime              @default(now())
+
+  item        InventoryItem         @relation(fields: [tenantId, itemId], references: [tenantId, id], onDelete: Restrict)
+  warehouse   Warehouse             @relation(fields: [tenantId, warehouseId], references: [tenantId, id], onDelete: Restrict)
+
+  @@unique([tenantId, id])
+  @@unique([tenantId, movementId])
+  @@index([tenantId, warehouseId, createdAt])
+  @@map("inventory_stock_adjustments")
+}
+
+model StockCount {
+  id          String          @id @default(uuid())
+  tenantId    String
+  warehouseId String
+  status      StockCountStatus @default(OPEN)
+  note        String?          @db.VarChar(500)
+  createdByUserId String
+  postedByUserId String?
+  createdAt   DateTime         @default(now())
+  postedAt    DateTime?
+
+  warehouse   Warehouse        @relation(fields: [tenantId, warehouseId], references: [tenantId, id], onDelete: Restrict)
+  lines       StockCountLine[]
+
+  @@unique([tenantId, id])
+  @@index([tenantId, warehouseId, status])
+  @@map("inventory_stock_counts")
+}
+
+model StockCountLine {
+  id          String  @id @default(uuid())
+  tenantId    String
+  countId     String
+  itemId      String
+  locationId  String  @default("") @db.VarChar(64)
+  /// The expected balance SNAPSHOT taken at count creation — the count
+  /// compares against what was expected then; movements that post during the
+  /// count are ledger rows of their own and are reported as post-snapshot
+  /// drift by the reconciliation read, not silently merged into the variance.
+  expectedQty Decimal @db.Decimal(18, 4)
+  countedQty  Decimal? @db.Decimal(18, 4)
+  /// countedQty - expectedQty, in the item's baseUnit.
+  variance    Decimal? @db.Decimal(18, 4)
+  /// The COUNT_VARIANCE movement posted for this line (non-zero variance).
+  movementId  String?
+
+  count       StockCount    @relation(fields: [tenantId, countId], references: [tenantId, id], onDelete: Restrict)
+  item        InventoryItem @relation(fields: [tenantId, itemId], references: [tenantId, id], onDelete: Restrict)
+
+  @@unique([tenantId, countId, itemId, locationId])
+  @@map("inventory_stock_count_lines")
+}

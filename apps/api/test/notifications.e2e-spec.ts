@@ -12,7 +12,7 @@ import { Request } from 'express';
 import request from 'supertest';
 import { ValidationError } from 'class-validator';
 import { PrismaService } from '../src/database/prisma.service';
-import { Prisma } from '@prisma/client';
+import { Prisma } from '../src/generated/core-client';
 import { PrismaModule } from '../src/database/prisma.module';
 import { NotificationModule } from '../src/notifications/notification.module';
 import { NotificationService } from '../src/notifications/notification.service';
@@ -116,7 +116,7 @@ describe('Notification Center E2E (ownership, tenant isolation, privacy, paginat
         title: 'اطلاع‌رسانی سیستم',
         body: 'یک رویداد در سامانه ثبت شد.',
         ...overrides,
-      } as Prisma.NotificationCreateInput,
+      } as Prisma.NotificationUncheckedCreateInput,
     });
     return row.id;
   };

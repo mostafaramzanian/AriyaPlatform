@@ -149,8 +149,12 @@ beforeAll(async () => {
     try {
       const adapter = app.getHttpAdapter();
       const inst = adapter?.getInstance();
-      if (inst && inst._router && Array.isArray(inst._router.stack)) {
-        for (const layer of inst._router.stack) {
+      // Express 5 renamed the app router: `inst._router` (Express 4) became `inst.router`
+      // (lazily created by `app.lazyrouter()`). Reading only `_router` on Express 5 is why
+      // this dump reported "Total routes: 0" while every request was actually being served.
+      const router = inst?._router ?? inst?.router;
+      if (router && Array.isArray(router.stack)) {
+        for (const layer of router.stack) {
           if (layer && layer.route && layer.route.path) {
             const methods = Object.keys(layer.route.methods || {}).map((m) => m.toUpperCase()).join(',');
             registeredRoutes.push(`${methods} ${layer.route.path}`);

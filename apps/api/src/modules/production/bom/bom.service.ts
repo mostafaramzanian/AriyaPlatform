@@ -247,6 +247,7 @@ export class BomHeaderService {
       take: window.take,
       status: query.status,
       search: query.search,
+      projectRef: query.projectRef,
     });
 
     return {
@@ -254,6 +255,39 @@ export class BomHeaderService {
       total,
       page: window.page,
       pageSize: window.pageSize,
+    };
+  }
+
+  /**
+   * Phase PRODUCTION-REGISTER-REDESIGN: the register summary consumed by the KPI strip
+   * and the project dropdown of `/admin/production`.
+   *
+   * The repository returns the raw aggregations; the service names the closed lifecycle
+   * so a status the domain does not declare reads as `0` rather than leaking an unknown
+   * key into the response — the same zero-filling rule the reporting seam applies.
+   */
+  async summary(actor: BomActor): Promise<{
+    total: number;
+    statusCounts: Record<'DRAFT' | 'SUBMITTED' | 'APPROVED' | 'REJECTED', number>;
+    activeItems: number;
+    inFlightChanges: number;
+    projectRefs: string[];
+    productTreeRefs: string[];
+  }> {
+    const raw = await this.repository.registerSummary(actor.tenantId);
+
+    return {
+      total: raw.total,
+      statusCounts: {
+        DRAFT: raw.statusCounts.get('DRAFT') ?? 0,
+        SUBMITTED: raw.statusCounts.get('SUBMITTED') ?? 0,
+        APPROVED: raw.statusCounts.get('APPROVED') ?? 0,
+        REJECTED: raw.statusCounts.get('REJECTED') ?? 0,
+      },
+      activeItems: raw.activeItems,
+      inFlightChanges: raw.inFlightChanges,
+      projectRefs: raw.projectRefs,
+      productTreeRefs: raw.productTreeRefs,
     };
   }
 

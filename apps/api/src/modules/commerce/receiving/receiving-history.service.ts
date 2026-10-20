@@ -1,5 +1,6 @@
 import { ConflictException, Injectable, NotFoundException } from '@nestjs/common';
 import { CommerceActor } from '../commerce-actor';
+import { InventoryIntegrationService } from '../integration/inventory-integration.service';
 import { CommerceAuditGateway } from '../commerce-audit.gateway';
 import { COMMERCE_AUDIT_RESOURCE } from '../commerce.constants';
 import { CommerceUnitOfWork } from '../database/commerce-transaction';
@@ -149,7 +150,8 @@ export class ReceivingHistoryService {
   constructor(
     private readonly repository: ReceivingHistoryRepository,
     private readonly audit: CommerceAuditGateway,
-    private readonly unitOfWork: CommerceUnitOfWork
+    private readonly unitOfWork: CommerceUnitOfWork,
+    private readonly inventoryIntegration: InventoryIntegrationService
   ) {}
 
   /**
@@ -220,7 +222,7 @@ export class ReceivingHistoryService {
    * never smuggle an over-receipt past the check.
    */
   async append(actor: CommerceActor, documentId: string, dto: CreateReceiptDto) {
-    const row = await this.unitOfWork.run(async (tx) => {
+    const { appended: row, plannedPostingIds } = await this.unitOfWork.run(async (tx) => {
       // 1. The document, LOCKED — the write path's tenant-scoped gate (§3-H).
       const document = await this.repository.lockDocumentForReceipt(actor.tenantId, documentId, tx);
       if (!document) throw new NotFoundException('Purchase document not found');
@@ -264,7 +266,7 @@ export class ReceivingHistoryService {
       }
 
       // 5. The ONLY write: one receipt, its lines, system-generated ids (R3).
-      return this.repository.append(actor.tenantId, tx, {
+      const appended = await this.repository.append(actor.tenantId, tx, {
         purchaseDocumentId: documentId,
         ...(dto.receivedAt ? { receivedAt: new Date(dto.receivedAt) } : {}),
         // The receiver is the acting session's user, taken OFF the actor — a
@@ -275,6 +277,19 @@ export class ReceivingHistoryService {
           quantity: moneyFromNumber(entry.quantity, 'quantity'),
         })),
       });
+
+      // 5b. Phase W2-B: the durable `InventoryPosting` rows of every stocked
+      //     line — planned INSIDE this unit of work, so a receipt can never
+      //     commit without its posting record. A stocked line with no
+      //     `warehouseId` is refused here, atomically (400).
+      const plannedPostingIds = await this.inventoryIntegration.planReceiptPostings(
+        tx,
+        actor.tenantId,
+        appended.lines,
+        lines,
+        dto.lines
+      );
+      return { appended, plannedPostingIds };
     });
 
     // 6. ONE audit row per SUCCESSFUL write, AFTER the commit (§3-G): the
@@ -295,6 +310,12 @@ export class ReceivingHistoryService {
         })),
       },
     });
+
+    // 6b. Phase W2-B: attempt each planned posting AFTER the commit — through
+    //     the Inventory port, never a direct reach. A refusal lands on the
+    //     posting row (FAILED + verbatim reason), not on this response: the
+    //     receipt is committed history, the posting row is the repair handle.
+    await this.inventoryIntegration.attemptPostings(actor, plannedPostingIds);
 
     return receiptView(row);
   }
@@ -333,7 +354,7 @@ export class ReceivingHistoryService {
     receiptLineId: string,
     dto: CompensateReceiptLineDto
   ) {
-    const row = await this.unitOfWork.run(async (tx) => {
+    const { appended: row, plannedPostingIds } = await this.unitOfWork.run(async (tx) => {
       // 1. The document, LOCKED — the same gate as append (§3-H).
       const document = await this.repository.lockDocumentForReceipt(actor.tenantId, documentId, tx);
       if (!document) throw new NotFoundException('Purchase document not found');
@@ -374,7 +395,7 @@ export class ReceivingHistoryService {
       // 5. A NEW receipt event carrying the NEGATIVE quantity (R4). The
       //    original row is neither read for update nor touched, and the ids
       //    stay stable for S (§ "returns reference these ids").
-      return this.repository.append(actor.tenantId, tx, {
+      const appended = await this.repository.append(actor.tenantId, tx, {
         purchaseDocumentId: documentId,
         ...(dto.receivedAt ? { receivedAt: new Date(dto.receivedAt) } : {}),
         receiverId: actor.userId,
@@ -386,6 +407,18 @@ export class ReceivingHistoryService {
           },
         ],
       });
+
+      // 5b. Phase W2-B: when the ORIGIN line's receipt posting reached the
+      //     inventory ledger, this compensation owes it an outbound movement —
+      //     planned inside this unit of work, attempted after the commit.
+      //     No POSTED origin means no stock ever arrived: nothing to remove.
+      const plannedPostingIds = await this.inventoryIntegration.planCompensationPosting(
+        tx,
+        actor.tenantId,
+        appended.lines[0],
+        target.id
+      );
+      return { appended, plannedPostingIds };
     });
 
     // 6. ONE audit row per successful correction, AFTER the commit (§3-G).
@@ -406,6 +439,11 @@ export class ReceivingHistoryService {
         })),
       },
     });
+
+    // 6b. Phase W2-B: attempt the planned compensation posting AFTER the
+    //     commit — a refusal lands on the posting row (FAILED + verbatim
+    //     reason), never on this response.
+    await this.inventoryIntegration.attemptPostings(actor, plannedPostingIds);
 
     return receiptView(row);
   }

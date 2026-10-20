@@ -60,6 +60,8 @@ function build() {
   const listDocumentPage = jest.fn().mockResolvedValue([[RAW_ROW], 1]);
   const countByStatus = jest.fn().mockResolvedValue(new Map<string, number>([['APPROVED', 1]]));
   const findDocumentById = jest.fn().mockResolvedValue(RAW_ROW);
+  const listPendingForAging = jest.fn().mockResolvedValue([]);
+  const listCostBasis = jest.fn().mockResolvedValue([]);
   const auditRead = jest.fn().mockResolvedValue({
     status: 'recorded',
     page: {
@@ -81,11 +83,11 @@ function build() {
   });
 
   const reader = new CommercePurchaseReportingReaderService(
-    { listDocumentPage, countByStatus, findDocumentById } as never,
+    { listDocumentPage, countByStatus, findDocumentById, listPendingForAging, listCostBasis } as never,
     { read: auditRead } as never
   );
 
-  return { reader, listDocumentPage, countByStatus, findDocumentById, auditRead };
+  return { reader, listDocumentPage, countByStatus, findDocumentById, listPendingForAging, listCostBasis, auditRead };
 }
 
 describe('CommercePurchaseReportingReaderService — the approved read seam', () => {
@@ -270,13 +272,154 @@ describe('CommercePurchaseReportingReaderService — the approved read seam', ()
     });
   });
 
-  it('exposes ONLY the four contract reads — no write, no lifecycle command', () => {
+  it('exposes ONLY the six contract reads — no write, no lifecycle command', () => {
     const names = Object.getOwnPropertyNames(CommercePurchaseReportingReaderService.prototype)
       .filter((name) => name !== 'constructor')
       .sort();
 
     expect(names).toEqual(
-      ['getReportRow', 'getReportSummary', 'getReportTimeline', 'listReportRows'].sort()
+      ['getReportRow', 'getReportSummary', 'getReportTimeline', 'listCostByCenter', 'listPendingAging', 'listReportRows'].sort()
     );
+  });
+
+  it('listPendingAging — ages rows from statusChangedAt and counts every bucket', async () => {
+    const { reader, listPendingForAging } = build();
+    const now = Date.now();
+    const day = 86_400_000;
+    const old = {
+      ...RAW_ROW,
+      statusChangedAt: new Date(now - 95 * day),
+      id: 'aging-1',
+    };
+    const fresh = {
+      ...RAW_ROW,
+      statusChangedAt: new Date(now - 2 * day),
+      id: 'aging-2',
+    };
+    listPendingForAging.mockResolvedValueOnce([old, fresh]);
+
+    const page = await reader.listPendingAging(scope(), { page: 1, pageSize: 20 });
+
+    expect(listPendingForAging).toHaveBeenCalledWith('tenant-a');
+    expect(page.total).toBe(2);
+    const first = page.items.find((r) => r.id === 'aging-1');
+    const second = page.items.find((r) => r.id === 'aging-2');
+    expect(first?.ageDays).toBe(95);
+    expect(first?.agingBucket).toBe('OVER_90');
+    expect(first?.statusEnteredAt).toBe(old.statusChangedAt.toISOString());
+    expect(second?.ageDays).toBe(2);
+    expect(second?.agingBucket).toBe('DAYS_0_7');
+    expect(page.byBucket).toEqual({
+      DAYS_0_7: 1,
+      DAYS_8_30: 0,
+      DAYS_31_90: 0,
+      OVER_90: 1,
+    });
+    expect(page.generatedAt).toBeTruthy();
+  });
+
+  it('listPendingAging — falls back to createdAt when statusChangedAt is null and pages honestly', async () => {
+    const { reader, listPendingForAging } = build();
+    const day = 86_400_000;
+    const legacy = {
+      ...RAW_ROW,
+      statusChangedAt: null,
+      createdAt: new Date(Date.now() - 45 * day),
+      id: 'legacy-1',
+    };
+    const recent = {
+      ...RAW_ROW,
+      statusChangedAt: new Date(Date.now() - 1 * day),
+      id: 'recent-1',
+    };
+    listPendingForAging.mockResolvedValue([legacy, recent]);
+
+    const page = await reader.listPendingAging(scope(), { page: 2, pageSize: 1 });
+
+    expect(page.total).toBe(2);
+    expect(page.items).toHaveLength(1);
+    // bucket counts are over the WHOLE pending set, not the page window
+    expect(page.byBucket.DAYS_31_90).toBe(1);
+    expect(page.byBucket.DAYS_0_7).toBe(1);
+
+    const legacyRow = (await reader.listPendingAging(scope(), { page: 1, pageSize: 20 })).items.find(
+      (r) => r.id === 'legacy-1'
+    );
+    expect(legacyRow?.statusEnteredAt).toBe(legacy.createdAt.toISOString());
+    expect(legacyRow?.agingBucket).toBe('DAYS_31_90');
+  });
+
+  it('listCostByCenter — committed, paid and outstanding stay three separate facts', async () => {
+    const { reader, listCostBasis } = build();
+    listCostBasis.mockResolvedValueOnce([
+      {
+        id: 'doc-1',
+        costCenter: 'CC-ENG',
+        currency: 'IRR',
+        status: 'APPROVED',
+        totalAmount: { toString: () => '1000.0000' },
+        payments: [{ amount: { toString: () => '400.0000' } }, { amount: { toString: () => '250.0000' } }],
+      },
+      {
+        // A cancelled document commits nothing — but money it received stays money paid.
+        id: 'doc-2',
+        costCenter: 'CC-ENG',
+        currency: 'IRR',
+        status: 'CANCELLED',
+        totalAmount: { toString: () => '500.0000' },
+        payments: [{ amount: { toString: () => '100.0000' } }],
+      },
+      {
+        // Same cost center, DIFFERENT currency — never summed into the IRR bucket.
+        id: 'doc-3',
+        costCenter: 'CC-ENG',
+        currency: 'USD',
+        status: 'APPROVED',
+        totalAmount: { toString: () => '60.0000' },
+        payments: [],
+      },
+    ]);
+
+    const report = await reader.listCostByCenter(scope());
+
+    expect(listCostBasis).toHaveBeenCalledWith('tenant-a');
+    expect(report.items).toHaveLength(2);
+    const irr = report.items.find((r) => r.currency === 'IRR');
+    const usd = report.items.find((r) => r.currency === 'USD');
+    expect(irr).toMatchObject({
+      costCenter: 'CC-ENG',
+      documentCount: 2,
+      committedAmount: '1000.0000',
+      paidAmount: '750.0000',
+      outstandingAmount: '250.0000',
+    });
+    expect(usd).toMatchObject({
+      documentCount: 1,
+      committedAmount: '60.0000',
+      paidAmount: '0.0000',
+      outstandingAmount: '60.0000',
+    });
+  });
+
+  it('listCostByCenter — a compensation row nets against the original, exactly', async () => {
+    const { reader, listCostBasis } = build();
+    listCostBasis.mockResolvedValueOnce([
+      {
+        id: 'doc-9',
+        costCenter: 'CC-OPS',
+        currency: 'IRR',
+        status: 'CLOSED',
+        totalAmount: { toString: () => '800.0000' },
+        payments: [
+          { amount: { toString: () => '800.0000' } },
+          // the compensating row: the exact negation of 300 of it never netted
+          { amount: { toString: () => '-300.0000' } },
+        ],
+      },
+    ]);
+
+    const report = await reader.listCostByCenter(scope());
+    expect(report.items[0].paidAmount).toBe('500.0000');
+    expect(report.items[0].outstandingAmount).toBe('300.0000');
   });
 });

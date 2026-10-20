@@ -10,6 +10,8 @@ import { HrPrismaModule } from '../modules/hr/database/hr-prisma.module';
 import { CommercePrismaModule } from '../modules/commerce/database/commerce-prisma.module';
 import { ProductionPrismaModule } from '../modules/production/database/production-prisma.module';
 import { FinancialPrismaModule } from '../modules/financial/database/financial-prisma.module';
+import { InventoryPrismaModule } from '../modules/inventory/database/inventory-prisma.module';
+import { TokenAuthModule } from '../platform/auth/token-auth.module';
 
 /**
  * Phase ARCH-1.3: the health graph of the COMBINED runtime — the class that used
@@ -71,6 +73,14 @@ import { FinancialPrismaModule } from '../modules/financial/database/financial-p
     // Core-only, CMS-only and future-hr runtimes still mark Financial `not-used` and
     // still import nothing for it.
     FinancialPrismaModule,
+    // Phase W1 — WAREHOUSE / INVENTORY FOUNDATION: the combined runtime hosts the
+    // Inventory module, so this graph imports its Prisma module and `inventory_db`
+    // joins the required set.
+    InventoryPrismaModule,
+    // PHASE W3 (P4): binds the token seam so `RevocationFeedProbe` can read the
+    // REAL registry posture — without this the probe could only report
+    // `not-configured` even while revocation is wired and healthy.
+    TokenAuthModule,
   ],
   controllers: [HealthController],
   providers: createHealthProviders('combined'),

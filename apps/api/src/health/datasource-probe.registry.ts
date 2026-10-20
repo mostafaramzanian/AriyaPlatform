@@ -12,6 +12,7 @@ import {
   CORE_PRISMA_CLIENT,
   FINANCE_PRISMA_CLIENT,
   HR_PRISMA_CLIENT,
+  INVENTORY_PRISMA_CLIENT,
   OBSERVABILITY_PRISMA_CLIENT,
   PRODUCTION_PRISMA_CLIENT,
   ObservabilityPrismaLike,
@@ -153,6 +154,9 @@ export const DATASOURCE_PROBES: Record<Datasource, DatasourceProbeDefinition> = 
   // token's provider is `FinancialPrismaModule`, and only a runtime whose policy
   // instantiates `FINANCE_DATABASE_URL` ever reaches this definition.
   FINANCE_DATABASE_URL: sqlProbe('FINANCE_DATABASE_URL', FINANCE_PRISMA_CLIENT),
+  // Phase W1 — WAREHOUSE / INVENTORY FOUNDATION: the same entry for Inventory's
+  // datasource; `InventoryPrismaModule` binds the token.
+  INVENTORY_DATABASE_URL: sqlProbe('INVENTORY_DATABASE_URL', INVENTORY_PRISMA_CLIENT),
 };
 
 /**

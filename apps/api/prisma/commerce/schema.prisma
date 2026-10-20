@@ -256,39 +256,43 @@ enum PurchaseDocumentStatus {
 /// below. There is no optimistic-version column: the header records why (no C1
 /// contract states a conflict response, so the column would have no reader).
 model PurchaseDocument {
-  id             String                 @id @default(uuid()) @db.Uuid
+  id                               String                 @id @default(uuid()) @db.Uuid
   /// TEXT, like every `tenantId` in this database.
-  tenantId       String                 @map("tenant_id") @db.Text
+  tenantId                         String                 @map("tenant_id") @db.Text
   /// The number this document was issued as — unique inside the tenant, minted
   /// by the numbering strategy documented above, never client-supplied and
   /// never random.
-  documentNumber String                 @map("document_number") @db.VarChar(64)
+  documentNumber                   String                 @map("document_number") @db.VarChar(64)
   /// The kind of document (§5.1) and part of the numbering key. Closed at
   /// PURCHASE_REQUEST for C1 — see the enum note for the full reasoning.
-  kind           PurchaseDocumentKind   @default(PURCHASE_REQUEST)
+  kind                             PurchaseDocumentKind   @default(PURCHASE_REQUEST)
   /// The commercial lifecycle of THIS document (§5.11) — never workflow,
   /// payment or receiving state. See the enum note.
-  status         PurchaseDocumentStatus @default(DRAFT)
+  status                           PurchaseDocumentStatus @default(DRAFT)
   /// WHO asked for the purchase: an OPAQUE Core identity id (the platform
   /// identity gateway is the only way to resolve it). Required — a purchase
   /// request with no requester is not a request.
-  requesterId    String                 @map("requester_id") @db.Text
+  requesterId                      String                 @map("requester_id") @db.Text
   /// The supplier the request is addressed to: an OPAQUE reference. C1 owns no
   /// supplier directory, and none may be invented here. NULL = none stated
   /// yet, which is a different statement from an empty string.
-  supplierId     String?                @map("supplier_id") @db.Text
+  supplierId                       String?                @map("supplier_id") @db.Text
   /// ISO 4217 alphabetic code. NULL = no currency stated yet; deliberately no
   /// default (see MONEY above).
-  currency       String?                @db.VarChar(3)
+  currency                         String?                @db.VarChar(3)
+  /// The cost center / department the purchase is charged to: free text, NULL =
+  /// none stated. Commerce owns no department directory, so this is a label the
+  /// requester states, not a foreign key.
+  costCenter                       String?                @map("cost_center") @db.VarChar(128)
   /// Σ of the lines' `lineTotal`, `Decimal(18, 4)` like every money column in
   /// this file. NULL until the lines are priced.
-  subtotalAmount Decimal?               @map("subtotal_amount") @db.Decimal(18, 4)
+  subtotalAmount                   Decimal?               @map("subtotal_amount") @db.Decimal(18, 4)
   /// Σ of the lines' `tax`. NULL under the same rule as `subtotalAmount`.
-  taxAmount      Decimal?               @map("tax_amount") @db.Decimal(18, 4)
+  taxAmount                        Decimal?               @map("tax_amount") @db.Decimal(18, 4)
   /// `subtotalAmount` + `taxAmount`. A STORED total, not a per-read sum: the
   /// number a document was submitted under is a historical fact, and §16 keeps
   /// invariants in the database rather than in application arithmetic.
-  totalAmount    Decimal?               @map("total_amount") @db.Decimal(18, 4)
+  totalAmount                      Decimal?               @map("total_amount") @db.Decimal(18, 4)
   /// STEP P (§3-B): the PINNED commercial configuration version — the single
   /// conditional `null → versionId` write the first commercial operation on
   /// this document performs. Every later commercial operation reads ONLY the
@@ -296,29 +300,36 @@ model PurchaseDocument {
   /// this document's commercial meaning. NULL = no commercial operation has
   /// pinned one yet, which is not an error (§3-A: absent configuration is no
   /// automatic commercial effect).
-  commercialConfigurationVersionId String? @map("commercial_configuration_version_id") @db.Uuid
+  commercialConfigurationVersionId String?                @map("commercial_configuration_version_id") @db.Uuid
   /// STEP O4: the PINNED line-routing aggregation configuration version. RESTRICT:
   /// running line workflows are explained by the exact routing version they ran under.
-  lineRoutingVersionId String? @map("line_routing_version_id") @db.Uuid
+  lineRoutingVersionId             String?                @map("line_routing_version_id") @db.Uuid
   /// PHASE C4-R (C1 §29): the COMPLETION ACTOR — the opaque Core identity of the user who
   /// completed this purchase, server-resolved from the session (`resolveCommerceActor`)
   /// and never accepted from a request. NULL until the document is completed; §29
   /// requires it to be recorded WHEN completion happens, so a completed document has it
   /// (a machine caller legitimately resolves to NULL userId — the same convention every
   /// other `*ByUserId`/`actorUserId` column here follows).
-  completedByUserId    String?                @map("completed_by_user_id") @db.Text
+  completedByUserId                String?                @map("completed_by_user_id") @db.Text
   /// PHASE C4-R (C1 §29): the COMPLETION TIMESTAMP — written by the clock the completion
   /// act reads, once, inside the same conditional write that moves the status. NULL until
   /// completed, and never rewritten: it is a historical fact, not a value to refresh.
-  completedAt          DateTime?              @map("completed_at") @db.Timestamptz(6)
+  completedAt                      DateTime?              @map("completed_at") @db.Timestamptz(6)
   /// PHASE C4-R: the PINNED completion policy version — the row whose
   /// `allowedFromStatuses` authorised this completion, recorded at close time because
   /// that is when the policy is evaluated (model A: evaluate-at-close, remember-what-was-
   /// used). The same null → id conditional pin the commercial and line-routing versions
   /// use, so a later publication never re-explains a completion that already happened.
-  completionPolicyVersionId String?            @map("completion_policy_version_id") @db.Uuid
-  createdAt      DateTime               @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt      DateTime               @updatedAt @map("updated_at") @db.Timestamptz(6)
+  completionPolicyVersionId        String?                @map("completion_policy_version_id") @db.Uuid
+  /// PHASE W2-C (pending-aging report): the instant the CURRENT status was
+  /// entered — written by every conditional status statement (submit, the
+  /// commercial APPROVED/REJECTED edges, reopen, close) in the SAME write as
+  /// the status itself, so aging never reads `updatedAt` (rewritten by every
+  /// touch). NULL only on rows predating the column; the reader falls back to
+  /// `createdAt`, the status's honest floor for a row no transition touched.
+  statusChangedAt                  DateTime?              @map("status_changed_at") @db.Timestamptz(6)
+  createdAt                        DateTime               @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt                        DateTime               @updatedAt @map("updated_at") @db.Timestamptz(6)
 
   /// The document's first-class lines (§5.2). RESTRICT: evidence of what was
   /// asked for is not deleted, and no lifecycle deletion path exists anywhere
@@ -333,6 +344,17 @@ model PurchaseDocument {
   /// table never becomes "a payments ledger or a projection storage".
   payments PaymentRecord[] @relation("PaymentRecordDocument")
 
+  /// The document's payment-instruction plans (دستور پرداخت / رژیم پرداخت):
+  /// what was ORDERED to be paid and in how many approved stages — separate
+  /// from the append-only `payments` history that records what WAS paid.
+  paymentPlans PaymentPlan[] @relation("PaymentPlanDocument")
+
+  /// PHASE GAP-6 (quotation): the document's price quotations — price EVIDENCE
+  /// rows (استعلام / پیش‌فاکتور) recorded against this request, each versioned.
+  /// A child lifecycle like payments/receipts: quotations never write this
+  /// table's status, and RESTRICT keeps the evidence when the document does.
+  quotations PriceQuotation[] @relation("PriceQuotationDocument")
+
   /// STEP R (§5.16): the document's append-only receiving history — receipt
   /// events, never columns of this table. The document deliberately holds NO
   /// receiving status and NO received-quantity column (R5): NOT_RECEIVED /
@@ -341,6 +363,11 @@ model PurchaseDocument {
   /// INDEPENDENT lifecycle (R6) and this table never becomes a receiving
   /// ledger or a projection storage.
   receipts Receipt[] @relation("ReceiptDocument")
+
+  /// PHASE W3 (status history): the document's append-only status-transition
+  /// events — every writer that moves `status` appends one row INSIDE the same
+  /// transaction, so the history can never disagree with a committed status.
+  statusEvents PurchaseStatusEvent[] @relation("PurchaseStatusEventDocument")
 
   /// STEP S (§5.17): the document's child RETURN lifecycle — `ReturnDocument`
   /// rows, never columns of this table. The document deliberately holds NO
@@ -374,6 +401,75 @@ model PurchaseDocument {
   /// The requester's own view — tenant-first like every read in this database.
   @@index([tenantId, requesterId, status], map: "PurchaseDocument_tenantId_requesterId_status_idx")
   @@map("PurchaseDocument")
+}
+
+/// PHASE W3: WHERE a status event came from — the closed vocabulary the append
+/// states. One member today: LIFECYCLE, a genuine transition written by the
+/// statement that moved `status`. A future BASELINE member (a migration-time
+/// record for documents that predate this table) would arrive WITH the
+/// migration that writes those rows and its own explicit marking — never as a
+/// fabricated history.
+enum PurchaseStatusEventSource {
+  /// A real transition: the row was appended by the same statement/transaction
+  /// that changed `PurchaseDocument.status`.
+  LIFECYCLE
+}
+
+/// PHASE W3 (status history): ONE append-only transition event of ONE purchase
+/// document — the durable record `statusChangedAt` alone can never give (it
+/// holds only the LATEST entry; it cannot say how long a document spent in any
+/// earlier state).
+///
+/// APPEND-ONLY, like every history in this schema: written once, never updated,
+/// never deleted. `fromStatus` is NULL on exactly one row per document — the
+/// creation event (entering DRAFT); every later row names the status it left
+/// and the status it entered, both read from the write itself, never inferred.
+/// `occurredAt` is the instant the WRITER stated (the same value the
+/// `statusChangedAt` column receives), so event time and column time can never
+/// disagree; `createdAt` is the row's own clock. `actorUserId` is the opaque
+/// Core identity of the acting session as the writer resolved it — NULL for a
+/// machine context, the same convention every `*ByUserId` column follows.
+///
+/// ORDERING: readers order by (`occurredAt`, `id`) — deterministic even when
+/// two transitions share an instant, which the index below is built for.
+///
+/// WHAT THIS TABLE IS NOT: not the audit trail (that is the AuditOutbox /
+/// platform audit's job — actor/action evidence with its own contract), and
+/// not a mutable projection that could disagree with `PurchaseDocument.status`
+/// — it records transitions, never current state.
+model PurchaseStatusEvent {
+  id                 String                    @id @default(uuid()) @db.Uuid
+  /// TEXT, like every `tenantId` in this database.
+  tenantId           String                    @map("tenant_id") @db.Text
+  /// The document this transition belongs to — composite-keyed with the
+  /// tenant, like every child row here.
+  purchaseDocumentId String                    @map("purchase_document_id") @db.Uuid
+  /// The status left — NULL only on the creation event (entry into DRAFT).
+  fromStatus         PurchaseDocumentStatus?   @map("from_status")
+  /// The status entered — never NULL; a transition that entered nothing is no
+  /// transition.
+  toStatus           PurchaseDocumentStatus    @map("to_status")
+  /// Where the event came from — LIFECYCLE for every writer today.
+  source             PurchaseStatusEventSource @default(LIFECYCLE)
+  /// The acting session's user as the writer resolved it — NULL for a machine
+  /// context. Never read from a request payload.
+  actorUserId        String?                   @map("actor_user_id") @db.Text
+  /// The instant the transition happened as the writer stated it — the SAME
+  /// value written to `PurchaseDocument.statusChangedAt` in the same update.
+  occurredAt         DateTime                  @map("occurred_at") @db.Timestamptz(6)
+  /// The row's OWN clock — append-only rows never change.
+  createdAt          DateTime                  @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  /// The document this event belongs to — RESTRICT: history is not deleted,
+  /// and no lifecycle deletion path exists anywhere in this database.
+  purchaseDocument PurchaseDocument @relation("PurchaseStatusEventDocument", fields: [tenantId, purchaseDocumentId], references: [tenantId, id], onDelete: Restrict, onUpdate: Cascade)
+
+  /// The tenant's handle on a row — the read every lookup performs.
+  @@unique([tenantId, id], map: "PurchaseStatusEvent_tenant_id_id_key")
+  /// The document's timeline read, oldest first with a deterministic
+  /// tie-break — every index leads with `tenant_id` (§3-F).
+  @@index([tenantId, purchaseDocumentId, occurredAt, id], map: "PurchaseStatusEvent_tenant_id_document_occurred_idx")
+  @@map("PurchaseStatusEvent")
 }
 
 /// ONE line of a purchase document (§5.2) — FIRST-CLASS. The workflow routes
@@ -952,36 +1048,35 @@ enum WorkflowLineRoutingAggregationPolicy {
 /// POLICIES. `noRouteBehavior`, `multipleMatchBehavior` and `aggregationPolicy`
 /// are the configurable outcomes for the three routing edge cases.
 model WorkflowLineRoutingVersion {
-  id                      String                              @id @default(uuid()) @db.Uuid
+  id                    String                               @id @default(uuid()) @db.Uuid
   /// TEXT, like every `tenantId` in this database.
-  tenantId                String                              @map("tenant_id") @db.Text
+  tenantId              String                               @map("tenant_id") @db.Text
   /// The established Aria version lifecycle (DRAFT → VALIDATED → PUBLISHED → ARCHIVED).
-  status                  WorkflowDefinitionVersionStatus     @default(DRAFT)
+  status                WorkflowDefinitionVersionStatus      @default(DRAFT)
   /// The tenant's own label for this routing version (e.g. "1404-01").
-  versionLabel            String                              @map("version_label") @db.VarChar(64)
+  versionLabel          String                               @map("version_label") @db.VarChar(64)
   /// Which event causes line routing for a purchase.
-  trigger                 WorkflowTriggerEvent                @map("trigger")
+  trigger               WorkflowTriggerEvent                 @map("trigger")
   /// What to do when a line matches no route.
-  noRouteBehavior         WorkflowLineRoutingNoRouteBehavior  @map("no_route_behavior")
+  noRouteBehavior       WorkflowLineRoutingNoRouteBehavior   @map("no_route_behavior")
   /// How to resolve multiple matching routes.
-  multipleMatchBehavior   WorkflowLineRoutingMatchBehavior    @map("multiple_match_behavior")
+  multipleMatchBehavior WorkflowLineRoutingMatchBehavior     @map("multiple_match_behavior")
   /// How line results may influence document state.
-  aggregationPolicy       WorkflowLineRoutingAggregationPolicy @map("aggregation_policy")
+  aggregationPolicy     WorkflowLineRoutingAggregationPolicy @map("aggregation_policy")
   /// The stored route-candidate array (see model note).
-  routeRules              Json                                @map("route_rules")
-  createdAt               DateTime                            @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt               DateTime                            @updatedAt @map("updated_at") @db.Timestamptz(6)
-
-  /// One label per tenant — an author cannot have two versions with the same name.
-  @@unique([tenantId, versionLabel], map: "WorkflowLineRoutingVersion_tenantId_versionLabel_key")
-  /// The operational read: the tenant's published routing for a trigger.
-  @@index([tenantId, status, trigger], map: "WorkflowLineRoutingVersion_tenantId_status_trigger_idx")
+  routeRules            Json                                 @map("route_rules")
+  createdAt             DateTime                             @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt             DateTime                             @updatedAt @map("updated_at") @db.Timestamptz(6)
 
   /// Purchase documents pinned to this routing version for O4 aggregation semantics.
   purchaseDocuments PurchaseDocument[] @relation("PurchaseDocumentLineRoutingVersion")
 
+  /// One label per tenant — an author cannot have two versions with the same name.
+  @@unique([tenantId, versionLabel], map: "WorkflowLineRoutingVersion_tenantId_versionLabel_key")
   /// Composite-key target for the same-tenant document pin foreign key.
   @@unique([tenantId, id], map: "WorkflowLineRoutingVersion_tenantId_id_key")
+  /// The operational read: the tenant's published routing for a trigger.
+  @@index([tenantId, status, trigger], map: "WorkflowLineRoutingVersion_tenantId_status_trigger_idx")
   @@map("WorkflowLineRoutingVersion")
 }
 
@@ -1404,22 +1499,22 @@ enum CommercialMatchBehavior {
 /// from assignment rows are RESTRICT, so a group with history cannot vanish
 /// under the history that names it.
 model CommercialGroup {
-  id             String    @id @default(uuid()) @db.Uuid
+  id            String   @id @default(uuid()) @db.Uuid
   /// TEXT, like every `tenantId` in this database.
-  tenantId       String    @map("tenant_id") @db.Text
+  tenantId      String   @map("tenant_id") @db.Text
   /// The tenant's stable code for the group — unique inside the tenant.
-  code           String    @db.VarChar(64)
+  code          String   @db.VarChar(64)
   /// The human name the surface renders.
-  name           String    @db.VarChar(128)
+  name          String   @db.VarChar(128)
   /// The configured commercial liaison: an OPAQUE identity (see the model note).
-  liaisonUserId  String?   @map("liaison_user_id") @db.Text
-  createdAt      DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt      DateTime  @updatedAt @map("updated_at") @db.Timestamptz(6)
+  liaisonUserId String?  @map("liaison_user_id") @db.Text
+  createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt     DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
 
   /// Current assignments in this group. RESTRICT (§3-L).
-  assignments CommercialAssignment[] @relation("CommercialAssignmentGroup")
+  assignments CommercialAssignment[]        @relation("CommercialAssignmentGroup")
   /// Append-only history naming this group. RESTRICT (§3-L).
-  history CommercialAssignmentHistory[] @relation("CommercialAssignmentHistoryGroup")
+  history     CommercialAssignmentHistory[] @relation("CommercialAssignmentHistoryGroup")
 
   /// Composite-key target for the tenant-first FKs above.
   @@unique([tenantId, id], map: "CommercialGroup_tenantId_id_key")
@@ -1454,46 +1549,46 @@ model CommercialGroup {
 /// fact catalogue at publish (§7.3–§7.4); a fact outside the catalogue is
 /// rejected so no rule can reach a raw Prisma row (§5).
 model CommercialConfigurationVersion {
-  id                       String                          @id @default(uuid()) @db.Uuid
+  id                     String                          @id @default(uuid()) @db.Uuid
   /// TEXT, like every `tenantId` in this database.
-  tenantId                 String                          @map("tenant_id") @db.Text
+  tenantId               String                          @map("tenant_id") @db.Text
   /// The established Aria version lifecycle (DRAFT → VALIDATED → PUBLISHED → ARCHIVED).
-  status                   WorkflowDefinitionVersionStatus @default(DRAFT)
+  status                 WorkflowDefinitionVersionStatus @default(DRAFT)
   /// The tenant's own label for this version — unique inside the tenant.
-  versionLabel             String                          @map("version_label") @db.VarChar(64)
+  versionLabel           String                          @map("version_label") @db.VarChar(64)
   /// The event that fires assignment for a pinned document (P4): the closed
   /// `WorkflowTriggerEvent` vocabulary — never a hard-coded timing.
-  assignmentTrigger        WorkflowTriggerEvent            @map("assignment_trigger")
+  assignmentTrigger      WorkflowTriggerEvent            @map("assignment_trigger")
   /// What a line with no matching rule becomes (§3-D, P6).
-  noAssignmentBehavior     CommercialNoAssignmentBehavior  @map("no_assignment_behavior")
+  noAssignmentBehavior   CommercialNoAssignmentBehavior  @map("no_assignment_behavior")
   /// How multiple matching rules resolve (§3-D).
-  matchBehavior            CommercialMatchBehavior        @map("match_behavior")
+  matchBehavior          CommercialMatchBehavior         @map("match_behavior")
   /// The tenant-authored assignment candidate list (see the model note).
-  assignmentRules          Json                            @map("assignment_rules")
+  assignmentRules        Json                            @map("assignment_rules")
   /// When the commercial approval lifecycle activates (§3-G).
-  approvalActivation       CommercialApprovalActivation    @map("approval_activation")
+  approvalActivation     CommercialApprovalActivation    @map("approval_activation")
   /// How an approver resolves — NULL while `approvalActivation` is
   /// NOT_REQUIRED (§7.8: a required activation must state one).
-  approvalApprover         CommercialApprovalApprover?     @map("approval_approver")
+  approvalApprover       CommercialApprovalApprover?     @map("approval_approver")
   /// The CONFIGURED_USER identity — validated at publish and again at
   /// activation through CommerceIdentityGateway (§7.5, §3-G).
-  approverUserId           String?                         @map("approver_user_id") @db.Text
+  approverUserId         String?                         @map("approver_user_id") @db.Text
   /// The optional bound applicability condition (§3-G): `false` → no approval
   /// record is created for the line.
-  applicabilityCondition   Json?                           @map("applicability_condition")
+  applicabilityCondition Json?                           @map("applicability_condition")
   /// The configured `PurchaseDocument` projection policy (§3-F, P11).
-  projectionPolicy         CommercialProjectionPolicy      @map("projection_policy")
-  createdAt                DateTime                        @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt                DateTime                        @updatedAt @map("updated_at") @db.Timestamptz(6)
+  projectionPolicy       CommercialProjectionPolicy      @map("projection_policy")
+  createdAt              DateTime                        @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt              DateTime                        @updatedAt @map("updated_at") @db.Timestamptz(6)
 
   /// Assignment rows produced under this version. RESTRICT (§3-B).
-  assignments CommercialAssignment[] @relation("CommercialAssignmentConfigurationVersion")
+  assignments       CommercialAssignment[]        @relation("CommercialAssignmentConfigurationVersion")
   /// Assignment history entries produced under this version. RESTRICT (§3-B).
   assignmentHistory CommercialAssignmentHistory[] @relation("CommercialAssignmentHistoryConfigurationVersion")
   /// Commercial approvals produced under this version. RESTRICT (§3-B).
-  approvals CommercialApproval[] @relation("CommercialApprovalConfigurationVersion")
+  approvals         CommercialApproval[]          @relation("CommercialApprovalConfigurationVersion")
   /// Documents pinned to this version. RESTRICT (§3-B).
-  documents PurchaseDocument[] @relation("PurchaseDocumentCommercialConfigurationVersion")
+  documents         PurchaseDocument[]            @relation("PurchaseDocumentCommercialConfigurationVersion")
 
   /// Composite-key target for the tenant-first FKs above.
   @@unique([tenantId, id], map: "CommercialConfigurationVersion_tenantId_id_key")
@@ -1527,35 +1622,35 @@ model CommercialConfigurationVersion {
 /// a history-shaped row must stay explainable and tenant-scoped without
 /// joining out of its own read.
 model CommercialAssignment {
-  id                       String                   @id @default(uuid()) @db.Uuid
+  id                     String                     @id @default(uuid()) @db.Uuid
   /// TEXT, like every `tenantId` in this database.
-  tenantId                 String                   @map("tenant_id") @db.Text
+  tenantId               String                     @map("tenant_id") @db.Text
   /// The line this assignment is for — OPAQUE (see the model note).
-  purchaseLineId           String                   @map("purchase_line_id") @db.Uuid
+  purchaseLineId         String                     @map("purchase_line_id") @db.Uuid
   /// The document the line belongs to — OPAQUE, carried for the tenant-first
   /// document read of §9 (`?documentId=`), never joined.
-  purchaseDocumentId       String                   @map("purchase_document_id") @db.Uuid
+  purchaseDocumentId     String                     @map("purchase_document_id") @db.Uuid
   /// The group in force — NULL exactly when `status = UNASSIGNED`.
-  commercialGroupId        String?                  @map("commercial_group_id") @db.Uuid
+  commercialGroupId      String?                    @map("commercial_group_id") @db.Uuid
   /// ASSIGNED / UNASSIGNED — the explicit state of §3-C/P6.
-  status                   CommercialAssignmentState
+  status                 CommercialAssignmentState
   /// Provenance of this row: which event (or the manual operation) produced it.
-  source                   CommercialAssignmentSource
+  source                 CommercialAssignmentSource
   /// The user resolved AT ASSIGNMENT TIME — OPAQUE (P1/P10).
-  resolvedUserId           String?                  @map("resolved_user_id") @db.Text
+  resolvedUserId         String?                    @map("resolved_user_id") @db.Text
   /// WHICH assignment rule produced this row (§3-M): the tenant's own rule
   /// LABEL, so "why was this line assigned?" is answerable from persisted state
   /// rather than from logs. NULL for a manual assignment and for an explicit
   /// UNASSIGNED row — the two cases where no rule decided.
-  matchedRuleLabel         String?                  @map("matched_rule_label") @db.VarChar(128)
+  matchedRuleLabel       String?                    @map("matched_rule_label") @db.VarChar(128)
   /// The configuration version this row was produced under — NULL until the
   /// document's first commercial operation pins one (§3-B).
-  configurationVersionId   String?                  @map("configuration_version_id") @db.Uuid
-  createdAt                DateTime                 @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt                DateTime                 @updatedAt @map("updated_at") @db.Timestamptz(6)
+  configurationVersionId String?                    @map("configuration_version_id") @db.Uuid
+  createdAt              DateTime                   @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt              DateTime                   @updatedAt @map("updated_at") @db.Timestamptz(6)
 
   /// The group in force. RESTRICT: a group with assignments is not deletable (§3-L).
-  commercialGroup CommercialGroup? @relation("CommercialAssignmentGroup", fields: [tenantId, commercialGroupId], references: [tenantId, id], onDelete: Restrict, onUpdate: Cascade)
+  commercialGroup      CommercialGroup?                @relation("CommercialAssignmentGroup", fields: [tenantId, commercialGroupId], references: [tenantId, id], onDelete: Restrict, onUpdate: Cascade)
   /// The version this row was produced under. RESTRICT (§3-B).
   configurationVersion CommercialConfigurationVersion? @relation("CommercialAssignmentConfigurationVersion", fields: [tenantId, configurationVersionId], references: [tenantId, id], onDelete: Restrict, onUpdate: Cascade)
 
@@ -1582,34 +1677,34 @@ model CommercialAssignment {
 /// A configuration change — including a liaison swap (§3-C) — never rewrites
 /// any row here: entries carry the user resolved AT ASSIGNMENT TIME.
 model CommercialAssignmentHistory {
-  id                       String                   @id @default(uuid()) @db.Uuid
+  id                     String                     @id @default(uuid()) @db.Uuid
   /// TEXT, like every `tenantId` in this database.
-  tenantId                 String                   @map("tenant_id") @db.Text
+  tenantId               String                     @map("tenant_id") @db.Text
   /// The line this entry describes — OPAQUE (see `CommercialAssignment`).
-  purchaseLineId           String                   @map("purchase_line_id") @db.Uuid
+  purchaseLineId         String                     @map("purchase_line_id") @db.Uuid
   /// The group that took effect — NULL for an explicit UNASSIGNED entry.
-  commercialGroupId        String?                  @map("commercial_group_id") @db.Uuid
+  commercialGroupId      String?                    @map("commercial_group_id") @db.Uuid
   /// The state that took effect: ASSIGNED / UNASSIGNED.
-  status                   CommercialAssignmentState
+  status                 CommercialAssignmentState
   /// Provenance of the assignment that took effect.
-  source                   CommercialAssignmentSource
+  source                 CommercialAssignmentSource
   /// The user resolved at assignment time — OPAQUE (P1/P10).
-  resolvedUserId           String?                  @map("resolved_user_id") @db.Text
+  resolvedUserId         String?                    @map("resolved_user_id") @db.Text
   /// WHICH assignment rule produced this state (§3-M), carried into history for
   /// the same reason the current row carries it: the January entry must answer
   /// "why" as completely as the February one. NULL for manual/unassigned.
-  matchedRuleLabel         String?                  @map("matched_rule_label") @db.VarChar(128)
+  matchedRuleLabel       String?                    @map("matched_rule_label") @db.VarChar(128)
   /// The configuration version in force at this change (§3-B).
-  configurationVersionId   String?                  @map("configuration_version_id") @db.Uuid
+  configurationVersionId String?                    @map("configuration_version_id") @db.Uuid
   /// Who caused the change — NULL for a configured trigger, set for MANUAL.
-  actorUserId              String?                  @map("actor_user_id") @db.Text
+  actorUserId            String?                    @map("actor_user_id") @db.Text
   /// The reason captured on a reassignment (P7).
-  reason                   String?                  @db.Text
+  reason                 String?                    @db.Text
   /// When this state took effect — the history clock, stated per row.
-  changedAt                DateTime                 @default(now()) @map("changed_at") @db.Timestamptz(6)
+  changedAt              DateTime                   @default(now()) @map("changed_at") @db.Timestamptz(6)
 
   /// The group that took effect. RESTRICT (§3-L).
-  commercialGroup CommercialGroup? @relation("CommercialAssignmentHistoryGroup", fields: [tenantId, commercialGroupId], references: [tenantId, id], onDelete: Restrict, onUpdate: Cascade)
+  commercialGroup      CommercialGroup?                @relation("CommercialAssignmentHistoryGroup", fields: [tenantId, commercialGroupId], references: [tenantId, id], onDelete: Restrict, onUpdate: Cascade)
   /// The version in force. RESTRICT (§3-B).
   configurationVersion CommercialConfigurationVersion? @relation("CommercialAssignmentHistoryConfigurationVersion", fields: [tenantId, configurationVersionId], references: [tenantId, id], onDelete: Restrict, onUpdate: Cascade)
 
@@ -1640,31 +1735,31 @@ model CommercialAssignmentHistory {
 /// (§5) — `NULL` means no bound condition was configured; nothing is
 /// recomputed at read time.
 model CommercialApproval {
-  id                       String                  @id @default(uuid()) @db.Uuid
+  id                     String                     @id @default(uuid()) @db.Uuid
   /// TEXT, like every `tenantId` in this database.
-  tenantId                 String                  @map("tenant_id") @db.Text
+  tenantId               String                     @map("tenant_id") @db.Text
   /// The line this approval decides — OPAQUE, line-scoped like assignment (P3).
-  purchaseLineId           String                  @map("purchase_line_id") @db.Uuid
+  purchaseLineId         String                     @map("purchase_line_id") @db.Uuid
   /// The document the line belongs to — OPAQUE, for the §9 document read.
-  purchaseDocumentId       String                  @map("purchase_document_id") @db.Uuid
+  purchaseDocumentId     String                     @map("purchase_document_id") @db.Uuid
   /// PENDING / APPROVED / REJECTED — the own lifecycle of §3-E.
-  status                   CommercialApprovalState @default(PENDING)
+  status                 CommercialApprovalState    @default(PENDING)
   /// WHICH resolution produced `approverUserId` (§3-E, P10).
-  approver                 CommercialApprovalApprover
+  approver               CommercialApprovalApprover
   /// The approver resolved AT ACTIVATION — OPAQUE, stored for the actor check.
-  approverUserId           String                  @map("approver_user_id") @db.Text
+  approverUserId         String                     @map("approver_user_id") @db.Text
   /// The persisted applicability outcome (§5) — NULL when no condition is bound.
-  applicabilityResult      Boolean?                @map("applicability_result")
+  applicabilityResult    Boolean?                   @map("applicability_result")
   /// The configuration version this record was activated under (§3-B) — NOT
   /// NULL: a record cannot exist without the pinned version that ordered it.
-  configurationVersionId   String                  @map("configuration_version_id") @db.Uuid
+  configurationVersionId String                     @map("configuration_version_id") @db.Uuid
   /// Who decided — OPAQUE; must equal `approverUserId` or the decision refuses.
-  decidedByUserId          String?                 @map("decided_by_user_id") @db.Text
-  decidedAt                DateTime?               @map("decided_at") @db.Timestamptz(6)
+  decidedByUserId        String?                    @map("decided_by_user_id") @db.Text
+  decidedAt              DateTime?                  @map("decided_at") @db.Timestamptz(6)
   /// The optional decision comment (§9).
-  comment                  String?                 @db.Text
-  createdAt                DateTime                @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt                DateTime                @updatedAt @map("updated_at") @db.Timestamptz(6)
+  comment                String?                    @db.Text
+  createdAt              DateTime                   @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt              DateTime                   @updatedAt @map("updated_at") @db.Timestamptz(6)
 
   /// The version this record was activated under. RESTRICT (§3-B).
   configurationVersion CommercialConfigurationVersion @relation("CommercialApprovalConfigurationVersion", fields: [tenantId, configurationVersionId], references: [tenantId, id], onDelete: Restrict, onUpdate: Cascade)
@@ -1762,18 +1857,27 @@ model PaymentRecord {
   purchaseDocument PurchaseDocument @relation("PaymentRecordDocument", fields: [tenantId, purchaseDocumentId], references: [tenantId, id], onDelete: Restrict, onUpdate: Cascade)
   /// The row this one reverses — the OBJECT side of `(tenant_id, reverses_payment_id)`
   /// to `PaymentRecord(tenant_id, id)` itself (Q4). Nullable, so an ordinary payment's
-  /// link column is simply not matched; the UNIQUE index below makes "at most one
-  /// compensation per row" a structural fact rather than a race-prone read.
-  reverses PaymentRecord? @relation("PaymentRecordReversal", fields: [tenantId, reversesPaymentId], references: [tenantId, id], onDelete: Restrict, onUpdate: Cascade)
-  /// The compensating row itself, seen from the target — the same one-to-one link from
-  /// the other end. Stated so the schema names both directions the way Prisma requires.
-  reversedBy PaymentRecord? @relation("PaymentRecordReversal")
+  /// link column is simply not matched.
+  reverses         PaymentRecord?   @relation("PaymentRecordReversal", fields: [tenantId, reversesPaymentId], references: [tenantId, id], onDelete: Restrict, onUpdate: Cascade)
+  /// The compensating rows of this payment, seen from the target — ONE TO MANY
+  /// since Phase W4-B (repeated partial refunds): the old one-compensation-per-row
+  /// unique index is replaced by the cumulative cap `compensate` enforces under
+  /// `SELECT … FOR UPDATE` on this row, so two raced partial refunds serialize on
+  /// the payment itself and the aggregate can never exceed its amount.
+  reversedBy       PaymentRecord[]   @relation("PaymentRecordReversal")
+
+  /// The plan installment whose execution appended this row — at most ONE by
+  /// the unique index on `PaymentInstallment.executedPaymentId`.
+  executingInstallment PaymentInstallment? @relation("InstallmentExecutedPayment")
+
+  /// The REFUNDED return transitions this row settles, seen from the
+  /// compensation side — the explicit refund→compensation link (Phase W4-B).
+  refundingTransitions ReturnLifecycleTransition[] @relation("RefundCompensationPayment")
 
   /// The tenant's handle on a row — the read every lookup performs.
   @@unique([tenantId, id], map: "PaymentRecord_tenant_id_id_key")
-  /// Q4's one-compensation-per-row rule, enforced STRUCTURALLY rather than by a read a
-  /// race could beat: two concurrent compensations cannot both land.
-  @@unique([tenantId, reversesPaymentId], map: "PaymentRecord_tenant_id_reverses_payment_id_key")
+  /// Every compensation of this payment — the refund-capacity and closure reads.
+  @@index([tenantId, reversesPaymentId], map: "PaymentRecord_tenant_id_reverses_payment_id_idx")
   /// The history page read — every index leads with `tenant_id` (Q1, §3-F).
   @@index([tenantId, purchaseDocumentId, createdAt], map: "PaymentRecord_tenant_id_purchase_document_id_created_at_idx")
   @@map("PaymentRecord")
@@ -1801,31 +1905,31 @@ model PaymentRecord {
 /// identity — no counter, no series, no formatter exists for this table, which
 /// is also what makes the id a STABLE reference for step S's future returns.
 model Receipt {
-  id                 String        @id @default(uuid()) @db.Uuid
+  id                 String   @id @default(uuid()) @db.Uuid
   /// TEXT, like every `tenantId` in this database — and the FIRST argument of
   /// every repository method and the FIRST column of every index here (§3-F).
-  tenantId           String        @map("tenant_id") @db.Text
+  tenantId           String   @map("tenant_id") @db.Text
   /// The document this receiving operation belongs to — OPAQUE,
   /// composite-keyed so a receipt can never name another tenant's document
   /// even if its UUID were guessed: both the foreign key and the predicate
   /// require the tenant.
-  purchaseDocumentId String        @map("purchase_document_id") @db.Uuid
+  purchaseDocumentId String   @map("purchase_document_id") @db.Uuid
   /// When the goods were received as the CALLER states it (a strict ISO
   /// instant at the DTO), default now — the operation's own instant, never
   /// rewritten.
-  receivedAt         DateTime      @default(now()) @map("received_at") @db.Timestamptz(6)
+  receivedAt         DateTime @default(now()) @map("received_at") @db.Timestamptz(6)
   /// Who received it — the acting session's user as an OPAQUE id, NULL for a
   /// machine context. Never resolved against a person table here: the actor
   /// comes from `resolveCommerceActor`, and §16 permits it only as opaque
   /// receiving metadata.
-  receiverId         String?       @map("receiver_id") @db.Text
+  receiverId         String?  @map("receiver_id") @db.Text
   /// The row's OWN clock. No `updated_at`: append-only rows never change.
-  createdAt          DateTime      @default(now()) @map("created_at") @db.Timestamptz(6)
+  createdAt          DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
 
   /// The actual quantities this operation received — one line per purchase
   /// line touched. RESTRICT: receiving evidence is not deleted, and no
   /// lifecycle deletion path exists anywhere in this database.
-  lines ReceiptLine[] @relation("ReceiptLines")
+  lines            ReceiptLine[]    @relation("ReceiptLines")
   /// The document this receiving operation belongs to — the OBJECT side of the
   /// composite foreign key `(tenant_id, purchase_document_id)` to
   /// `PurchaseDocument(tenant_id, id)`. RESTRICT, like every relation in this
@@ -1860,48 +1964,48 @@ model Receipt {
 /// tenant-bearing for the same reason every foreign key here is: a receipt line
 /// can never point at another tenant's line even if its UUID were guessed.
 model ReceiptLine {
-  id                    String        @id @default(uuid()) @db.Uuid
+  id                    String   @id @default(uuid()) @db.Uuid
   /// TEXT, like every `tenantId` in this database — and the FIRST argument of
   /// every repository method and the FIRST column of every index here (§3-F).
-  tenantId              String        @map("tenant_id") @db.Text
+  tenantId              String   @map("tenant_id") @db.Text
   /// The receiving operation this quantity belongs to — composite-keyed with
   /// the tenant, so a line can never hang under another tenant's receipt.
-  receiptId             String        @map("receipt_id") @db.Uuid
+  receiptId             String   @map("receipt_id") @db.Uuid
   /// The purchase line this quantity was received against — composite-keyed
   /// with the tenant: cross-document and cross-tenant receipt lines are not
   /// expressible (contract §10).
-  purchaseLineId        String        @map("purchase_line_id") @db.Uuid
+  purchaseLineId        String   @map("purchase_line_id") @db.Uuid
   /// The ACTUAL received quantity: positive on a receipt, the EXACT NEGATION
   /// of the stated magnitude on a compensation (server-derived sign, contract
   /// §3-D) — never client-stated as a negative, never rounded, never a float.
-  quantity              Decimal       @db.Decimal(18, 4)
+  quantity              Decimal  @db.Decimal(18, 4)
   /// The receipt line this one compensates — NULL on an ordinary receipt. The
   /// link is a FACT THE SERVER STATES from the route's path, never a payload
   /// field, so self-compensation is structurally impossible (contract §3-E).
-  reversesReceiptLineId String?       @map("reverses_receipt_line_id") @db.Uuid
+  reversesReceiptLineId String?  @map("reverses_receipt_line_id") @db.Uuid
   /// The row's OWN clock. No `updated_at`: append-only rows never change.
-  createdAt             DateTime      @default(now()) @map("created_at") @db.Timestamptz(6)
+  createdAt             DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
 
   /// The receiving operation this quantity belongs to — the OBJECT side of
   /// `(tenant_id, receipt_id)` to `Receipt(tenant_id, id)`. RESTRICT, like
   /// every relation in this schema, and tenant-bearing so a line can never
   /// hang under another tenant's receipt.
-  receipt Receipt @relation("ReceiptLines", fields: [tenantId, receiptId], references: [tenantId, id], onDelete: Restrict, onUpdate: Cascade)
+  receipt      Receipt       @relation("ReceiptLines", fields: [tenantId, receiptId], references: [tenantId, id], onDelete: Restrict, onUpdate: Cascade)
   /// The purchase line this quantity was received against — the OBJECT side of
   /// `(tenant_id, purchase_line_id)` to `PurchaseLine(tenant_id, id)`.
   /// RESTRICT: receiving evidence is not deleted when a line is not either.
-  purchaseLine PurchaseLine @relation("ReceiptLinePurchaseLine", fields: [tenantId, purchaseLineId], references: [tenantId, id], onDelete: Restrict, onUpdate: Cascade)
+  purchaseLine PurchaseLine  @relation("ReceiptLinePurchaseLine", fields: [tenantId, purchaseLineId], references: [tenantId, id], onDelete: Restrict, onUpdate: Cascade)
   /// The receipt line this one compensates — the OBJECT side of
   /// `(tenant_id, reverses_receipt_line_id)` to `ReceiptLine(tenant_id, id)`
   /// itself. Nullable, so an ordinary receipt's link column is simply not
   /// matched; the CAP on repeat compensation is enforced at write time inside
   /// the locked unit of work (contract §3-D/§3-H), because no unique index can
   /// express a SUM.
-  reverses ReceiptLine? @relation("ReceiptLineReversal", fields: [tenantId, reversesReceiptLineId], references: [tenantId, id], onDelete: Restrict, onUpdate: Cascade)
+  reverses     ReceiptLine?  @relation("ReceiptLineReversal", fields: [tenantId, reversesReceiptLineId], references: [tenantId, id], onDelete: Restrict, onUpdate: Cascade)
   /// The compensating lines themselves, seen from the target — the same
   /// self-link from the other end. Stated so the schema names both directions
   /// the way Prisma requires.
-  reversedBy ReceiptLine[] @relation("ReceiptLineReversal")
+  reversedBy   ReceiptLine[] @relation("ReceiptLineReversal")
 
   /// STEP S (S-D5): the return lines that name this receipt line — one
   /// `ReturnLine` → ONE `ReceiptLine`, the opaque origin reference §5.17
@@ -2008,13 +2112,13 @@ model ReturnDocument {
   /// `(tenant_id, purchase_document_id)`. RESTRICT, like every relation in
   /// this schema; `onUpdate: Restrict` too, because an id a lifecycle points
   /// at is never rewritten (contract §14: RESTRICT-based, both directions).
-  purchaseDocument PurchaseDocument @relation("ReturnDocumentPurchaseDocument", fields: [tenantId, purchaseDocumentId], references: [tenantId, id], onDelete: Restrict, onUpdate: Restrict)
+  purchaseDocument PurchaseDocument            @relation("ReturnDocumentPurchaseDocument", fields: [tenantId, purchaseDocumentId], references: [tenantId, id], onDelete: Restrict, onUpdate: Restrict)
   /// The returned quantities — one row per (purchase line, receipt line)
   /// origin, MANY per document (S-D5's multi-line return).
-  lines ReturnLine[] @relation("ReturnLineDocument")
+  lines            ReturnLine[]                @relation("ReturnLineDocument")
   /// The append-only lifecycle history whose LAST row (ordered by
   /// `(createdAt, id)`) IS this return's current state (S-D2/§4-A).
-  transitions ReturnLifecycleTransition[] @relation("ReturnLifecycleTransitionDocument")
+  transitions      ReturnLifecycleTransition[] @relation("ReturnLifecycleTransitionDocument")
 
   /// The tenant's handle on a row — the read every lookup performs.
   @@unique([tenantId, id], map: "ReturnDocument_tenant_id_id_key")
@@ -2064,8 +2168,8 @@ model ReturnLine {
   createdAt        DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
 
   returnDocument ReturnDocument @relation("ReturnLineDocument", fields: [tenantId, returnDocumentId], references: [tenantId, id], onDelete: Restrict, onUpdate: Restrict)
-  purchaseLine PurchaseLine @relation("ReturnLinePurchaseLine", fields: [tenantId, purchaseLineId], references: [tenantId, id], onDelete: Restrict, onUpdate: Restrict)
-  receiptLine ReceiptLine @relation("ReturnLineReceiptLine", fields: [tenantId, receiptLineId], references: [tenantId, id], onDelete: Restrict, onUpdate: Restrict)
+  purchaseLine   PurchaseLine   @relation("ReturnLinePurchaseLine", fields: [tenantId, purchaseLineId], references: [tenantId, id], onDelete: Restrict, onUpdate: Restrict)
+  receiptLine    ReceiptLine    @relation("ReturnLineReceiptLine", fields: [tenantId, receiptLineId], references: [tenantId, id], onDelete: Restrict, onUpdate: Restrict)
 
   /// The tenant's handle on a row — the read every lookup performs.
   @@unique([tenantId, id], map: "ReturnLine_tenant_id_id_key")
@@ -2104,25 +2208,45 @@ model ReturnLine {
 /// approve / reject / refund when given (NULL otherwise — the CREATE
 /// document's why is `ReturnDocument.reason`, one home per fact).
 model ReturnLifecycleTransition {
-  id               String           @id @default(uuid()) @db.Uuid
+  id               String      @id @default(uuid()) @db.Uuid
   /// TEXT, like every `tenantId` in this database.
-  tenantId         String           @map("tenant_id") @db.Text
+  tenantId         String      @map("tenant_id") @db.Text
   /// The return this transition belongs to — composite-keyed with the
   /// tenant; RESTRICT both directions (contract §14).
-  returnDocumentId String           @map("return_document_id") @db.Uuid
+  returnDocumentId String      @map("return_document_id") @db.Uuid
   /// The state this row REACHED — closed vocabulary, stored on the history
   /// row, NEVER a mutable document column (S-D2).
   state            ReturnState
   /// Who made the transition, OPAQUE; NULL for a machine context (§4-G).
-  actorUserId      String?          @map("actor_user_id") @db.Text
+  actorUserId      String?     @map("actor_user_id") @db.Text
   /// The stated reason of this transition when given, NULL otherwise —
   /// 1..500 enforced at the DTO, free text (§4-B).
-  reason           String?          @db.Text
+  reason           String?     @db.Text
+  /// PHASE W3.1 (confirmed closure rule): on the `REFUNDED` transition ONLY,
+  /// the `PaymentRecord` this refund settled — the payment whose compensating
+  /// row Q appended inside the same transaction (§4-E). This is the honest,
+  /// persisted link between a resolved return and its financial settlement;
+  /// the closure evaluator reads it to compute the NET payable after refunds
+  /// instead of guessing which payment compensations belong to returns.
+  /// NULL on every other state — no other transition settles a payment.
+  refundedPaymentId String?    @map("refunded_payment_id") @db.Uuid
+  /// PHASE W4-B: on the `REFUNDED` transition ONLY, the COMPENSATING
+  /// `PaymentRecord` row this refund appended — the precise ledger row, not
+  /// just the original payment it reversed. `refundedPaymentId` names the
+  /// payment funded; this column names the refund itself, so the closure
+  /// evaluator counts this row's magnitude exactly once and can never fold
+  /// an unrelated manual compensation of the same payment into the refund.
+  /// NULL on legacy rows written before the link existed and on every
+  /// non-REFUNDED state.
+  refundCompensationPaymentId String? @map("refund_compensation_payment_id") @db.Uuid
   /// The row's OWN clock — the FIRST ordering key of the projection. No
   /// `updated_at`: a transition never changes.
-  createdAt        DateTime         @default(now()) @map("created_at") @db.Timestamptz(6)
+  createdAt        DateTime    @default(now()) @map("created_at") @db.Timestamptz(6)
 
   returnDocument ReturnDocument @relation("ReturnLifecycleTransitionDocument", fields: [tenantId, returnDocumentId], references: [tenantId, id], onDelete: Restrict, onUpdate: Restrict)
+  /// The compensation row this refund produced — the OBJECT side of
+  /// `(tenant_id, refund_compensation_payment_id)` to `PaymentRecord(tenant_id, id)`.
+  refundCompensationPayment PaymentRecord? @relation("RefundCompensationPayment", fields: [tenantId, refundCompensationPaymentId], references: [tenantId, id], onDelete: Restrict, onUpdate: Cascade)
 
   /// The tenant's handle on a row — the read every lookup performs.
   @@unique([tenantId, id], map: "ReturnLifecycleTransition_tenant_id_id_key")
@@ -2132,6 +2256,13 @@ model ReturnLifecycleTransition {
   /// at 63 bytes and the full model name overran it; the COLUMNS are exactly
   /// the three the contract states.
   @@index([tenantId, returnDocumentId, createdAt], map: "ReturnTransition_tenant_id_return_document_id_created_at_idx")
+  /// The refund-association read — "which transitions does this compensation settle".
+  /// W4-D: a compensation row settles AT MOST ONE REFUNDED transition. Prisma
+  /// cannot declare the partial unique, so the database carries it as the
+  /// `WHERE refund_compensation_payment_id IS NOT NULL` unique index written
+  /// by migration `20261024120000_refund_compensation_unique_link`; this
+  /// @@index stays the tenant-first read path.
+  @@index([tenantId, refundCompensationPaymentId], map: "ReturnTransition_tenant_id_refund_compensation_payment_id_idx")
   @@map("ReturnLifecycleTransition")
 }
 
@@ -2158,20 +2289,20 @@ model ReturnLifecycleTransition {
 /// delivery. Written atomically with the business mutation inside the same
 /// Commerce database transaction.
 model AuditOutbox {
-  id        String   @id @default(uuid()) @db.Uuid
-  tenantId  String   @map("tenant_id") @db.Text
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @map("tenant_id") @db.Text
 
   /// The producer-owned event identity, matching `AuditEventInput.auditId`.
-  auditId   String   @map("audit_id") @db.VarChar(64)
+  auditId String @map("audit_id") @db.VarChar(64)
 
   /// The full event payload, serialised as JSON.
-  payload   Json
+  payload Json
 
   /// Relay attempts so far. Incremented on each failed attempt.
-  attempts  Int      @default(0)
+  attempts Int @default(0)
 
   /// When the next relay attempt is allowed. Defaults to now (immediate).
-  nextAt    DateTime @default(now()) @map("next_at") @db.Timestamptz(6)
+  nextAt DateTime @default(now()) @map("next_at") @db.Timestamptz(6)
 
   createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
 
@@ -2179,4 +2310,524 @@ model AuditOutbox {
   @@index([tenantId, nextAt], map: "AuditOutbox_tenant_nextAt_idx")
   @@index([tenantId, createdAt], map: "AuditOutbox_tenant_createdAt_idx")
   @@map("AuditOutbox")
+}
+
+// ============================================================================
+// PHASE GAP-6 — PRICE QUOTATION (استعلام قیمت / فاکتور) + CONFIRMATION LOOP
+// ============================================================================
+//
+// WHAT THESE TWO MODELS ARE. A quotation is PRICE EVIDENCE recorded against a
+// purchase document: the proforma/invoice a procurement specialist (or the
+// requesting group's liaison) obtained from a seller, entered so the requester
+// or group can CONFIRM or RETURN it before the purchase proceeds. C1 §9
+// deferred this surface ("quotation entry / requester confirmation / correction")
+// and Phase C5 recorded the blocking questions; the product contract that
+// answers them now exists (the procurement process specification), so the
+// surface arrives here — as a child lifecycle, exactly like payments (Q),
+// receiving (R) and returns (S).
+//
+// BOUNDARIES THESE MODELS OBSERVE (mirroring Q/R/S):
+//  * A quotation NEVER writes `PurchaseDocument.status`, never touches
+//    workflow, payment, receipt or return rows. Confirmation is ITS OWN state.
+//  * Tenant-first everywhere: `tenantId` is the first column, the first index
+//    component and the first argument of every repository method.
+//  * Money is `Decimal(18, 4)` like every amount in this database; line totals
+//    are DERIVED server-side by `purchase-money.ts`, never accepted from a
+//    client (the same rule as `PurchaseLine.lineTotal`).
+//  * `supplierLabel` is free text, NOT a foreign key: Commerce owns no
+//    supplier directory (the same opaque-reference rule as
+//    `PurchaseDocument.supplierId`).
+//  * Versions are IMMUTABLE evidence: a corrected/updated quotation is a NEW
+//    `version` row, never an edit of a decided one. `version` is unique per
+//    document, so two concurrent creates of the same version collide on the
+//    index rather than both landing.
+
+/// The confirmation state of ONE quotation — three members, nothing more.
+/// PENDING   — recorded, waiting for the requester's/group's decision.
+/// CONFIRMED — the price/terms were accepted; the purchase may proceed.
+/// RETURNED  — sent back for correction with a required comment; a new version
+///             supersedes it. Neither terminal state is ever rewritten: the
+///             loop continues on the NEXT version row.
+enum QuotationStatus {
+  PENDING
+  CONFIRMED
+  RETURNED
+}
+
+/// One price quotation (proforma/invoice evidence) against a purchase document.
+model PriceQuotation {
+  id                 String          @id @default(uuid()) @db.Uuid
+  /// TEXT, like every `tenantId` here — first column, first index component.
+  tenantId           String          @map("tenant_id") @db.Text
+  /// The purchase this quotation prices — composite-keyed so a quotation can
+  /// never name another tenant's document even if its UUID were guessed.
+  purchaseDocumentId String          @map("purchase_document_id") @db.Uuid
+  /// The version number within the document, 1-based, assigned SERVER-SIDE as
+  /// max(existing)+1 inside the creating transaction; the unique index below
+  /// makes a concurrent duplicate a refusal rather than two rows.
+  version            Int
+  /// Seller label as the recorder states it — free text, kept alongside the
+  /// structured `supplierId` below for quotations recorded before the supplier
+  /// directory existed and for sellers not (yet) in it.
+  supplierLabel      String?         @map("supplier_label") @db.VarChar(255)
+  /// The supplier this quote was obtained from — the SUPPLIER DIRECTORY's id
+  /// (`Supplier.id`), validated by the service against the tenant's own rows
+  /// before it is stored. Nullable because (a) the scan-only entry mode may
+  /// carry no resolvable seller and (b) quotations recorded before the supplier
+  /// directory existed have none. NO foreign key on purpose: the C1 header pins
+  /// every `supplierId` in this database as an OPAQUE reference and the
+  /// isolation suite's foreign-key scan would refuse a second vocabulary; the
+  /// referential answer is the service's tenant-scoped existence check plus the
+  /// supplier history read, never a join.
+  supplierId         String?         @map("supplier_id") @db.Uuid
+  /// The seller's own document number — an OPAQUE reference (§13 convention).
+  quoteReference     String?         @map("quote_reference") @db.VarChar(128)
+  /// The date ON the quoted document, as the seller stated it. Nullable: a
+  /// screenshot of a price list may carry no date worth storing.
+  quoteDate          DateTime?       @map("quote_date") @db.Date
+  /// ISO 4217 code stated on the quote; NULL = none stated (no default — the
+  /// same MONEY rule as `PurchaseDocument.currency`).
+  currency           String?         @db.VarChar(3)
+  /// The quote's total. DERIVED from the lines when lines are recorded, or
+  /// the recorder's stated invoice total when they are not (the "fast" entry
+  /// mode where the scanned document itself is the evidence). NULL = not
+  /// stated, never zero.
+  totalAmount        Decimal?        @map("total_amount") @db.Decimal(18, 4)
+  /// The uploaded/scanned document's reference (object key or URL produced by
+  /// the platform's storage). TEXT because no length contract exists yet; the
+  /// row stores a REFERENCE, never file bytes. NULL = no scan attached.
+  attachmentRef      String?         @map("attachment_ref") @db.Text
+  /// Free-text note by the recorder (context, delivery terms, caveats).
+  notes              String?         @db.Text
+  /// The confirmation state (see `QuotationStatus`). A decision moves it ONCE,
+  /// conditionally, from PENDING; decided rows are never rewritten.
+  status             QuotationStatus @default(PENDING)
+  /// Who recorded it — the acting session's user (server-resolved, never from
+  /// the request body), the same actor convention as every Commerce row.
+  createdByUserId    String          @map("created_by_user_id") @db.Text
+  /// Who decided it — server-resolved at decision time. NULL while PENDING.
+  decidedByUserId    String?         @map("decided_by_user_id") @db.Text
+  /// When the decision landed — server clock, written with the status.
+  decidedAt          DateTime?       @map("decided_at") @db.Timestamptz(6)
+  /// The decision comment. REQUIRED by the service for a RETURNED decision
+  /// (the reason the price came back), optional for a confirmation.
+  decisionComment    String?         @map("decision_comment") @db.Text
+  createdAt          DateTime        @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt          DateTime        @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  /// The document this quotation prices — OBJECT side of
+  /// `(tenant_id, purchase_document_id)`. RESTRICT: price evidence is never
+  /// removed by removing its document, and no deletion path exists here.
+  purchaseDocument PurchaseDocument @relation("PriceQuotationDocument", fields: [tenantId, purchaseDocumentId], references: [tenantId, id], onDelete: Restrict, onUpdate: Cascade)
+  /// The quoted lines (optional: the scanned document alone may be the
+  /// evidence, and the confirmation then accepts the stated total).
+  lines            QuotationLine[]  @relation("QuotationLines")
+
+  /// The tenant's handle on a row — the read every lookup performs.
+  @@unique([tenantId, id], map: "PriceQuotation_tenant_id_id_key")
+  /// ONE version per document, ever: the concurrency answer for two creates
+  /// racing on the same next version (the repository translates the refusal).
+  @@unique([tenantId, purchaseDocumentId, version], map: "PriceQuotation_tenant_document_version_key")
+  /// The document's quotation list ("is there a PENDING one?") — tenant-first.
+  @@index([tenantId, purchaseDocumentId, status], map: "PriceQuotation_tenant_document_status_idx")
+  /// The supplier's quotation history ("which quotes name this seller?") —
+  /// tenant-first like every read here; added with the supplier directory.
+  @@index([tenantId, supplierId], map: "PriceQuotation_tenant_id_supplier_id_idx")
+  @@map("PriceQuotation")
+}
+
+/// ONE priced line of a quotation — the optional itemisation (count × unit
+/// price = line total, summed into the quote total). Immutable like its parent:
+/// a correction is a new version's lines, never an edit of these.
+model QuotationLine {
+  id          String   @id @default(uuid()) @db.Uuid
+  /// TEXT, like every `tenantId` here — first column, first index component.
+  tenantId    String   @map("tenant_id") @db.Text
+  /// The quotation these lines belong to — composite-keyed, RESTRICT, the
+  /// same child shape as every relation in this schema.
+  quotationId String   @map("quotation_id") @db.Uuid
+  /// The line's position within the quotation, 1-based — unique per
+  /// quotation so a duplicated position is a refusal, not a reordering.
+  lineNumber  Int      @map("line_number")
+  /// What is being quoted — one bounded string, no item catalogue (Commerce
+  /// owns none; the same opaque-item rule as a free-text line description).
+  description String   @db.VarChar(512)
+  /// `Decimal(18, 4)` — required, like `PurchaseLine.quantity`: a quoted line
+  /// without a quantity is not a line.
+  quantity    Decimal  @db.Decimal(18, 4)
+  /// `Decimal(18, 4)` — required; the price of ONE unit as quoted.
+  unitPrice   Decimal  @map("unit_price") @db.Decimal(18, 4)
+  /// `Decimal(18, 4)` — DERIVED: `quantity × unitPrice` computed server-side
+  /// by `multiplyMoney`, never client-stated (the `PurchaseLine` rule).
+  lineTotal   Decimal  @map("line_total") @db.Decimal(18, 4)
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  /// The quotation these lines belong to — OBJECT side of
+  /// `(tenant_id, quotation_id)`.
+  quotation PriceQuotation @relation("QuotationLines", fields: [tenantId, quotationId], references: [tenantId, id], onDelete: Restrict, onUpdate: Cascade)
+
+  /// The tenant's handle on a row — the read every lookup performs.
+  @@unique([tenantId, id], map: "QuotationLine_tenant_id_id_key")
+  /// One position per line per quotation — the ordering key, tenant-first.
+  @@unique([tenantId, quotationId, lineNumber], map: "QuotationLine_tenant_quotation_line_key")
+  /// The quotation's line list — tenant-first like every read here.
+  @@index([tenantId, quotationId], map: "QuotationLine_tenant_quotation_id_idx")
+  @@map("QuotationLine")
+}
+
+// ============================================================================
+// SUPPLIER MASTER DATA — the procurement requirements' "module 7": a reusable,
+// tenant-scoped directory of the sellers the organisation buys from, replacing
+// the free-text label on a quotation and the opaque string on a document.
+// ============================================================================
+//
+// WHY HERE: the requirements name a supplier database with identity, contact
+// and banking facts (name, entity type, national code, SHEBA/card, bank,
+// address, phone, real/legal distinction) that purchase and payment processing
+// must SELECT from and REPORT on. No other context owns "the tenant's
+// suppliers" — a supplier is a COMMERCE fact, so Commerce stores it,
+// tenant-scoped, exactly like every other row in this database.
+//
+// MUST NOT BECOME: not inventory, not a price agreement (a price lives on the
+// quotation that quoted it), not Core identity (a supplier is NOT a user), and
+// NOT DELETABLE — a supplier a purchase, quotation or payment ever named must
+// stay readable forever, so there is no delete route and no `deletedAt`;
+// `status` (ACTIVE/INACTIVE) is the supported retirement.
+//
+// BANKING FIELDS ARE SENSITIVE BY CONTRACT: sheba/card/nationalCode/bankName
+// are returned ONLY by the `commerce.supplier.manage` banking route — list and
+// ordinary detail projections exclude them.
+//
+// DUPLICATE PREVENTION: the unique pair below makes a second supplier with the
+// same national code inside one tenant a STRUCTURAL refusal, and the service
+// adds the exact-identity rule (same entity type + name + national code —
+// exact equality only, no fuzzy matching, which is what stops the system
+// silently selecting the same record for similar names).
+enum SupplierEntityType {
+  INDIVIDUAL
+  LEGAL
+}
+
+enum SupplierStatus {
+  ACTIVE
+  INACTIVE
+}
+
+/// ONE supplier in the tenant's directory (see the block comment above the
+/// enums). `id` is the value a purchase document's or a quotation's
+/// `supplierId` carries; `tenantId` is the first column and first index
+/// component like every row in this database. There are NO relations on this
+/// model — every reference to it is the opaque-string convention the C1
+/// header pins, answered by the service's tenant-scoped existence check.
+model Supplier {
+  id              String             @id @default(uuid()) @db.Uuid
+  /// TEXT, like every `tenantId` here — first column, first index component.
+  tenantId        String             @map("tenant_id") @db.Text
+  /// Individual (حقیقی) or legal entity (حقوقی) — the closed vocabulary the
+  /// requirements name. Required: identity fields differ accordingly.
+  entityType      SupplierEntityType @map("entity_type")
+  /// The supplier's display name — a person's name for INDIVIDUAL, the
+  /// trading name for LEGAL. Required: an unrecognisable directory row is not
+  /// a directory row.
+  name            String             @db.VarChar(255)
+  /// Registered company name for a LEGAL supplier. Required by the SERVICE for
+  /// LEGAL rows (a conditional the DTO's closed vocabulary cannot state);
+  /// NULL for INDIVIDUAL.
+  companyName     String?            @map("company_name") @db.VarChar(255)
+  /// National code (کد ملی) for an INDIVIDUAL / registration id for a LEGAL
+  /// entity — 10 digits, DTO-validated, UNIQUE per tenant in the index below.
+  /// NULL when not stated; PostgreSQL's default NULLS DISTINCT keeps the
+  /// unique from colliding on NULLs.
+  nationalCode    String?            @map("national_code") @db.VarChar(10)
+  /// Iranian SHEBA (IBAN): `IR` + 24 digits, normalised UPPERCASE by the
+  /// service. VARCHAR(26) is the exact wire length.
+  shebaNumber     String?            @map("sheba_number") @db.VarChar(26)
+  /// Card number (شماره کارت) — 16 digits, DTO-validated. NULL for suppliers
+  /// paid by SHEBA only.
+  cardNumber      String?            @map("card_number") @db.VarChar(16)
+  /// Bank name as the supplier states it — free text (no bank catalogue
+  /// exists, and inventing one would be another owner's vocabulary).
+  bankName        String?            @map("bank_name") @db.VarChar(128)
+  address         String?            @db.VarChar(1000)
+  phone           String?            @db.VarChar(32)
+  email           String?            @db.VarChar(255)
+  /// Extra context the commercial team records (delivery terms, caveats).
+  notes           String?            @db.VarChar(2000)
+  /// ACTIVE by default; INACTIVE is the supported retirement — refused for
+  /// NEW references, fully readable, so every historical row that names it
+  /// still resolves. There is no delete.
+  status          SupplierStatus     @default(ACTIVE)
+  /// Who created it — server-resolved acting user (the same actor convention
+  /// as every Commerce row); NOT NULL because the service refuses a machine
+  /// context for supplier writes.
+  createdByUserId String             @map("created_by_user_id") @db.Text
+  /// Who last changed it — server-resolved at update time. NULL until then.
+  updatedByUserId String?            @map("updated_by_user_id") @db.Text
+  createdAt       DateTime           @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt       DateTime           @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  /// The tenant's handle on a row — the read every lookup performs.
+  @@unique([tenantId, id], map: "Supplier_tenant_id_id_key")
+  /// ONE supplier per national code per tenant, STRUCTURAL: two concurrent
+  /// creates with the same code cannot both land; the repository translates
+  /// the refusal into a named 409.
+  @@unique([tenantId, nationalCode], map: "Supplier_tenant_id_national_code_key")
+  /// The directory list read ("active suppliers by name") — tenant-first.
+  @@index([tenantId, status, name], map: "Supplier_tenant_id_status_name_idx")
+  @@map("Supplier")
+}
+
+/// PAYMENT PLAN (دستور پرداخت و رژیم پرداخت): the business requirements'
+/// "payment instruction" — a separate concept from the append-only
+/// `PaymentRecord` history. The record history answers "what money events were
+/// recorded"; the plan answers "what was ORDERED to be paid, in how many
+/// stages, under whose approval". Requirements §6-§7: a purchase may be paid
+/// in several stages (رژیم پرداخت), each later payment requires its own
+/// approval, a partially paid case must never look closed, and the plan may
+/// never push the recorded total past the document's commitment.
+///
+/// STATUS IS AN EXPLICIT LIFECYCLE, NOT A COLUMN A RULE HIDES BEHIND: the
+/// transitions are exactly DRAFT -> SUBMITTED -> APPROVED, with SUPERSEDED and
+/// CANCELLED as the two terminal exits. There is no "edit an approved plan"
+/// act — a plan that must change is SUPERSEDED by a new draft that names it,
+/// so the approved version and its approval evidence stay byte-for-byte
+/// readable (the same rule the quotation lifecycle applies).
+enum PaymentPlanStatus {
+  DRAFT
+  SUBMITTED
+  APPROVED
+  SUPERSEDED
+  CANCELLED
+}
+
+enum PaymentInstallmentStatus {
+  PENDING
+  APPROVED
+  CANCELLED
+}
+
+/// ONE payment plan against ONE purchase document. `committedAmount` is a
+/// SNAPSHOT of the document's `totalAmount` at plan creation — the ceiling the
+/// plan's installments were validated against — so a later change to the
+/// document's total cannot silently rewrite what this plan was approved to
+/// cover (the currency rides the same snapshot rule as PaymentRecord's).
+model PaymentPlan {
+  id                 String            @id @default(uuid()) @db.Uuid
+  /// TEXT, like every `tenantId` in this database — first argument of every
+  /// repository method and first column of every index.
+  tenantId           String            @map("tenant_id") @db.Text
+  /// The document the plan orders payment for — composite-keyed, so a plan
+  /// can never name another tenant's document.
+  purchaseDocumentId String            @map("purchase_document_id") @db.Uuid
+  status             PaymentPlanStatus @default(DRAFT)
+  /// The ceiling this plan's installments were summed against at creation.
+  committedAmount    Decimal           @map("committed_amount") @db.Decimal(18, 4)
+  /// Snapshotted from the document, like `PaymentRecord.currency`.
+  currency           String?           @db.VarChar(3)
+  /// Why the payment is staged (رژیم پرداخت reason) — free text the
+  /// requirements ask to keep beside each plan.
+  note               String?           @db.VarChar(1000)
+  /// The approved plan this draft replaces — NULL for a first plan. At most
+  /// ONE successor per plan, enforced by the unique index below, so two
+  /// concurrent revisions cannot both supersede the same approved plan.
+  supersedesPlanId   String?           @map("supersedes_plan_id") @db.Uuid
+  requestedByUserId  String?           @map("requested_by_user_id") @db.Text
+  submittedAt        DateTime?         @map("submitted_at") @db.Timestamptz(6)
+  approvedByUserId   String?           @map("approved_by_user_id") @db.Text
+  approvedAt         DateTime?         @map("approved_at") @db.Timestamptz(6)
+  cancelledAt        DateTime?         @map("cancelled_at") @db.Timestamptz(6)
+  cancelReason       String?           @map("cancel_reason") @db.VarChar(500)
+  createdAt          DateTime          @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  purchaseDocument PurchaseDocument     @relation("PaymentPlanDocument", fields: [tenantId, purchaseDocumentId], references: [tenantId, id], onDelete: Restrict, onUpdate: Cascade)
+  supersedes       PaymentPlan?         @relation("PaymentPlanSupersession", fields: [tenantId, supersedesPlanId], references: [tenantId, id], onDelete: Restrict, onUpdate: Cascade)
+  supersededBy     PaymentPlan?         @relation("PaymentPlanSupersession")
+  installments     PaymentInstallment[] @relation("PlanInstallments")
+
+  @@unique([tenantId, id], map: "PaymentPlan_tenant_id_id_key")
+  /// One successor per plan, structural: two drafts cannot both name the same
+  /// approved plan as superseded.
+  @@unique([tenantId, supersedesPlanId], map: "PaymentPlan_tenant_id_supersedes_plan_id_key")
+  @@index([tenantId, purchaseDocumentId, createdAt], map: "PaymentPlan_tenant_id_purchase_document_id_created_at_idx")
+  @@map("PaymentPlan")
+}
+
+/// ONE stage of a plan — مبلغ، سررسید و روش هر قسط. An installment is
+/// IMMUTABLE once created: correction is a plan-level supersession, never an
+/// edit, so the installment's own state machine is only PENDING -> APPROVED
+/// (decision), PENDING/APPROVED -> CANCELLED, APPROVED -> executed. Execution
+/// is a FACT the server states by linking the append-only `PaymentRecord` row
+/// it created (`executedPaymentId`) — never a status the client may set.
+model PaymentInstallment {
+  id                String                   @id @default(uuid()) @db.Uuid
+  tenantId          String                   @map("tenant_id") @db.Text
+  planId            String                   @map("plan_id") @db.Uuid
+  /// 1-based position inside the plan — the wire's handle for the row.
+  seq               Int
+  amount            Decimal                  @db.Decimal(18, 4)
+  dueDate           DateTime?                @map("due_date") @db.Timestamptz(6)
+  method            PaymentMethod
+  status            PaymentInstallmentStatus @default(PENDING)
+  note              String?                  @db.VarChar(500)
+  approvedByUserId  String?                  @map("approved_by_user_id") @db.Text
+  approvedAt        DateTime?                @map("approved_at") @db.Timestamptz(6)
+  /// The `PaymentRecord` row this installment's execution appended — NULL
+  /// until executed, UNIQUE per tenant so one money event can never execute
+  /// two installments and one installment can never be executed twice.
+  executedPaymentId String?                  @map("executed_payment_id") @db.Uuid
+  executedAt        DateTime?                @map("executed_at") @db.Timestamptz(6)
+  createdAt         DateTime                 @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  plan            PaymentPlan    @relation("PlanInstallments", fields: [tenantId, planId], references: [tenantId, id], onDelete: Restrict, onUpdate: Cascade)
+  executedPayment PaymentRecord? @relation("InstallmentExecutedPayment", fields: [tenantId, executedPaymentId], references: [tenantId, id], onDelete: Restrict, onUpdate: Cascade)
+
+  @@unique([tenantId, planId, seq], map: "PaymentInstallment_tenant_id_plan_id_seq_key")
+  @@unique([tenantId, executedPaymentId], map: "PaymentInstallment_tenant_id_executed_payment_id_key")
+  @@index([tenantId, planId], map: "PaymentInstallment_tenant_id_plan_id_idx")
+  @@map("PaymentInstallment")
+}
+
+// ============================================================================
+// Phase W2-B contract — COMMERCE → INVENTORY INTEGRATION RECORD
+// ============================================================================
+
+/// Phase W2-B: the durable integration record between Commerce's append-only
+/// receiving/return history and Inventory's append-only stock ledger.
+///
+/// WHY A TABLE AND NOT A SYNC-ONLY CALL: the two contexts own separate
+/// databases; no transaction can span both, so "receipt committed, posting
+/// unknown" is a state the system must be able to SEE and RETRY. This row is
+/// that state: it is written inside the SAME commerce transaction that
+/// appends the receipt/return evidence, and the posting attempt happens after
+/// that commit — PENDING/FAILED stays honest, POSTED records the resulting
+/// movement id, and the retry route can re-attempt without ever guessing at
+/// the business data again (item, cell, quantity and unit are all facts THIS
+/// row carries).
+///
+/// `sourceLineId` is the receipt line or return line id — the SAME id the
+/// inventory movement carries as `sourceId`, so a second attempt can never
+/// produce a second movement even if the marking read raced: Inventory's own
+/// `(source_type, source_id, kind)` unique is the last defence, and the
+/// service reads a duplicate refusal as POSTED.
+enum InventoryPostingStatus {
+  /// Planned but not yet attempted, or the last attempt failed before the
+  /// inventory call could be made.
+  PENDING
+  /// The inventory movement exists; `movementId` names it.
+  POSTED
+  /// The last attempt failed — `lastError` carries the reason verbatim so an
+  /// operator can act on it (mapping, unit, stock, warehouse …).
+  FAILED
+}
+
+model InventoryPosting {
+  id             String                 @id @default(uuid()) @db.Uuid
+  /// TEXT, like every `tenantId` in this database — and the FIRST column of
+  /// every index here (§3-F).
+  tenantId       String                 @map("tenant_id") @db.Text
+  /// Which business event this posting stands for: RECEIPT for a physical
+  /// receipt line, RECEIPT_COMPENSATION for a compensating receiving line,
+  /// RETURN_DISPATCH for a return that reached physical handover. VARCHAR,
+  /// not an enum: the vocabulary is owned by the integration service.
+  kind           String                 @map("kind") @db.VarChar(32)
+  /// The receipt line or return line this posting was planned from — the
+  /// SAME value the inventory movement records as `sourceId`. UNIQUE with
+  /// (tenant, kind): one business line posts at most once.
+  sourceLineId   String                 @map("source_line_id") @db.Uuid
+  /// The purchase line this quantity belongs to — traceability for repair
+  /// and reconciliation, opaque like every reference in this schema.
+  purchaseLineId String                 @map("purchase_line_id") @db.Uuid
+  /// The purchase line's `itemReference` as stated at plan time — the SKU
+  /// the item lookup resolves against. Stored so a later item creation can
+  /// rescue a FAILED posting without re-deriving the purchase side.
+  itemRef        String                 @map("item_ref") @db.Text
+  /// The resolved inventory item id — set when the item lookup succeeds.
+  itemId         String?                @map("item_id") @db.Uuid
+  /// The destination cell for inbound, the source cell for outbound —
+  /// inherited from the original receipt's posting for compensations and
+  /// returns (stock leaves where it arrived).
+  warehouseId    String                 @map("warehouse_id") @db.Uuid
+  /// '' is the warehouse-level cell — the same convention the inventory
+  /// ledger stores. TEXT, not UUID, because the empty key is the majority.
+  locationId     String                 @map("location_id") @db.Text
+  /// The stated quantity in `unit` — the purchase line's own unit label.
+  quantity       Decimal                @db.Decimal(18, 4)
+  unit           String                 @map("unit") @db.VarChar(32)
+  status         InventoryPostingStatus @default(PENDING) @map("status")
+  /// The inventory movement this posting produced — set on POSTED.
+  movementId     String?                @map("movement_id") @db.Uuid
+  /// Attempt bookkeeping for the retry surface: count, last error, last
+  /// attempt instant. `lastError` carries the server's refusal VERBATIM.
+  attempts       Int                    @default(0)
+  lastError      String?                @map("last_error") @db.Text
+  lastAttemptAt  DateTime?              @map("last_attempt_at") @db.Timestamptz(6)
+  createdAt      DateTime               @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt      DateTime               @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  /// The append-only attempt history this posting produced — one row per
+  /// ledger call (success, refusal or duplicate answer).
+  attemptHistory InventoryPostingAttempt[] @relation("InventoryPostingAttempts")
+
+  /// One business line posts at most once — the durable half of the
+  /// idempotency contract (the inventory ledger's unique is the other half).
+  @@unique([tenantId, kind, sourceLineId], map: "InventoryPosting_tenant_id_kind_source_line_id_key")
+  /// The composite key the attempt rows foreign-key into — the same
+  /// tenant-first ownership predicate every other child row uses.
+  @@unique([tenantId, id], map: "InventoryPosting_tenant_id_id_key")
+  /// The operational queue read — pending and failed postings.
+  @@index([tenantId, status, createdAt], map: "InventoryPosting_tenant_id_status_created_at_idx")
+  /// The per-purchase-line posting read — reconciliation and return origin.
+  @@index([tenantId, purchaseLineId], map: "InventoryPosting_tenant_id_purchase_line_id_idx")
+  /// The return/compensation origin lookup: "what posting did this receipt
+  /// line produce" — the cell an outbound posting inherits.
+  @@index([tenantId, sourceLineId], map: "InventoryPosting_tenant_id_source_line_id_idx")
+  @@map("InventoryPosting")
+}
+
+/// ONE row per posting ATTEMPT — the append-only half of the posting's
+/// observability contract. `InventoryPosting` keeps the CURRENT state
+/// (status, lastError, attempts) for the repair queue; this table keeps the
+/// WHOLE story — every call against the ledger, its result, the sanitized
+/// error, the movement it produced, who asked, and when it started and
+/// finished. Attempt rows are never updated or deleted: a retry appends a
+/// NEW row, so "it failed twice with the same reason and posted on the third
+/// try" is readable history, not an overwrite.
+///
+/// `result` is owned by the integration service: POSTED (the ledger created
+/// the movement), POSTED_DUPLICATE (the ledger already held it — idempotent
+/// answer, no second movement) and FAILED (a refusal, recorded VERBATIM in
+/// `error`). `attempt` is the 1-based ordinal within the posting — UNIQUE
+/// with (tenantId, postingId), so two concurrent retries can never write
+/// the same ordinal.
+model InventoryPostingAttempt {
+  id          String    @id @default(uuid()) @db.Uuid
+  /// TEXT, like every `tenantId` in this database — and the FIRST column of
+  /// every index here (§3-F).
+  tenantId    String    @map("tenant_id") @db.Text
+  postingId   String    @map("posting_id") @db.Uuid
+  /// 1-based ordinal inside (tenantId, postingId) — the "third try" column.
+  attempt     Int       @map("attempt")
+  /// POSTED | POSTED_DUPLICATE | FAILED — closed by the integration service.
+  result      String    @map("result") @db.VarChar(24)
+  /// The refusal, verbatim, truncated to the posting row's 2000-char bound.
+  error       String?   @map("error") @db.Text
+  /// The inventory movement this attempt produced — set on POSTED.
+  movementId  String?   @map("movement_id") @db.Uuid
+  /// The user who triggered the attempt (receipt committer or retrier).
+  actorUserId String?   @map("actor_user_id") @db.Text
+  startedAt   DateTime  @map("started_at") @db.Timestamptz(6)
+  finishedAt  DateTime  @map("finished_at") @db.Timestamptz(6)
+  createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  /// The posting row this attempt belongs to — TENANT-COMPOSITE, like every
+  /// child row in this schema.
+  posting InventoryPosting @relation("InventoryPostingAttempts", fields: [tenantId, postingId], references: [tenantId, id], onDelete: Restrict, onUpdate: Cascade)
+
+  /// The tenant-first row key every table in this schema carries (§3-F).
+  @@unique([tenantId, id], map: "InventoryPostingAttempt_tenant_id_id_key")
+  /// The ordinal is unique per posting — the append-once contract.
+  @@unique([tenantId, postingId, attempt], map: "InventoryPostingAttempt_tenant_id_posting_id_attempt_key")
+  /// The per-posting history read — "every attempt on this posting".
+  @@index([tenantId, postingId], map: "InventoryPostingAttempt_tenant_id_posting_id_idx")
+  @@map("InventoryPostingAttempt")
 }

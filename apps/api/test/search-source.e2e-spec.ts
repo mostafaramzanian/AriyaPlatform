@@ -13,7 +13,6 @@ import request from 'supertest';
 import { ValidationError } from 'class-validator';
 
 import { PrismaService } from '../src/database/prisma.service';
-import { Prisma } from '@prisma/client';
 import { PrismaModule } from '../src/database/prisma.module';
 import { SearchModule } from '../src/search/search.module';
 import { JwtAuthGuard } from '../src/auth/guards/jwt-auth.guard';
@@ -112,7 +111,7 @@ describe('Platform Search Source E2E (registration, projection, authorization, t
         passwordHash: 'not-a-real-hash',
         firstName,
         lastName: 'آزمون',
-      } as Prisma.UserCreateInput,
+      },
     });
     createdUsers.push(user.id);
     return user.id;
@@ -250,8 +249,9 @@ describe('Platform Search Source E2E (registration, projection, authorization, t
     [field: string]: unknown;
   }
 
-  const resultsFor = (body) => (body.results ?? []) as SearchResultRow[];
-  const keyed = (body, key: string) =>
+  const resultsFor = (body: { results?: SearchResultRow[] }) =>
+    (body.results ?? []) as SearchResultRow[];
+  const keyed = (body: { results?: SearchResultRow[] }, key: string) =>
     resultsFor(body).filter((row) => row.sourceKey === key);
 
   describe('registration rules at the REAL port', () => {
@@ -309,12 +309,15 @@ describe('Platform Search Source E2E (registration, projection, authorization, t
       expect(mine.map((row) => row.sourceId).sort()).toEqual(['doc-a', 'doc-b']);
 
       const docA = mine.find((row) => row.sourceId === 'doc-a');
+      expect(docA).toBeDefined();
+      if (!docA) return;
       expect(docA.sourceType).toBe('EXTERNAL');
       expect(docA.sourceKey).toBe(KEYS.purchase);
       expect(docA.title).toBe(`سند خرید ${TOKEN}`);
       expect(docA.snippet).toContain(TOKEN);
-      expect(docA.highlights.length).toBeGreaterThan(0);
-      expect(docA.highlights[0].end).toBeGreaterThan(docA.highlights[0].start);
+      const docAHighlights = docA.highlights as { start: number; end: number }[];
+      expect(docAHighlights.length).toBeGreaterThan(0);
+      expect(docAHighlights[0].end).toBeGreaterThan(docAHighlights[0].start);
       expect(docA.navigation).toEqual({ href: '/admin/test/purchase-documents/doc-a' });
       expect(docA.score).toBeGreaterThan(0);
       expect(docA.score).toBeLessThanOrEqual(1);
@@ -370,7 +373,9 @@ describe('Platform Search Source E2E (registration, projection, authorization, t
       const asB = await search(TOKEN, userBId);
       const seenByB = keyed(asB.body, KEYS.purchase).map((row) => row.sourceId);
       expect(seenByB).toEqual(['doc-b1']);
-      expect(asB.body.results.map((row) => row.sourceId)).toEqual(['doc-b1']);
+      expect(
+        (asB.body.results as SearchResultRow[]).map((row) => row.sourceId)
+      ).toEqual(['doc-b1']);
     });
   });
 

@@ -40,6 +40,7 @@ import {
   responseBuffer,
 } from './reporting-export.fixtures';
 import { PrismaService as CorePrismaService } from '../src/database/prisma.service';
+import { ensureHrReportingTestProvisioning } from './fixtures/hr-provisioning';
 import { HrPrismaService } from '../src/modules/hr/database/hr-prisma.service';
 
 type SupertestResponse = import('supertest').Response;
@@ -200,7 +201,7 @@ describe('Reporting — Personnel Traffic Report (fourth vertical slice)', () =>
   const reportUrl = (suffix = '') => `${API_PREFIX}/reporting/hr/personnel-traffic${suffix}`;
   const envelope = <T,>(body: { data?: T } | T): T =>
     (body as { data?: T }).data ?? (body as T);
-  const idsOf = (body) => envelope(body).items.map((item) => item.id);
+  const idsOf = (body: unknown) => ((envelope(body as { items?: unknown }).items ?? []) as { id: string }[]).map((item) => item.id);
 
   /** Unit → position → employee, returned for punching against. */
   async function hireEmployee(
@@ -265,6 +266,14 @@ describe('Reporting — Personnel Traffic Report (fourth vertical slice)', () =>
 
   beforeAll(async () => {
     await waitForReadiness();
+
+    // Test-only provisioning for THIS tenant, and it MUST run BEFORE any login: login resolves
+    // the caller's permission claim through the PermissionSource port (which caches its answer),
+    // so a grant written after the first token is minted leaves every later request carrying a
+    // permission-empty identity — and every HR write below would answer 403 instead of 201.
+    // Shapes mirrored, nothing else touched: fixtures/hr-provisioning.ts.
+    await ensureHrReportingTestProvisioning(getCoreDb(), ['tenant-test-1']);
+
     const roleId = await findAdminRoleId();
 
     const seeded = await login('admin@localhost', PASSWORDS.seededAdmin);
@@ -318,7 +327,7 @@ describe('Reporting — Personnel Traffic Report (fourth vertical slice)', () =>
       )
       .set('Authorization', `Bearer ${admin.token}`)
       .expect(200);
-    dateKeyDayOne = dayOne.body.items.find((row) => row.id === deviceClosedId)?.dateKey;
+    dateKeyDayOne = dayOne.body.items.find((row: { id: string; dateKey: string }) => row.id === deviceClosedId)?.dateKey ?? '';
     if (!dateKeyDayOne) throw new Error('[E2E] HR register did not return the day-key for day one');
 
     // Tenant B: one employee, one punch — the isolation probe.
@@ -538,7 +547,7 @@ describe('Reporting — Personnel Traffic Report (fourth vertical slice)', () =>
     expect(Array.isArray(res.body.items)).toBe(true);
     // The punch (create) and the clock-out (update) were both audited by HR.
     expect(res.body.total).toBeGreaterThanOrEqual(2);
-    const actions = res.body.items.map((item) => item.action);
+    const actions = res.body.items.map((item: { action: string }) => item.action);
     expect(actions).toEqual(expect.arrayContaining(['create', 'update']));
     // The timeline projection never carries raw envelope internals.
     for (const item of res.body.items) {
@@ -562,7 +571,7 @@ describe('Reporting — Personnel Traffic Report (fourth vertical slice)', () =>
       .expect(200);
 
     expect(res.body.total).toBeGreaterThanOrEqual(1);
-    const actions = res.body.items.map((item) => item.action);
+    const actions = res.body.items.map((item: { action: string }) => item.action);
     expect(actions).toEqual(expect.arrayContaining(['adjust']));
     expect(actions).not.toContain('create');
   });
@@ -615,7 +624,7 @@ describe('Reporting — Personnel Traffic Report (fourth vertical slice)', () =>
     expect(sheet.header).toEqual(['کد پرسنل', 'تاریخ', 'روز هفته', 'ورود', 'خروج', 'منبع']);
     expect(sheet.data).toHaveLength(4);
     expect(sheet.data.map((row) => row[0]).sort()).toEqual(
-      listed.items.map((item) => item.employeeCode).sort()
+      listed.items.map((item: { employeeCode: string }) => item.employeeCode).sort()
     );
     // The metadata block above the table exists: «خلاصه» heads the summary counts.
     expect(sheet.firstColumn).toContain('خلاصه');

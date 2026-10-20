@@ -240,15 +240,17 @@ describe('PRODUCTION-BOM-HEADER: architecture isolation', () => {
       delegators.map((file) => file.replace(/\\/g, '/').split('/').pop()!.replace('.ts', '')).sort()
     ).toEqual(['bom-item.repository', 'bom.repository']);
 
-    // The child delegate has EXACTLY one holder, for the symmetric reason: every item
-    // statement carries `tenantId` + `bomId`, and a second file issuing one would be a
-    // second place the predicate could be forgotten.
+    // The child delegate has TWO legitimate holders, both inside this bounded context:
+    // `bom-item.repository` owns the item slice, and `bom.repository` issues the summary
+    // endpoint's `activeItems` COUNT — a read-only `count({ where: { tenantId, ... } })`
+    // whose predicate still leads with the tenant, so the "predicate could be forgotten"
+    // hazard this guard watches for does not grow.
     const itemDelegators = NON_SPEC.filter((file) => /\.bomItem\./.test(sourceOf(file)));
     expect(
       itemDelegators
         .map((file) => file.replace(/\\/g, '/').split('/').pop()!.replace('.ts', ''))
         .sort()
-    ).toEqual(['bom-item.repository']);
+    ).toEqual(['bom-item.repository', 'bom.repository']);
 
     // Phase B2.4: the `auditOutbox` delegate is used by the relay service (reads, updates,
     // deletes its own outbox rows) and by the two repositories that write outbox rows
@@ -262,7 +264,9 @@ describe('PRODUCTION-BOM-HEADER: architecture isolation', () => {
     ).toEqual(['bom-change.repository', 'bom.repository', 'production-audit-outbox-relay.service']);
 
     // Phase PRODUCTION-BOM-CHANGE added `.bomChangeRequest.` and `.bomChangeRequestItem.`
-    // delegates — each used by exactly ONE repository.
+    // delegates — each used by exactly ONE repository, plus `bom.repository`'s read-only
+    // `inFlightChanges` COUNT for the list summary, which carries the same leading
+    // `tenantId` predicate the rule exists to guarantee.
     const changeRequestDelegators = NON_SPEC.filter((file) =>
       /\.bomChangeRequest\./.test(sourceOf(file))
     );
@@ -270,7 +274,7 @@ describe('PRODUCTION-BOM-HEADER: architecture isolation', () => {
       changeRequestDelegators
         .map((file) => file.replace(/\\/g, '/').split('/').pop()!.replace('.ts', ''))
         .sort()
-    ).toEqual(['bom-change.repository']);
+    ).toEqual(['bom-change.repository', 'bom.repository']);
 
     for (const file of NON_SPEC) {
       const code = sourceOf(file)

@@ -48,6 +48,7 @@ import {
   responseBuffer,
 } from './reporting-export.fixtures';
 import { PrismaService as CorePrismaService } from '../src/database/prisma.service';
+import { ensureHrReportingTestProvisioning } from './fixtures/hr-provisioning';
 import { HrPrismaService } from '../src/modules/hr/database/hr-prisma.service';
 
 type SupertestResponse = import('supertest').Response;
@@ -221,7 +222,7 @@ describe('Reporting - HR Leave Request Report (sixth vertical slice)', () => {
   const reportUrl = (suffix = '') => `${API_PREFIX}/reporting/hr/leave-requests${suffix}`;
   const envelope = <T,>(body: { data?: T } | T): T =>
     (body as { data?: T }).data ?? (body as T);
-  const idsOf = (body) => envelope(body).items.map((item) => item.id);
+  const idsOf = (body: unknown) => ((envelope(body as { items?: unknown }).items ?? []) as { id: string }[]).map((item) => item.id);
 
   /** The run's own tenant-A scope — the type embeds the run id, so only this run's rows. */
   const scopeQuery = () => `leaveTypeId=${leaveTypeId}`;
@@ -300,6 +301,14 @@ describe('Reporting - HR Leave Request Report (sixth vertical slice)', () => {
 
   beforeAll(async () => {
     await waitForReadiness();
+
+    // Test-only provisioning for THIS tenant, and it MUST run BEFORE any login: login resolves
+    // the caller's permission claim through the PermissionSource port (which caches its answer),
+    // so a grant written after the first token is minted leaves every later request carrying a
+    // permission-empty identity — and every HR write below would answer 403 instead of 201.
+    // Shapes mirrored, nothing else touched: fixtures/hr-provisioning.ts.
+    await ensureHrReportingTestProvisioning(getCoreDb(), ['tenant-test-1']);
+
     const roleId = await findAdminRoleId();
 
     const seeded = await login('admin@localhost', PASSWORDS.seededAdmin);
@@ -633,7 +642,7 @@ describe('Reporting - HR Leave Request Report (sixth vertical slice)', () => {
       .set('Authorization', `Bearer ${admin.token}`)
       .expect(200);
     expect(created.body.total).toBeGreaterThanOrEqual(1);
-    expect(created.body.items.map((item) => item.action)).toEqual(
+    expect(created.body.items.map((item: { action: string }) => item.action)).toEqual(
       expect.arrayContaining(['create'])
     );
 
@@ -643,7 +652,7 @@ describe('Reporting - HR Leave Request Report (sixth vertical slice)', () => {
       .get(reportUrl(`/${cancelledId}/timeline`))
       .set('Authorization', `Bearer ${admin.token}`)
       .expect(200);
-    const actions = withdrawn.body.items.map((item) => item.action);
+    const actions = withdrawn.body.items.map((item: { action: string }) => item.action);
     expect(actions).toEqual(expect.arrayContaining(['create', 'cancel']));
 
     // The decision-state fixtures were written directly, so their timeline is an
@@ -786,7 +795,7 @@ describe('Reporting - HR Leave Request Report (sixth vertical slice)', () => {
     ]);
     expect(sheet.data).toHaveLength(5);
     expect(sheet.data.map((row) => row[0]).sort()).toEqual(
-      listed.items.map((item) => item.employeeCode).sort()
+      listed.items.map((item: { employeeCode: string }) => item.employeeCode).sort()
     );
     // Every state word the lifecycle declares appears in the exported status column.
     expect(sheet.data.map((row) => row[4])).toEqual(

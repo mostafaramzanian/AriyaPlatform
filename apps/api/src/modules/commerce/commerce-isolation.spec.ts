@@ -24,8 +24,8 @@
  *   B. THE DATABASE (the twelve applied migrations, re-read from the file system)
  *      Nothing in the history may DROP, TRUNCATE, DELETE, ALTER a column, RENAME, or
  *      SET NOT NULL: the history is ADDITIVE. Every ALTER TABLE is an ADD COLUMN or an
- *      ADD CONSTRAINT, and both are counted. All twenty-one tables lead with `tenant_id`,
- *      and so do all sixty indexes. All twenty-five foreign keys are the composite pair
+ *      ADD CONSTRAINT, and both are counted. All twenty-five tables lead with `tenant_id`,
+ *      and so do all seventy-three indexes. All twenty-seven foreign keys are the composite pair
  *      `(tenant_id, …) → (tenant_id, id)` with ON DELETE RESTRICT, every target is a table
  *      this database created and exposes a unique `(tenant_id, id)` key for, and no
  *      statement reaches outside it: no extension, no foreign table, no dblink, and no
@@ -85,7 +85,7 @@ const MODULE_FILE = join(MODULE_DIR, 'commerce.module.ts');
  *
  * `writes` is the FULL truth — every model the file writes by ANY of the three write paths
  * (Prisma delegate, nested create inside an owned parent's statement, raw statement). Keeping
- * the non-delegate paths in the same list is what lets D3 prove that the twenty-one models
+ * the non-delegate paths in the same list is what lets D3 prove that the twenty-nine models
  * partition across the ten files with no overlap, instead of clearing the three files that
  * use the other two paths from the check.
  */
@@ -99,7 +99,7 @@ interface OwnershipSlice {
 }
 
 /**
- * THE MATRIX (D2/D3/D4). Every one of the twenty-one models appears in exactly ONE `writes` list;
+ * THE MATRIX (D2/D3/D4). Every one of the twenty-nine models appears in exactly ONE `writes` list;
  * every entry of `reads` is a model owned by a different file, and the union of all `reads`
  * entries is the complete set of cross-slice seams the step contracts allow:
  *
@@ -119,7 +119,15 @@ const OWNERSHIP: readonly OwnershipSlice[] = [
   {
     file: 'purchase/purchase.repository.ts',
     // Phase B2.3: auditOutbox — durable outbox writes inside submit/close transactions.
-    writes: ['auditOutbox', 'purchaseDocument', 'purchaseDocumentCounter', 'purchaseLine'],
+    // PHASE W3: purchaseStatusEvent — the append-only transition history, written
+    // inside the same transactions as the status changes it records.
+    writes: [
+      'auditOutbox',
+      'purchaseDocument',
+      'purchaseDocumentCounter',
+      'purchaseLine',
+      'purchaseStatusEvent',
+    ],
     writesWithoutDelegate: ['purchaseDocumentCounter'],
     reads: [],
   },
@@ -161,6 +169,17 @@ const OWNERSHIP: readonly OwnershipSlice[] = [
     writesWithoutDelegate: [],
     reads: ['purchaseDocument'],
   },
+  // PAYMENT PLAN (دستور پرداخت / رژیم پرداخت): the instruction slice owns
+  // `PaymentPlan` + `PaymentInstallment` (stages created nested under their
+  // plan) and writes NO `PaymentRecord` — the money event stays the payment
+  // history's sole write, appended through Q's repository inside the caller's
+  // unit of work, while this file only states the installment→payment link.
+  {
+    file: 'payment-plan/payment-plan.repository.ts',
+    writes: ['paymentInstallment', 'paymentPlan'],
+    writesWithoutDelegate: [],
+    reads: ['paymentRecord', 'purchaseDocument'],
+  },
   {
     file: 'receiving/receiving-history.repository.ts',
     writes: ['receipt', 'receiptLine'],
@@ -184,6 +203,62 @@ const OWNERSHIP: readonly OwnershipSlice[] = [
     writes: ['purchaseCompletionPolicyVersion'],
     writesWithoutDelegate: [],
     reads: [],
+  },
+  // PHASE GAP-6: the quotation slice owns `PriceQuotation` and — through nested
+  // creates only — `QuotationLine`, plus its audit outbox row. It READS the
+  // purchase document (status is the "still in circulation" guard) and never
+  // writes it: quotations are a child lifecycle, so no second writer exists for
+  // any model another slice owns.
+  {
+    file: 'quotation/quotation.repository.ts',
+    writes: ['auditOutbox', 'priceQuotation', 'quotationLine'],
+    writesWithoutDelegate: ['quotationLine'],
+    reads: ['purchaseDocument'],
+  },
+  // SUPPLIER MASTER DATA: the supplier slice owns `Supplier` plus its audit
+  // outbox row, and introduces TWO new cross-slice READ seams — the purchase
+  // documents and the quotations that NAME a supplier (`supplierId`) — the
+  // same observation-only posture payment/receiving use. Quotation's optional
+  // `supplierId` validation runs through this repository from
+  // `quotation.service.ts` (application layer), so it adds NO persistence
+  // seam of its own.
+  {
+    file: 'supplier/supplier.repository.ts',
+    writes: ['auditOutbox', 'supplier'],
+    writesWithoutDelegate: [],
+    reads: ['purchaseDocument', 'priceQuotation'],
+  },
+  // PHASE W2-B: the integration slice owns `InventoryPosting` ALONE — the
+  // durable record Commerce writes in the same transaction as the receiving
+  // or dispatch event it plans from. It reads no other slice's model: the
+  // origin lookups answer from its own table, which is exactly why no new
+  // seam joins the list below.
+  {
+    file: 'integration/inventory-posting.repository.ts',
+    writes: ['inventoryPosting', 'inventoryPostingAttempt'],
+    writesWithoutDelegate: [],
+    reads: [],
+  },
+  // PHASE W3.2: the aggregated traceability read's repository — the ONLY
+  // slice that writes nothing. Its six seams are the read set the history
+  // stream correlates; ownership is unchanged because this file's whole
+  // contract is observation.
+  {
+    file: 'purchase/purchase-history.repository.ts',
+    writes: [],
+    writesWithoutDelegate: [],
+    reads: [
+      'commercialApproval',
+      'commercialAssignment',
+      'inventoryPosting',
+      'inventoryPostingAttempt',
+      'paymentPlan',
+      'paymentRecord',
+      'priceQuotation',
+      'purchaseLine',
+      'receipt',
+      'returnDocument',
+    ],
   },
 ];
 
@@ -218,17 +293,23 @@ const READ_OPERATIONS: readonly string[] = [
 const DELEGATE_OPERATIONS = [...WRITE_OPERATIONS, ...READ_OPERATIONS];
 
 /**
- * The FIVE named permissions the Commerce catalogue defines and the controllers use: every
- * `@Roles(...)` in the module names exactly one of these, once per route. A sixth name
- * invented at a call site would not exist in Core's catalogue, so the guard would compare a
- * real permission against `undefined` and refuse everyone — a failure mode worth pinning at
- * the source rather than discovering as a 403.
+ * The SEVEN named permissions the Commerce catalogue defines — six that the
+ * controllers had used until PHASE GAP-6 and the seventh
+ * (`COMMERCE_SUPPLIER_MANAGE`) the supplier-directory controller added — every
+ * `@Roles(...)` in the module names exactly one of these, once per route. An
+ * eighth name invented at a call site would not exist in Core's catalogue, so
+ * the guard would compare a real permission against `undefined` and refuse
+ * everyone — a failure mode worth pinning at the source rather than discovering
+ * as a 403. GAP-6 gave `COMMERCE_COMMERCIAL_MANAGE` its first routes; the
+ * supplier slice gave `COMMERCE_SUPPLIER_MANAGE` its seven.
  */
 const COMMERCE_PERMISSIONS: readonly string[] = [
   'COMMERCE_APPROVE',
+  'COMMERCE_COMMERCIAL_MANAGE',
   'COMMERCE_CONFIGURE',
   'COMMERCE_MANAGE',
   'COMMERCE_READ',
+  'COMMERCE_SUPPLIER_MANAGE',
   'COMMERCE_WORKFLOW_MANAGE',
 ];
 
@@ -263,7 +344,7 @@ const CLIENT_SUPPLIED_ACTOR =
   /\breq\.(?:body|query|params|headers)\s*(?:\?\.)?\s*(?:\.\s*(?:tenantId|userId|actorId)\b|\[\s*['"`](?:x-)?(?:tenant|user|actor)[-_]?id['"`]\s*\])/i;
 
 /**
- * The HTTP surface, route by route: `method|path|permission` for all sixty-five handlers.
+ * The HTTP surface, route by route: `method|path|permission` for all seventy-nine handlers.
  * One artifact, read by two checks. A1 compares `method|path`, so the surface is exactly this
  * — nothing added, nothing moved to another prefix, nothing turned from a read into a write.
  * A3 compares the permission, so the route that settles a payment stays `MANAGE`, the route
@@ -310,8 +391,28 @@ const CONTROLLER_SURFACE: Readonly<Record<string, readonly string[]>> = {
     'Post|:id/payments|COMMERCE_MANAGE',
     'Post|:id/payments/:paymentId/compensate|COMMERCE_MANAGE',
   ],
+  // PAYMENT PLAN (دستور پرداخت / رژیم پرداخت): the instruction surface — the
+  // same `commerce/purchase-documents` collection, the same permission split,
+  // extended by `COMMERCE_APPROVE` on the two decision routes: approving the
+  // plan and approving each later payment stage, which is exactly the
+  // requirements' "each subsequent payment needs the manager's approval".
+  'payment-plan/payment-plan.controller.ts': [
+    'Get|:id/payment-plans|COMMERCE_READ',
+    'Post|:id/payment-plans|COMMERCE_MANAGE',
+    'Get|:id/payment-plans/:planId|COMMERCE_READ',
+    'Post|:id/payment-plans/:planId/submit|COMMERCE_MANAGE',
+    'Post|:id/payment-plans/:planId/approve|COMMERCE_APPROVE',
+    'Post|:id/payment-plans/:planId/cancel|COMMERCE_MANAGE',
+    'Post|:id/payment-plans/:planId/supersede|COMMERCE_MANAGE',
+    'Post|:id/payment-plans/:planId/installments/:seq/approve|COMMERCE_APPROVE',
+    'Post|:id/payment-plans/:planId/installments/:seq/cancel|COMMERCE_MANAGE',
+    'Post|:id/payment-plans/:planId/installments/:seq/execute|COMMERCE_MANAGE',
+  ],
   'purchase/purchase.controller.ts': [
     'Get||COMMERCE_READ',
+    // WIP REPAIR (working tree): the KPI summary route the register work added —
+    // a read of tenant aggregates, so `commerce.read` like the list it sits beside.
+    'Get|summary|COMMERCE_READ',
     'Get|:id|COMMERCE_READ',
     'Post||COMMERCE_MANAGE',
     'Patch|:id|COMMERCE_MANAGE',
@@ -319,10 +420,22 @@ const CONTROLLER_SURFACE: Readonly<Record<string, readonly string[]>> = {
     // PHASE C4-R (GAP-3): the completion act — the same permission as every other document
     // write, and the ONE route that reaches `CLOSED`.
     'Post|:id/close|COMMERCE_MANAGE',
+    // REACTIVATION (GAP-6 follow-up): the reopen act — same write remit, the ONE route
+    // that reaches `DRAFT` from `REJECTED`.
+    'Post|:id/reopen|COMMERCE_MANAGE',
     // PHASE C7 (GAP-7): the audit timeline — a READ of the document's own trail, so
     // `commerce.read` like every other read on this collection. The route binds only
     // `:id`; resource, resourceId and tenant are server-built.
     'Get|:id/timeline|COMMERCE_READ',
+    // PHASE W3 (GAP-7b): the append-only status-transition history — a READ of the
+    // document's own rows, `commerce.read` like the timeline beside it. History
+    // itself is written only inside the status mutations' transactions, never
+    // through this route.
+    'Get|:id/status-events|COMMERCE_READ',
+    // PHASE W3.2: the aggregated traceability read — status events, correlated
+    // audit events and posting diagnostics under server-side filters. A READ
+    // of the document's own truth sources, `commerce.read`.
+    'Get|:id/history|COMMERCE_READ',
   ],
   'receiving/receiving-history.controller.ts': [
     'Get|:id/receipts|COMMERCE_READ',
@@ -336,6 +449,12 @@ const CONTROLLER_SURFACE: Readonly<Record<string, readonly string[]>> = {
     'Post|:id/returns/:returnId/reject|COMMERCE_MANAGE',
     'Post|:id/returns/:returnId/receive-back|COMMERCE_MANAGE',
     'Post|:id/returns/:returnId/refund|COMMERCE_MANAGE',
+  ],
+  // PHASE W2-B: the integration's operational surface — the posting queue
+  // read under `commerce.read`, the retry act under `commerce.manage`.
+  'integration/inventory-posting.controller.ts': [
+    'Get||COMMERCE_READ',
+    'Post|:id/retry|COMMERCE_MANAGE',
   ],
   'workflow/workflow-configuration.controller.ts': [
     'Get|workflow-definitions|COMMERCE_READ',
@@ -383,6 +502,39 @@ const CONTROLLER_SURFACE: Readonly<Record<string, readonly string[]>> = {
     'Post|completion-policies/:id/publish|COMMERCE_CONFIGURE',
     'Post|completion-policies/:id/archive|COMMERCE_CONFIGURE',
   ],
+  // PHASE GAP-6: the PRICE QUOTATION routes — the document's quotation trail
+  // (a read, `commerce.read`) and the two writes that record/decide a version,
+  // answering `commerce.commercial.manage` — the permission Core's catalogue
+  // description always assigned to quotation entry/confirmation/correction.
+  // GAP-6 follow-up 3.3: the attachment pair joins them — upload (multipart)
+  // under the same `commerce.commercial.manage` remit, download under
+  // `commerce.read` like every other evidence read.
+  'quotation/quotation.controller.ts': [
+    'Get|price-quotations|COMMERCE_READ',
+    'Post|price-quotations|COMMERCE_COMMERCIAL_MANAGE',
+    'Post|price-quotations/:id/decision|COMMERCE_COMMERCIAL_MANAGE',
+    'Post|price-quotations/:id/attachment|COMMERCE_COMMERCIAL_MANAGE',
+    'Get|price-quotations/:id/attachment|COMMERCE_READ',
+  ],
+  // SUPPLIER MASTER DATA: the directory's SEVEN routes. Reads answer
+  // `COMMERCE_READ` like every collection read here; the two writes AND the
+  // sensitive BANKING projection answer `COMMERCE_SUPPLIER_MANAGE` — the
+  // seventh catalogue permission, seeded by core migration
+  // 20261017140100_seed_commerce_supplier_permission. The banking route is
+  // deliberately its own route so the five sensitive fields never ride along
+  // on a `COMMERCE_READ` projection.
+  'supplier/supplier.controller.ts': [
+    'Get|suppliers|COMMERCE_READ',
+    'Post|suppliers|COMMERCE_SUPPLIER_MANAGE',
+    // PHASE W2-C: the reconciliation read — declared before `:id` so the
+    // literal segment is never swallowed as a supplier id.
+    'Get|suppliers/reconciliation|COMMERCE_READ',
+    'Get|suppliers/:id|COMMERCE_READ',
+    'Patch|suppliers/:id|COMMERCE_SUPPLIER_MANAGE',
+    'Get|suppliers/:id/banking|COMMERCE_SUPPLIER_MANAGE',
+    'Get|suppliers/:id/purchases|COMMERCE_READ',
+    'Get|suppliers/:id/quotations|COMMERCE_READ',
+  ],
 };
 
 /**
@@ -394,7 +546,11 @@ const CONTROLLER_SURFACE: Readonly<Record<string, readonly string[]>> = {
  * would either fail on it or be loosened until it proved nothing.
  */
 const FORBIDDEN_SQL: readonly { readonly name: string; readonly pattern: RegExp }[] = [
-  { name: 'DROP', pattern: /^\s*DROP\b/im },
+  // W4-B CARVE-OUT: `DROP INDEX` removes a constraint's INDEX, never data — the
+  // multi-partial-refund migration drops the obsolete one-compensation unique
+  // and replaces its safety with the locked cumulative cap. Every other DROP
+  // form (TABLE, COLUMN, …) stays refused.
+  { name: 'DROP', pattern: /^\s*DROP\s+(?!INDEX\b)/im },
   { name: 'TRUNCATE', pattern: /^\s*TRUNCATE\b/im },
   { name: 'DELETE', pattern: /^\s*DELETE\b/im },
   { name: 'ALTER COLUMN', pattern: /\bALTER\s+COLUMN\b/i },
@@ -409,6 +565,19 @@ const FORBIDDEN_SQL: readonly { readonly name: string; readonly pattern: RegExp 
 
 /** The nested-create sites, and the model each one puts rows into (D3). */
 const NESTED_CREATES: readonly { file: string; parent: string; model: string }[] = [
+  // PAYMENT PLAN: a plan with its stage list, in ONE create — a plan whose
+  // stages could land separately would be a half-visible instruction.
+  {
+    file: 'payment-plan/payment-plan.repository.ts',
+    parent: 'paymentPlan',
+    model: 'paymentInstallment',
+  },
+  // PHASE GAP-6: one quotation version with its itemised lines, in ONE create.
+  {
+    file: 'quotation/quotation.repository.ts',
+    parent: 'priceQuotation',
+    model: 'quotationLine',
+  },
   { file: 'receiving/receiving-history.repository.ts', parent: 'receipt', model: 'receiptLine' },
   { file: 'returns/return-history.repository.ts', parent: 'returnDocument', model: 'returnLine' },
   {
@@ -602,14 +771,20 @@ interface IndexArtifact {
 }
 
 function indexesOf(sql: string): IndexArtifact[] {
-  return [...sql.matchAll(/CREATE (UNIQUE )?INDEX "([^"]+)" ON "(\w+)"\(([^)]*)\)/g)].map(
-    (match) => ({
+  // The LIVE artifact set: every index the history created, minus the ones a
+  // later migration dropped (W4-B: the obsolete one-compensation unique — the
+  // only DROP INDEX the history may ever carry, carved out in FORBIDDEN_SQL).
+  const dropped = new Set(
+    [...sql.matchAll(/DROP INDEX "([^"]+)"/g)].map((match) => match[1])
+  );
+  return [...sql.matchAll(/CREATE (UNIQUE )?INDEX "([^"]+)"\s+ON\s+"(\w+)"\s*\(([^)]*)\)/g)]
+    .map((match) => ({
       name: match[2],
       table: match[3],
       columns: columnsOf(match[4]),
       unique: match[1] === 'UNIQUE ',
-    })
-  );
+    }))
+    .filter((index) => !dropped.has(index.name));
 }
 
 /** An `ADD CONSTRAINT … FOREIGN KEY … REFERENCES …` from the history, with both column lists. */
@@ -786,6 +961,50 @@ const MIGRATIONS = [
   '20261001000000_purchase_completion_policy',
   // Phase B2.3: Commerce audit outbox — one table, three indexes, no FK.
   '20261008150000_audit_outbox',
+  // WIP REPAIR (working tree): `PurchaseDocument.costCenter` — one late nullable
+  // column on an existing table, no table, no type, no index, no foreign key.
+  '20261015130000_purchase_cost_center',
+  // PHASE GAP-6: the price quotation — two tables, one new enum type, six indexes
+  // (three per table: the tenant handle, the ordering/version key and the list
+  // read) and two composite RESTRICT foreign keys.
+  '20261017000000_price_quotation',
+  // SUPPLIER MASTER DATA: the supplier directory — one table, two enum types,
+  // four indexes and one nullable column added to PriceQuotation.
+  '20261017140000_supplier_master',
+  // PAYMENT PLAN (دستور پرداخت / رژیم پرداخت): the payment-instruction pair —
+  // two tables, two enum types, seven indexes, four composite RESTRICT
+  // foreign keys.
+  '20261018120000_payment_plan',
+  // PHASE W2-B: the durable Commerce→Inventory posting record — one table
+  // (InventoryPosting), one enum type (InventoryPostingStatus), four
+  // tenant-first indexes, no foreign key (opaque cross-context references
+  // are never FK'd).
+  '20261019120000_inventory_posting',
+  // PHASE W2-C: `PurchaseDocument.status_changed_at` — one late nullable column
+  // with an honest COALESCE backfill; no table, no type, no index, no foreign key.
+  '20261019130000_purchase_status_changed_at',
+  // PHASE W3 (GAP-7b): `PurchaseStatusEvent` — the append-only transition
+  // history; one table, one enum type, two indexes (the tenant handle and the
+  // per-document timeline read), one composite RESTRICT foreign key into the
+  // document it belongs to. NO backfill — see the migration's own note.
+  '20261020120000_purchase_status_event',
+  // PHASE W3.1 (resolved-return closure): one ADD COLUMN —
+  // `ReturnLifecycleTransition.refunded_payment_id`, the persisted
+  // return→settlement link. No backfill.
+  '20261021120000_return_refunded_payment',
+  // PHASE W3.2 (attempt-level traceability): one table
+  // (InventoryPostingAttempt), four indexes (the posting's tenant handle
+  // unique, the attempt row's tenant handle, the ordinal-per-posting unique
+  // and the per-posting history read), one composite foreign key.
+  '20261022120000_inventory_posting_attempt',
+  // PHASE W4-B (repeated partial refunds + the exact refund link): no table,
+  // two indexes (the reversal read replacing the dropped one-compensation
+  // unique, the refund-association read), one composite foreign key, one
+  // ADD COLUMN (`ReturnLifecycleTransition.refund_compensation_payment_id`).
+  '20261023120000_multi_partial_refund',
+  // PHASE W4-D: the partial unique on `refund_compensation_payment_id` — one
+  // compensation settles one REFUNDED transition, enforced by the database.
+  '20261024120000_refund_compensation_unique_link',
 ] as const;
 
 /** How many tables, enum types, indexes and foreign keys each migration contributed. */
@@ -811,10 +1030,45 @@ const MIGRATION_CONTRIBUTIONS: Readonly<Record<string, Contribution>> = {
   // Phase B2.3: one table (AuditOutbox), no type, three indexes (unique auditId,
   // nextAt for polling, tenantId for isolation), no foreign key.
   '20261008150000_audit_outbox': [1, 0, 3, 0],
+  // WIP REPAIR: one ADD COLUMN on PurchaseDocument, nothing else.
+  '20261015130000_purchase_cost_center': [0, 0, 0, 0],
+  // PHASE GAP-6: two tables, one enum type, six indexes, two foreign keys.
+  '20261017000000_price_quotation': [2, 1, 6, 2],
+  // SUPPLIER MASTER DATA: one table (Supplier), two enum types, four indexes
+  // (the tenant handle unique, the national-code unique, the directory list
+  // read, and the quotation-supplier history read), no foreign key.
+  '20261017140000_supplier_master': [1, 2, 4, 0],
+  // PAYMENT PLAN: two tables, two enum types, seven indexes (both tenant
+  // handles, the supersession unique, the seq unique, the executed-payment
+  // unique, the register read and the plan's stages read), four foreign keys.
+  '20261018120000_payment_plan': [2, 2, 6, 4],
+  // PHASE W2-B: one table (InventoryPosting), one enum type
+  // (InventoryPostingStatus), four indexes (the one-posting-per-line unique,
+  // the operational queue read, the per-purchase-line read and the origin
+  // lookup), no foreign key.
+  '20261019120000_inventory_posting': [1, 1, 4, 0],
+  // PHASE W2-C: one ADD COLUMN + one UPDATE backfill; contributes nothing counted.
+  '20261019130000_purchase_status_changed_at': [0, 0, 0, 0],
+  // PHASE W3: one table (PurchaseStatusEvent), one enum type
+  // (PurchaseStatusEventSource), two indexes (the tenant handle unique and the
+  // document timeline read), one composite foreign key.
+  '20261020120000_purchase_status_event': [1, 1, 2, 1],
+  // PHASE W3.1: one ADD COLUMN (`ReturnLifecycleTransition.refunded_payment_id`)
+  // — no table, enum, index or foreign key contribution.
+  '20261021120000_return_refunded_payment': [0, 0, 0, 0],
+  // PHASE W3.2: one table (InventoryPostingAttempt), four indexes (the
+  // posting's tenant handle unique + the attempt row's own three), one
+  // composite foreign key.
+  '20261022120000_inventory_posting_attempt': [1, 0, 4, 1],
+  // PHASE W4-B: two indexes (reversal read + refund-association read — the
+  // dropped one-compensation unique subtracts one at C3), one foreign key.
+  '20261023120000_multi_partial_refund': [0, 0, 2, 1],
+  // PHASE W4-D: one partial UNIQUE index, no table, no column, no key.
+  '20261024120000_refund_compensation_unique_link': [0, 0, 1, 0],
 };
 
 /**
- * The TEN controllers, the path each serves and the number of routes each exposes. The
+ * The THIRTEEN controllers, the path each serves and the number of routes each exposes. The
  * counts are the slices' own totals, so a route added anywhere without its `@Roles` is a
  * failure of A3's count even though every sibling route still passes.
  *
@@ -824,7 +1078,7 @@ const MIGRATION_CONTRIBUTIONS: Readonly<Record<string, Contribution>> = {
  * configuration routes on `workflow-line-routing.controller.ts` — list, read, create and
  * publish — over the capability step O built and that A1 previously pinned as absent.
  * A1–A5 hold that controller to the same chain, surface, permission and registration
- * tests as every other file here.
+ * tests as every other file here. PHASE GAP-6 (quotation) joins as the eleventh.
  */
 const CONTROLLERS: Readonly<Record<string, { readonly prefix: string; readonly routes: number }>> =
   {
@@ -833,9 +1087,21 @@ const CONTROLLERS: Readonly<Record<string, { readonly prefix: string; readonly r
     // read, create, edit-a-draft, validate, publish and archive, on `commerce`.
     'completion/purchase-completion-policy.controller.ts': { prefix: 'commerce', routes: 7 },
     'payment/payment-history.controller.ts': { prefix: 'commerce/purchase-documents', routes: 3 },
-    // PHASE C4-R (GAP-3): six routes now — §29's completion act joined the five L shipped,
+    // PAYMENT PLAN: the instruction slice's ten routes on the same collection.
+    'payment-plan/payment-plan.controller.ts': {
+      prefix: 'commerce/purchase-documents',
+      routes: 10,
+    },
+    // PHASE W2-B: the integration operational surface — the posting queue
+    // read and the retry act on `commerce/inventory-postings`.
+    'integration/inventory-posting.controller.ts': {
+      prefix: 'commerce/inventory-postings',
+      routes: 2,
+    },
+    // WIP REPAIR + PHASE GAP-6 + REACTIVATION: nine routes now — §29's completion act,
+    // C7's timeline, the working tree's KPI summary read and the reopen act joined L's five,
     // on the same `commerce/purchase-documents` collection.
-    'purchase/purchase.controller.ts': { prefix: 'commerce/purchase-documents', routes: 7 },
+    'purchase/purchase.controller.ts': { prefix: 'commerce/purchase-documents', routes: 11 },
     'receiving/receiving-history.controller.ts': {
       prefix: 'commerce/purchase-documents',
       routes: 3,
@@ -846,6 +1112,11 @@ const CONTROLLERS: Readonly<Record<string, { readonly prefix: string; readonly r
     // PHASE C3 (GAP-2): line-routing configuration — list, read, open a DRAFT, publish.
     'workflow/workflow-line-routing.controller.ts': { prefix: 'commerce', routes: 4 },
     'pending/pending-decisions.controller.ts': { prefix: 'commerce', routes: 1 },
+    // PHASE GAP-6: the quotation controller — list, record one version, decide it.
+    'quotation/quotation.controller.ts': { prefix: 'commerce', routes: 5 },
+    // SUPPLIER MASTER DATA: the supplier controller — list, create, read,
+    // update, banking projection, purchase history and quotation history.
+    'supplier/supplier.controller.ts': { prefix: 'commerce', routes: 8 },
   };
 
 /**
@@ -866,7 +1137,7 @@ const migrationByDir = Object.fromEntries(migrationSql.map((entry) => [entry.dir
 const sqlOfMigration = (dir: string) => sqlCode(migrationByDir[dir]?.raw ?? '');
 const allSql = migrationSql.map(({ raw }) => sqlCode(raw)).join('\n');
 
-/** The twenty-one models: name, body, the table each maps to, and the delegate Prisma generates. */
+/** The twenty-nine models: name, body, the table each maps to, and the delegate Prisma generates. */
 const modelList = modelBlocks(schemaText).map(({ name, body }) => ({
   name,
   body,
@@ -933,7 +1204,7 @@ const sqlColumns = [
 ];
 
 describe('A. the entry point: every route behind one authenticated, entitled gate', () => {
-  it('A1 — discovers the ten controllers on disk, and no @Controller hiding in another file', () => {
+  it('A1 — discovers the twelve controllers on disk, and no @Controller hiding in another file', () => {
     expect(controllerFiles.map(relName).sort()).toEqual(Object.keys(CONTROLLERS).sort());
 
     // Discovery is by DECORATOR across every source file, not by file name: a controller added
@@ -974,14 +1245,14 @@ describe('A. the entry point: every route behind one authenticated, entitled gat
     expect(chains).toEqual(expected);
   });
 
-  it('A3 — registers exactly those ten classes in commerce.module.ts', () => {
+  it('A3 — registers exactly those fourteen classes in commerce.module.ts', () => {
     const region = /controllers:\s*\[([\s\S]*?)\]/.exec(codeOf(readModule(MODULE_FILE)))?.[1] ?? '';
     const registered = [...region.matchAll(/(\w+Controller)\b/g)].map((match) => match[1]).sort();
     expect(registered).toEqual(controllerFiles.map(classNameOf).sort());
-    expect(registered).toHaveLength(10);
+    expect(registered).toHaveLength(14);
   });
 
-  it('A4 — serves exactly the pinned sixty-five routes, on the pinned prefixes', () => {
+  it('A4 — serves exactly the pinned eighty-three routes, on the pinned prefixes', () => {
     const surface = Object.fromEntries(
       controllerFiles.map((file) => [
         relName(file),
@@ -1069,7 +1340,7 @@ function historyPlanned(plans: readonly { readonly dir: string; readonly sql: st
 }
 
 describe('B. the history: additive at every step, tenant-first in every key', () => {
-  it('B1 — is the ten pinned migrations, each contributing exactly the measured total', () => {
+  it('B1 — is the pinned migrations, each contributing exactly the measured total', () => {
     const directories = readdirSync(MIGRATIONS_DIR, { withFileTypes: true })
       .filter((entry) => entry.isDirectory())
       .map((entry) => entry.name)
@@ -1101,14 +1372,23 @@ describe('B. the history: additive at every step, tenant-first in every key', ()
 
   it('B2 — ALTER only ever adds, and no refused statement appears in executable SQL', () => {
     const alters = allSql.match(/ALTER TABLE[^;]*;/g) ?? [];
-    expect(alters).toHaveLength(35);
+    // SUPPLIER MASTER DATA: one more ALTER — the `PriceQuotation` supplier_id
+    // column, an ADD COLUMN like every other late column in this history.
+    // W2-C: `status_changed_at` is ALTER forty-four; W3.1:
+    // `ReturnLifecycleTransition.refunded_payment_id` is ALTER forty-five;
+    // W3.2: the InventoryPostingAttempt foreign key is forty-six; W4-B:
+    // the refund-compensation column and its key are forty-seven/-eight.
+    expect(alters).toHaveLength(49);
     expect(alters.filter((statement) => !/ADD COLUMN|ADD CONSTRAINT/.test(statement))).toEqual([]);
 
     // Columns and constraints are counted apart from the statements carrying them: one ALTER
     // can add four columns, so five columns arriving in two statements is not the same history
-    // as five arriving in five. PHASE C4-R added three column statements and one constraint.
-    expect([...allSql.matchAll(/ADD COLUMN/g)]).toHaveLength(12);
-    expect([...allSql.matchAll(/ADD CONSTRAINT/g)]).toHaveLength(26);
+    // as five arriving in five. PHASE C4-R added three column statements and one constraint;
+    // the working tree's costCenter added one more, and PHASE GAP-6 two FK constraint
+    // statements on top.
+    // W2-C: `status_changed_at` is the fifteenth late column (one ALTER).
+    expect([...allSql.matchAll(/ADD COLUMN/g)]).toHaveLength(17);
+    expect([...allSql.matchAll(/ADD CONSTRAINT/g)]).toHaveLength(35);
 
     // The one enum member added after its type already existed, and the only place this
     // history ever appends a value. No `RENAME VALUE`, so a published member keeps its name.
@@ -1138,15 +1418,18 @@ describe('B. the history: additive at every step, tenant-first in every key', ()
 
     // Every index leads with `tenant_id`: an index that could cross
     // tenants is an index no tenant-scoped query would ever want, and none exists.
-    expect(sqlIndexes).toHaveLength(63);
+    // PHASE GAP-6 added six (the quotation pair's three each); SUPPLIER MASTER
+    // DATA added four (three on Supplier, one on PriceQuotation).
+    expect(sqlIndexes).toHaveLength(91);
     expect(sqlIndexes.filter(({ columns }) => columns[0] !== 'tenant_id')).toEqual([]);
 
     // And every foreign key is composite on the tenant, pointing at the `(tenant_id, id)` key,
-    // so a child row cannot name a parent in another tenant. Deletion is RESTRICTED on all
-    // twenty-four: no parent row is ever removed by deleting its children. Update differs —
-    // twenty cascade and the five in the return slice restrict — and it is pinned per count,
-    // because "twenty plus five" is the part a hand-edit is most likely to change silently.
-    expect(sqlForeignKeys).toHaveLength(25);
+    // so a child row cannot name a parent in another tenant. Deletion is RESTRICTED on all:
+    // no parent row is ever removed by deleting its children. Update differs — the majority
+    // cascade and the return slice's five restrict — and it is pinned per count,
+    // because "twenty-two plus five" is the part a hand-edit is most likely to change silently.
+    // PHASE GAP-6 added two cascade-on-update, restrict-on-delete keys.
+    expect(sqlForeignKeys).toHaveLength(34);
     expect(
       sqlForeignKeys.filter(
         (key) =>
@@ -1159,7 +1442,7 @@ describe('B. the history: additive at every step, tenant-first in every key', ()
       counts[key.onUpdate] = (counts[key.onUpdate] ?? 0) + 1;
       return counts;
     }, {});
-    expect(onUpdate).toEqual({ CASCADE: 20, RESTRICT: 5 });
+    expect(onUpdate).toEqual({ CASCADE: 29, RESTRICT: 5 });
   });
 
   it('B4 — alters only tables that exist by the end of that same migration', () => {
@@ -1180,7 +1463,7 @@ describe('B. the history: additive at every step, tenant-first in every key', ()
     // Four positions, one set: a statement that reached into another owner's table would have
     // to name it in at least one of them, and no such name is a Commerce table.
     expect([...named].sort()).toEqual(schemaTables);
-    expect(schemaTables).toHaveLength(22);
+    expect(schemaTables).toHaveLength(30);
   });
 });
 
@@ -1195,24 +1478,24 @@ const FOREIGN_CLIENT_NAME =
 
 describe('C. the schema and the history: one artifact, joined in both directions', () => {
   it('C1 — maps every model to a created table, and every created table to a mapped model', () => {
-    expect(modelList).toHaveLength(22);
+    expect(modelList).toHaveLength(30);
 
     // Every model states its table. Without `@@map`, Prisma would name the table after the
     // model, and a table the history never created is a table only the client believes in.
     expect(modelList.filter(({ table }) => table === '').map(({ name }) => name)).toEqual([]);
-    expect([...new Set(schemaTables)]).toHaveLength(22);
-    expect([...new Set(createdTables)]).toHaveLength(22);
+    expect([...new Set(schemaTables)]).toHaveLength(30);
+    expect([...new Set(createdTables)]).toHaveLength(30);
     expect([...createdTables].sort()).toEqual(schemaTables);
 
     // One delegate per model: D attributes a write to a file BY this name, so two models sharing
     // a delegate would attribute one model's write to another model's owner.
-    expect([...new Set(delegateNames)]).toHaveLength(22);
+    expect([...new Set(delegateNames)]).toHaveLength(30);
   });
 
-  it('C2 — declares the same twenty-seven types, member for member, and extends exactly one', () => {
+  it('C2 — declares the same thirty types, member for member, and extends exactly one', () => {
     const sqlEnums = [...allSql.matchAll(/CREATE TYPE "(\w+)"/g)].map((match) => match[1]);
-    expect(sqlEnums).toHaveLength(27);
-    expect([...new Set(sqlEnums)]).toHaveLength(27);
+    expect(sqlEnums).toHaveLength(34);
+    expect([...new Set(sqlEnums)]).toHaveLength(34);
     expect([...sqlEnums].sort()).toEqual([...schemaEnums].sort());
 
     // The strong form: the same MEMBERS in the same ORDER for each of the twenty-seven. This is
@@ -1237,24 +1520,28 @@ describe('C. the schema and the history: one artifact, joined in both directions
     expect(appended).toEqual(['WorkflowTriggerEvent.AFTER_DOCUMENT_WORKFLOW_APPROVED']);
   });
 
-  it('C3 — builds the same sixty-three indexes, on the same tables and the same columns', () => {
-    expect(schemaIndexes).toHaveLength(63);
-    expect(sqlIndexes).toHaveLength(63);
+  it('C3 — builds the same seventy-three indexes, on the same tables and the same columns', () => {
+    expect(schemaIndexes).toHaveLength(90);
+    expect(sqlIndexes).toHaveLength(91);
 
     // A name is used once and only once on each side: a reused name would let the join below
     // pair one index with a different index's shape and still compare equal.
-    expect([...new Set(schemaIndexes.map(({ name }) => name))]).toHaveLength(63);
-    expect([...new Set(sqlIndexes.map(({ name }) => name))]).toHaveLength(63);
+    expect([...new Set(schemaIndexes.map(({ name }) => name))]).toHaveLength(90);
+    expect([...new Set(sqlIndexes.map(({ name }) => name))]).toHaveLength(91);
     expect(
       schemaIndexes
         .filter((index) => !sqlIndexes.some((candidate) => candidate.name === index.name))
         .map(({ name }) => name)
     ).toEqual([]);
+    // W4-D: ONE index exists on the SQL side alone — the partial UNIQUE on
+    // `refund_compensation_payment_id` Prisma's @@index cannot express. It is
+    // named here, deliberately, so a second unmodelled index cannot hide in
+    // the same carve-out.
     expect(
       sqlIndexes
         .filter((index) => !schemaIndexes.some((candidate) => candidate.name === index.name))
         .map(({ name }) => name)
-    ).toEqual([]);
+    ).toEqual(['ReturnLifecycleTransition_tenant_id_refund_compensation_key']);
 
     // Compared as `name|table|unique|columns` tuples: the schema lists FIELDS and the SQL lists
     // mapped COLUMNS, so the field list is translated the way Prisma translates it. An index
@@ -1266,24 +1553,30 @@ describe('C. the schema and the history: one artifact, joined in both directions
       )
       .sort();
     const physical = sqlIndexes
+      .filter(({ name }) => name !== 'ReturnLifecycleTransition_tenant_id_refund_compensation_key')
       .map(({ name, table, unique, columns }) => `${name}|${table}|${unique}|${columns.join(',')}`)
       .sort();
     expect(physical).toEqual(modelled);
   });
 
-  it('C4 — gives every column a field, and the twelve late columns no place in their CREATE TABLE', () => {
-    expect(schemaColumns).toHaveLength(234);
-    expect(sqlColumns).toHaveLength(234);
-    expect(addedColumns).toHaveLength(12);
+  it('C4 — gives every column a field, and the fourteen late columns no place in their CREATE TABLE', () => {
+    // 262 before SUPPLIER MASTER DATA, +18 on the new `Supplier` table, +1
+    // for `PriceQuotation.supplier_id` — the fourteenth late column — and +1
+    // for `PurchaseDocument.status_changed_at` (W2-C), the fifteenth, and +1
+    // for `ReturnLifecycleTransition.refunded_payment_id` (W3.1), the sixteenth.
+    expect(schemaColumns).toHaveLength(351);
+    expect(sqlColumns).toHaveLength(351);
+    expect(addedColumns).toHaveLength(17);
 
-    // The join at COLUMN granularity, both directions: the 215 columns the twenty-one `CREATE TABLE`
-    // statements declare, plus the 12 the history added to tables that already existed. Nothing
-    // the database holds is unmodelled, and nothing the schema maps is absent from the database.
+    // The join at COLUMN granularity, both directions: the columns the `CREATE TABLE`
+    // statements declare, plus the 14 the history added to tables that already existed.
+    // Nothing the database holds is unmodelled, and nothing the schema maps is absent
+    // from the database.
     const pairOf = (entry: { table: string; column: string }) => `${entry.table}.${entry.column}`;
     const mapped = schemaColumns.map(pairOf).sort();
     const created = sqlColumns.map(pairOf).sort();
-    expect([...new Set(mapped)]).toHaveLength(234);
-    expect([...new Set(created)]).toHaveLength(234);
+    expect([...new Set(mapped)]).toHaveLength(351);
+    expect([...new Set(created)]).toHaveLength(351);
     expect(created).toEqual(mapped);
 
     // And the PROVENANCE of the twelve: each is ABSENT from the `CREATE TABLE` that created its
@@ -1366,9 +1659,20 @@ const AUDITED_SERVICES: readonly string[] = [
   'completion/purchase-completion-policy.service.ts',
   'completion/purchase-completion.service.ts',
   'payment/payment-history.service.ts',
+  // PAYMENT PLAN: every mutating act records — create, submit, approve,
+  // supersede, cancel, and the three stage acts; the money event itself stays
+  // audited as `PAYMENT_RECORD` through the payment slice's own append trail.
+  'payment-plan/payment-plan.service.ts',
   'purchase/purchase.service.ts',
+  // PHASE GAP-6: the quotation service records both of its acts — version created
+  // (outbox builder) and decision recorded (outbox payload).
+  'quotation/quotation.service.ts',
   'receiving/receiving-history.service.ts',
   'returns/return-history.service.ts',
+  // SUPPLIER MASTER DATA: the supplier service records both of its acts —
+  // supplier created and supplier updated (outbox builders inside the unit of
+  // work); its reads audit nothing (the module's read rule).
+  'supplier/supplier.service.ts',
   'workflow/workflow-configuration.service.ts',
   'workflow/workflow-line-routing.service.ts',
 ];
@@ -1397,6 +1701,11 @@ const UNAUDITED_SERVICES: readonly { readonly file: string; readonly because: st
       'PHASE C7: it READS the platform audit trail through the gateway — no delegate write and no command of its own, so there is nothing to record',
   },
   {
+    file: 'purchase/purchase-history.service.ts',
+    because:
+      'PHASE W3.2: the aggregated traceability read — it READS status events, audit trail and posting diagnostics and writes nothing, so there is no command to record',
+  },
+  {
     file: 'search/commerce-search-source.service.ts',
     because:
       'PHASE C9: it READS commerce rows for the platform search authorization re-read and pushes projections to the platform INDEX — no delegate write, and search indexing is not an audited Commerce command (§50), so there is nothing to record',
@@ -1405,6 +1714,11 @@ const UNAUDITED_SERVICES: readonly { readonly file: string; readonly because: st
     file: 'commerce-audit-outbox-relay.service.ts',
     because:
       'Phase B2.3: infrastructure relay — polls the local outbox and delivers through AUDIT_PORT; no business command, no audit.record call',
+  },
+  {
+    file: 'integration/inventory-integration.service.ts',
+    because:
+      'Phase W2-B: integration plumbing — it plans/attempts posting records and the POSTED/FAILED bookkeeping is the durable evidence; the business act it follows (receipt append, return dispatch) is already audited by its own slice, and the stock effect is audited inventory-side',
   },
 ];
 
@@ -1531,7 +1845,7 @@ function appendedMembersOf(sql: string, names: readonly string[]): string[] {
  * D. The ownership matrix, checked against the code instead of against itself: the walk finds
  * the ten repositories, every delegate call in them is attributed to a table by NAME, the
  * writes reproduce the matrix's write lists file by file, the reads outside a file's own writes
- * are exactly the named seams, the twenty-one models have one writer each across all three write
+ * are exactly the named seams, the twenty-nine models have one writer each across all three write
  * paths (delegate, nested create, raw statement), and the two operations the module refuses are
  * absent from every file it holds — including the ones outside `modules/commerce`.
  */
@@ -1581,25 +1895,43 @@ describe('D. the ownership matrix, replayed against the repository code', () => 
       Object.fromEntries(OWNERSHIP.map(({ file, reads }) => [file, [...reads].sort()]))
     );
 
-    // And the seams as NAMES: eight (file → model) pairs, so the newest of them
-    // (`returns → receiptLine`) is pinned where it can be read, not only counted.
+    // And the seams as NAMES: seventeen (file → model) pairs, so each of them
+    // is pinned where it can be read, not only counted. PHASE GAP-6 adds the
+    // quotation slice's document-status read; SUPPLIER MASTER DATA adds the
+    // supplier slice's two history reads; PHASE W3.2 adds the six reads the
+    // aggregated history's read-only repository needs.
     expect(
       Object.entries(seams)
         .flatMap(([file, models]) => models.map((model) => `${file} → ${model}`))
         .sort()
     ).toEqual([
+      'payment-plan/payment-plan.repository.ts → paymentRecord',
+      'payment-plan/payment-plan.repository.ts → purchaseDocument',
       'payment/payment-history.repository.ts → purchaseDocument',
+      'purchase/purchase-history.repository.ts → commercialApproval',
+      'purchase/purchase-history.repository.ts → commercialAssignment',
+      'purchase/purchase-history.repository.ts → inventoryPosting',
+      'purchase/purchase-history.repository.ts → inventoryPostingAttempt',
+      'purchase/purchase-history.repository.ts → paymentPlan',
+      'purchase/purchase-history.repository.ts → paymentRecord',
+      'purchase/purchase-history.repository.ts → priceQuotation',
+      'purchase/purchase-history.repository.ts → purchaseLine',
+      'purchase/purchase-history.repository.ts → receipt',
+      'purchase/purchase-history.repository.ts → returnDocument',
+      'quotation/quotation.repository.ts → purchaseDocument',
       'receiving/receiving-history.repository.ts → purchaseDocument',
       'receiving/receiving-history.repository.ts → purchaseLine',
       'returns/return-history.repository.ts → purchaseDocument',
       'returns/return-history.repository.ts → purchaseLine',
       'returns/return-history.repository.ts → receiptLine',
+      'supplier/supplier.repository.ts → priceQuotation',
+      'supplier/supplier.repository.ts → purchaseDocument',
       'workflow/workflow-execution.repository.ts → purchaseDocument',
       'workflow/workflow-execution.repository.ts → workflowDefinitionVersion',
     ]);
   });
 
-  it('D2 — gives every one of the twenty-one models exactly ONE writer file', () => {
+  it('D2 — gives every one of the twenty-nine models exactly ONE writer file', () => {
     const writtenBy = Object.fromEntries(
       repositoryFiles.map((file) => {
         const source = readModule(file);
@@ -1644,8 +1976,10 @@ describe('D. the ownership matrix, replayed against the repository code', () => 
       )
     );
     expect(Object.values(businessWriters).filter((files) => files.length !== 1)).toEqual([]);
-    // auditOutbox is written by multiple durable-required repositories — verify the count.
-    expect(writers['auditOutbox']).toHaveLength(4);
+    // auditOutbox is written by multiple durable-required repositories — the six
+    // durable writers (purchase, commercial lifecycle, payment, returns, GAP-6
+    // quotation, and the supplier directory).
+    expect(writers['auditOutbox']).toHaveLength(6);
 
     // The ten `writes` lists cover every delegate: every business model is owned once, and
     // `auditOutbox` is shared across durable-required repositories (Phase B2.3).
@@ -1657,6 +1991,7 @@ describe('D. the ownership matrix, replayed against the repository code', () => 
     // one raw upsert — and D3 replays those paths from the code.
     expect(OWNERSHIP.flatMap(({ writesWithoutDelegate }) => writesWithoutDelegate).sort()).toEqual([
       'purchaseDocumentCounter',
+      'quotationLine',
       'receiptLine',
       'returnLine',
     ]);
@@ -1704,11 +2039,12 @@ describe('D. the ownership matrix, replayed against the repository code', () => 
     );
     const nonEmpty = Object.entries(statements).filter(([, found]) => found.length > 0);
     expect(nonEmpty.map(([file]) => file)).toEqual([
+      'payment/payment-history.repository.ts',
       'purchase/purchase.repository.ts',
       'receiving/receiving-history.repository.ts',
       'returns/return-history.repository.ts',
     ]);
-    expect(nonEmpty.flatMap(([, found]) => found)).toHaveLength(3);
+    expect(nonEmpty.flatMap(([, found]) => found)).toHaveLength(6);
 
     // The matrix lists MODELS (delegate names); a raw statement names TABLES. The two are
     // joined through the schema before the comparison, so an owner is allowed its own table
@@ -1787,7 +2123,7 @@ describe('D. the ownership matrix, replayed against the repository code', () => 
     ).toEqual([]);
   });
 
-  it('D7 — accounts for every service file: ten carry the trail, five are pinned apart', () => {
+  it('D7 — accounts for every service file: twelve carry the trail, five are pinned apart', () => {
     // The service files are discovered, and the two lists must COVER them: a new service lands
     // in neither list and fails here before anything can be assumed about what it records.
     const serviceFiles = sourceFiles.filter((file) => file.endsWith('.service.ts'));
@@ -2027,13 +2363,13 @@ describe('E. every scan fails on a planted defect of its own kind', () => {
     // Prisma pads the clauses of a multi-clause `ALTER TABLE` — `ADD COLUMN     "x"` — and the
     // one-space spelling that once read this scan matched NOTHING, which made C4's provenance
     // check pass over an empty list. The padded statement goes to the very function C4 runs,
-    // and the twelve late additions the real history carries come back as twelve.
+    // and the fourteen late additions the real history carries come back as fourteen.
     const padded = 'ALTER TABLE "PurchaseDocument" ADD COLUMN     "delivery_date" TIMESTAMP(6);';
     expect(addedColumnsOf(padded)).toEqual([
       { table: 'PurchaseDocument', column: 'delivery_date' },
     ]);
     expect(/ADD COLUMN "/.test(padded)).toBe(false);
-    expect(addedColumnsOf(allSql)).toHaveLength(12);
+    expect(addedColumnsOf(allSql)).toHaveLength(17);
   });
 
   it('E10 — the route/permission pairing fails the moment a handler drops its gate', () => {

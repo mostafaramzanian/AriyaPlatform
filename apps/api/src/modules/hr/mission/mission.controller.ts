@@ -65,15 +65,6 @@ export class MissionController {
     return this.mission.list(resolveHrActor(req), query);
   }
 
-  @Get(':id')
-  @Roles(Permissions.HR_MISSION_READ)
-  async getOne(
-    @Request() req: ExRequest,
-    @Param('id', new ParseUUIDPipe({ version: '4' })) id: string
-  ) {
-    return this.mission.getById(resolveHrActor(req), id);
-  }
-
   // -- Writes ---------------------------------------------------------------
 
   @Post()
@@ -341,5 +332,22 @@ export class MissionController {
     @Param('versionId', new ParseUUIDPipe({ version: '4' })) versionId: string
   ) {
     return this.policy.archiveVersion(resolveHrActor(req), versionId);
+  }
+
+  /*
+   * DECLARED LAST ON PURPOSE: `@Get(':id')` is a wildcard segment, and Nest matches
+   * routes in declaration order — while it sat above, every static GET under this
+   * controller (`option-groups`, `approval-definitions`, `policy-versions`,
+   * `approvals/pending`) matched `:id` and died in `ParseUUIDPipe` with
+   * "Validation failed (uuid v 4 is expected)". Keeping the catch-all at the bottom
+   * is what keeps the named routes reachable.
+   */
+  @Get(':id')
+  @Roles(Permissions.HR_MISSION_READ)
+  async getOne(
+    @Request() req: ExRequest,
+    @Param('id', new ParseUUIDPipe({ version: '4' })) id: string
+  ) {
+    return this.mission.getById(resolveHrActor(req), id);
   }
 }

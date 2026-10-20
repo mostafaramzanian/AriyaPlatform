@@ -82,14 +82,27 @@ export class CreatePaymentDto {
  * Append the compensating row (`POST …/payments/:paymentId/compensate`, §6).
  *
  * EVERY FIELD IS OPTIONAL BY DESIGN — including the body itself. The reversal's
- * `amount` is the exact negation of the target, its `method` and `currency` are
- * mirrored from the target, and `reversesPaymentId` comes from the path: none of the
- * row's defining facts are client-stated (§3-D), so an empty POST is a complete
- * request. What the caller MAY state is its own evidence: when the correction was
- * made, its own external reference, and a `reason` — which is not a column but the
- * platform audit event's `reason` field (one trail, §3-G).
+ * `amount` is by default the exact negation of the target, its `method` and
+ * `currency` are mirrored from the target, and `reversesPaymentId` comes from
+ * the path (§3-D), so an empty POST is a complete request.
+ *
+ * PHASE W4 (partial compensation): a caller MAY state an `amount` strictly
+ * smaller than the target's — the written row then negates THAT figure, which
+ * is the honest persisted representation of a partial refund. A stated amount
+ * larger than the target is refused by the service (409): over-refunding a
+ * payment is not a compensation, it is a ledger error. `method` and `currency`
+ * still mirror the target — a refund happens in the money that was paid.
+ * What the caller MAY also state is its own evidence: when the correction was
+ * made, its own external reference, and a `reason` — which is not a column but
+ * the platform audit event's `reason` field (one trail, §3-G).
  */
 export class CompensatePaymentDto {
+  @IsOptional()
+  @IsNumber({ maxDecimalPlaces: PURCHASE_MONEY_SCALE })
+  @Min(0.0001)
+  @Max(PURCHASE_MAX_MONEY_AMOUNT)
+  amount?: number;
+
   @IsOptional()
   @IsDateString()
   paymentDate?: string;

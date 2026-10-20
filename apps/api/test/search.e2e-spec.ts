@@ -12,7 +12,6 @@ import { Request } from 'express';
 import request from 'supertest';
 import { ValidationError } from 'class-validator';
 import { PrismaService } from '../src/database/prisma.service';
-import { Prisma } from '@prisma/client';
 import { RoleName } from '../src/generated/core-client';
 import { PrismaModule } from '../src/database/prisma.module';
 import { SearchModule } from '../src/search/search.module';
@@ -145,7 +144,7 @@ describe('Global Search E2E (tenant isolation, per-source authz, degraded mode)'
         email: `search-${Math.random().toString(36).slice(2)}-${now}@example.com`,
         passwordHash: 'not-a-real-hash',
         ...data,
-      } as Prisma.UserCreateInput,
+      },
     });
     createdUsers.push(user.id);
     return user;
@@ -167,12 +166,20 @@ describe('Global Search E2E (tenant isolation, per-source authz, degraded mode)'
     return get(`/search?${params.toString()}`, userId);
   };
 
+  /** The shape of one result row the assertions below read (`body` is the parsed JSON). */
+  interface SearchHit {
+    sourceType: string;
+    sourceId: string;
+    score: number;
+    navigation?: { href: string; anchor?: string | null };
+  }
+
   /** Source types present in a response body. */
-  const sourcesIn = (body): string[] =>
-    [...new Set((body.results ?? []).map((r) => r.sourceType))] as string[];
+  const sourcesIn = (body: { results?: SearchHit[] }): string[] =>
+    [...new Set((body.results ?? []).map((r) => r.sourceType))];
 
   /** True when the response contains a result for this exact row. */
-  const hasRow = (body, sourceType: string, sourceId: string) =>
+  const hasRow = (body: { results?: SearchHit[] }, sourceType: string, sourceId: string) =>
     (body.results ?? []).some((r) => r.sourceType === sourceType && r.sourceId === sourceId);
 
   const grantToRole = async (roleName: string, permissionName: string) => {
@@ -685,14 +692,14 @@ describe('Global Search E2E (tenant isolation, per-source authz, degraded mode)'
     it('anchors a comment result at the ticket page and a message at the conversation', async () => {
       const agentRes = await search(TOKEN, agentId);
       const comment = agentRes.body.results.find(
-        (r) => r.sourceType === 'TICKET_COMMENT' && r.sourceId === ids.publicComment,
+        (r: SearchHit) => r.sourceType === 'TICKET_COMMENT' && r.sourceId === ids.publicComment,
       );
       expect(comment.navigation.href).toBe(`/admin/support/${ids.ticket}`);
       expect(comment.navigation.anchor).toBe(ids.publicComment);
 
       const memberRes = await search(TOKEN, memberId);
       const message = memberRes.body.results.find(
-        (r) => r.sourceType === 'MESSAGE' && r.sourceId === ids.message,
+        (r: SearchHit) => r.sourceType === 'MESSAGE' && r.sourceId === ids.message,
       );
       expect(message.navigation.href).toBe('/admin/messages');
       // The CONVERSATION id, not the message id: there is no per-message route.
@@ -735,7 +742,7 @@ describe('Global Search E2E (tenant isolation, per-source authz, degraded mode)'
 
     it('orders results by descending score', async () => {
       const res = await search(TOKEN, memberId);
-      const scores = res.body.results.map((r) => r.score);
+      const scores = res.body.results.map((r: SearchHit) => r.score);
 
       for (let i = 1; i < scores.length; i += 1) {
         expect(scores[i - 1]).toBeGreaterThanOrEqual(scores[i]);
@@ -753,7 +760,7 @@ describe('Global Search E2E (tenant isolation, per-source authz, degraded mode)'
       expect(first.status).toBe(200);
       expect(second.status).toBe(200);
 
-      const key = (r) => `${r.sourceType}:${r.sourceId}`;
+      const key = (r: SearchHit) => `${r.sourceType}:${r.sourceId}`;
       const firstKeys = first.body.results.map(key);
       for (const result of second.body.results) {
         expect(firstKeys).not.toContain(key(result));

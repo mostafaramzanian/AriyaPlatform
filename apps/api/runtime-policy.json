@@ -76,6 +76,15 @@
           "generatedClientDir": "financial-client",
           "generateScript": "prisma:generate:financial",
           "artifactStatus": "implemented"
+        },
+        "INVENTORY_DATABASE_URL": {
+          "requirement": "not-used",
+          "owner": "inventory",
+          "prismaProject": "inventory",
+          "prismaSchema": "prisma/inventory/schema.prisma",
+          "generatedClientDir": "inventory-client",
+          "generateScript": "prisma:generate:inventory",
+          "artifactStatus": "implemented"
         }
       },
       "infrastructure": {
@@ -96,7 +105,8 @@
         "HR_DATABASE_URL",
         "COMMERCE_DATABASE_URL",
         "PRODUCTION_DATABASE_URL",
-        "FINANCE_DATABASE_URL"
+        "FINANCE_DATABASE_URL",
+        "INVENTORY_DATABASE_URL"
       ],
       "instantiatedOwners": ["core", "observability"],
       "notInstantiatedOwners": [
@@ -105,7 +115,8 @@
         "hr",
         "commerce",
         "production",
-        "financial"
+        "financial",
+        "inventory"
       ],
       "prismaProjects": ["core", "observability"],
       "generatedClientDirs": ["core-client", "observability-client"],
@@ -115,7 +126,8 @@
         "hr-client",
         "commerce-client",
         "production-client",
-        "financial-client"
+        "financial-client",
+        "inventory-client"
       ],
       "generateScripts": ["prisma:generate:core", "prisma:generate:observability"],
       "health": {
@@ -208,6 +220,15 @@
           "generatedClientDir": "financial-client",
           "generateScript": "prisma:generate:financial",
           "artifactStatus": "implemented"
+        },
+        "INVENTORY_DATABASE_URL": {
+          "requirement": "not-used",
+          "owner": "inventory",
+          "prismaProject": "inventory",
+          "prismaSchema": "prisma/inventory/schema.prisma",
+          "generatedClientDir": "inventory-client",
+          "generateScript": "prisma:generate:inventory",
+          "artifactStatus": "implemented"
         }
       },
       "infrastructure": {
@@ -228,7 +249,8 @@
         "HR_DATABASE_URL",
         "COMMERCE_DATABASE_URL",
         "PRODUCTION_DATABASE_URL",
-        "FINANCE_DATABASE_URL"
+        "FINANCE_DATABASE_URL",
+        "INVENTORY_DATABASE_URL"
       ],
       "instantiatedOwners": ["core", "cms"],
       "notInstantiatedOwners": [
@@ -237,7 +259,8 @@
         "hr",
         "commerce",
         "production",
-        "financial"
+        "financial",
+        "inventory"
       ],
       "prismaProjects": ["core", "cms"],
       "generatedClientDirs": ["core-client", "cms-client"],
@@ -247,7 +270,8 @@
         "hr-client",
         "commerce-client",
         "production-client",
-        "financial-client"
+        "financial-client",
+        "inventory-client"
       ],
       "generateScripts": ["prisma:generate:core", "prisma:generate:cms"],
       "health": {
@@ -335,6 +359,15 @@
           "generatedClientDir": "financial-client",
           "generateScript": "prisma:generate:financial",
           "artifactStatus": "implemented"
+        },
+        "INVENTORY_DATABASE_URL": {
+          "requirement": "required",
+          "owner": "inventory",
+          "prismaProject": "inventory",
+          "prismaSchema": "prisma/inventory/schema.prisma",
+          "generatedClientDir": "inventory-client",
+          "generateScript": "prisma:generate:inventory",
+          "artifactStatus": "implemented"
         }
       },
       "infrastructure": {
@@ -356,7 +389,8 @@
         "HR_DATABASE_URL",
         "COMMERCE_DATABASE_URL",
         "PRODUCTION_DATABASE_URL",
-        "FINANCE_DATABASE_URL"
+        "FINANCE_DATABASE_URL",
+        "INVENTORY_DATABASE_URL"
       ],
       "notUsedDatasources": [],
       "instantiatedOwners": [
@@ -367,7 +401,8 @@
         "hr",
         "commerce",
         "production",
-        "financial"
+        "financial",
+        "inventory"
       ],
       "notInstantiatedOwners": [],
       "prismaProjects": [
@@ -378,7 +413,8 @@
         "hr",
         "commerce",
         "production",
-        "financial"
+        "financial",
+        "inventory"
       ],
       "generatedClientDirs": [
         "core-client",
@@ -388,7 +424,8 @@
         "hr-client",
         "commerce-client",
         "production-client",
-        "financial-client"
+        "financial-client",
+        "inventory-client"
       ],
       "prunedClientDirs": [],
       "generateScripts": [
@@ -399,7 +436,8 @@
         "prisma:generate:hr",
         "prisma:generate:commerce",
         "prisma:generate:production",
-        "prisma:generate:financial"
+        "prisma:generate:financial",
+        "prisma:generate:inventory"
       ],
       "health": {
         "className": "CombinedHealthModule",
@@ -491,6 +529,15 @@
           "generatedClientDir": "financial-client",
           "generateScript": "prisma:generate:financial",
           "artifactStatus": "implemented"
+        },
+        "INVENTORY_DATABASE_URL": {
+          "requirement": "not-used",
+          "owner": "inventory",
+          "prismaProject": "inventory",
+          "prismaSchema": "prisma/inventory/schema.prisma",
+          "generatedClientDir": "inventory-client",
+          "generateScript": "prisma:generate:inventory",
+          "artifactStatus": "implemented"
         }
       },
       "infrastructure": {
@@ -514,10 +561,18 @@
         "CORRESPONDENCE_DATABASE_URL",
         "COMMERCE_DATABASE_URL",
         "PRODUCTION_DATABASE_URL",
-        "FINANCE_DATABASE_URL"
+        "FINANCE_DATABASE_URL",
+        "INVENTORY_DATABASE_URL"
       ],
       "instantiatedOwners": ["core", "observability", "hr"],
-      "notInstantiatedOwners": ["cms", "correspondence", "commerce", "production", "financial"],
+      "notInstantiatedOwners": [
+        "cms",
+        "correspondence",
+        "commerce",
+        "production",
+        "financial",
+        "inventory"
+      ],
       "prismaProjects": ["core", "observability", "hr"],
       "generatedClientDirs": ["core-client", "observability-client", "hr-client"],
       "prunedClientDirs": [
@@ -525,7 +580,8 @@
         "correspondence-client",
         "commerce-client",
         "production-client",
-        "financial-client"
+        "financial-client",
+        "inventory-client"
       ],
       "generateScripts": [
         "prisma:generate:core",

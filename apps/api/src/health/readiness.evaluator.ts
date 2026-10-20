@@ -109,6 +109,9 @@ export class ReadinessEvaluator {
     for (const service of INFRASTRUCTURE_SERVICES) {
       out[INFRASTRUCTURE_CHECK_KEYS[service]] = policy.infrastructure[service];
     }
+    // PHASE W3: the revocation feed is always OPTIONAL — ttl-bound-only is a
+    // documented degraded posture, so its absence never blocks readiness.
+    out.tokenRevocationFeed = 'optional';
     return out;
   }
 }

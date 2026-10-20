@@ -1,10 +1,14 @@
 import { Injectable, UnauthorizedException, BadRequestException, Logger, ForbiddenException, Optional } from '@nestjs/common';
 import { TokenIssuer } from '../platform/auth/token-issuer';
+import { REVOCATION_EVENT_CONTRACT } from '../platform/auth/token-revocation';
+import { REVOCATION_ROUTING_KEY } from '../platform/auth/token-revocation-feed';
 import { PermissionSource } from '../platform/auth/permission-source.contract';
 import { UsersService } from '../users/users.service';
 import * as bcrypt from 'bcryptjs';
 import { RefreshTokenService } from './refresh-token.service';
 import { NotificationPublisher } from '../notifications/notification.publisher';
+import { EmailService } from '../notifications/email/email.service';
+import { passwordResetCodeEmail } from '../notifications/email/password-reset-code.email';
 import { PrismaService } from '../database/prisma.service';
 import { TokenHashService } from './services/token-hash.service';
 import { SessionService } from './services/session.service';
@@ -13,10 +17,53 @@ import { RequestContextService } from '../common/request-context.service';
 import type { PassportLoginUser } from './auth.types';
 import type { RegisterDto } from './dto/register.dto';
 
+/**
+ * How long a password-reset CODE stays valid.
+ *
+ * TEN MINUTES, not the two hours the previous link-token flow allowed: a six-digit secret is
+ * transcribed from a mailbox, so the window only has to be long enough for a person to open
+ * their mail and type it. A shorter window is the cheapest defence there is against a code
+ * that leaked (a shared screenshot, a forwarding rule), and the cost of an expired code is one
+ * more request — which stays rate-limited.
+ */
+export const PASSWORD_RESET_CODE_TTL_MINUTES = 10;
+
+/**
+ * How many WRONG codes one row tolerates before it is burned.
+ *
+ * FIVE against a million possible values means an online guesser's odds are ~1 in 200,000 per
+ * issued code, and the row dies at the cap so the attack must start over — against a request
+ * path that is limited per IP and cooled down per account. This is the number that makes a
+ * six-digit code defensible without making a typo lock a legitimate user out for long.
+ */
+export const MAX_PASSWORD_RESET_ATTEMPTS = 5;
+
+/**
+ * How long an account must wait before a SECOND code is issued.
+ *
+ * There is at most one live code per account, so without a cooldown a caller could invalidate
+ * their own code by pressing the button twice — and an attacker could keep the mailbox busy.
+ * Sixty seconds is measured from the last ISSUE, so the very first request is never delayed.
+ */
+export const PASSWORD_RESET_REQUEST_COOLDOWN_SECONDS = 60;
+
+/**
+ * The one sentence every refusal on the reset path uses.
+ *
+ * Deliberately identical for "no such account", "wrong code", "expired" and "burned": the
+ * reset path is ANONYMOUS, so a message that distinguished them would turn it into an oracle
+ * for which addresses exist and which codes are close. The operator-facing detail lives in the
+ * audit trail (`reason`) instead, where only an administrator reads it.
+ */
+const PASSWORD_RESET_REFUSAL = 'Invalid or expired reset code';
+
 @Injectable()
 export class AuthService {
   private readonly logger = new Logger('AuthService');
-  private readonly refreshTokenExpiration = 30 * 24 * 60; // 30 days in minutes
+  // Product decision: the session lifetime (the refresh token's validity) is NINE
+  // HOURS. When it expires the user is fully signed out — the frontend drops the
+  // session on the next 401 and returns to the login page.
+  private readonly refreshTokenExpiration = 9 * 60; // 9 hours in minutes
 
   constructor(
     private usersService: UsersService,
@@ -38,6 +85,17 @@ export class AuthService {
     private tokenHashService: TokenHashService,
     private sessionService: SessionService,
     private prisma: PrismaService,
+    /**
+     * PHASE PASSWORD-RESET-CODE: the ONE way this process sends mail.
+     *
+     * WHY THE MAIL IS SENT HERE AND NOT THROUGH THE EVENT BROKER. The reset path used to
+     * publish `auth.password.reset.requested` and hope a consumer would send it — no consumer
+     * exists, so no code ever reached a mailbox and the flow was a dead end. A credential that
+     * must arrive for the feature to work is not an integration point: it is the request's own
+     * side effect, so it is awaited here (and its failure is recorded, never thrown — see
+     * `sendPasswordResetCode`).
+     */
+    private readonly emailService: EmailService,
     @Optional() private readonly auditService?: AuditService,
   ) {}
 
@@ -327,91 +385,239 @@ export class AuthService {
     return { revoked: true, sessionId };
   }
 
+  /**
+   * Request a password-reset CODE for an email address.
+   *
+   * THE ANSWER IS ALWAYS THE SAME — `true`, in a 200 — whether or not the address exists,
+   * whether or not a code was issued, and whether or not the mail could be delivered. That is
+   * the whole contract of an anonymous endpoint that touches a mailbox: nothing it returns may
+   * tell the caller which addresses are registered.
+   *
+   * WHAT ACTUALLY HAPPENS, in order:
+   *  1. the account is resolved quietly (an unknown address stops here);
+   *  2. a code issued less than `PASSWORD_RESET_REQUEST_COOLDOWN_SECONDS` ago is NOT replaced —
+   *     the first code stays the valid one, so a double click cannot invalidate it;
+   *  3. every other live code for the account is retired, so at most ONE code can ever work;
+   *  4. a fresh six-digit code is hashed (account id + process pepper) and stored with its
+   *     expiry; the plaintext exists only in this method's scope and in the email;
+   *  5. the email is sent, and a delivery failure is recorded rather than thrown.
+   *
+   * NOTE ON THE BROKER EVENT: it still fires, but the payload no longer carries the credential.
+   * A one-time secret must not sit in a broker queue where no consumer exists to use it.
+   */
   async requestPasswordReset(email: string) {
     const user = await this.usersService.findByEmail(email);
     if (!user) return true; // don't reveal existence
 
-    const token = this.tokenHashService.generateToken();
-    const expiresAt = this.tokenHashService.getExpirationTime(2 * 60); // 2 hours
-    const hashedToken = this.tokenHashService.hashToken(token);
+    const now = new Date();
+    const live = await this.prisma.passwordReset.findFirst({
+      where: { userId: user.id, used: false, expiresAt: { gt: now } },
+      orderBy: { createdAt: 'desc' },
+    });
+
+    if (
+      live &&
+      now.getTime() - live.createdAt.getTime() < PASSWORD_RESET_REQUEST_COOLDOWN_SECONDS * 1000
+    ) {
+      // A code was issued moments ago and is still valid: return the same neutral answer and
+      // leave it alone. Replacing it here is what would make a double submit fail.
+      this.logger.log(`Password reset code re-requested within the cooldown for: ${email}`);
+      return true;
+    }
+
+    // At most one live code per account: the previous one is retired with the new one issued.
+    await this.prisma.passwordReset.updateMany({
+      where: { userId: user.id, used: false },
+      data: { used: true },
+    });
+
+    const code = this.tokenHashService.generateNumericCode();
+    const expiresAt = this.tokenHashService.getExpirationTime(PASSWORD_RESET_CODE_TTL_MINUTES);
 
     await this.prisma.passwordReset.create({
       data: {
-        token: hashedToken,
+        codeHash: this.tokenHashService.hashPasswordResetCode(code, user.id),
         userId: user.id,
         expiresAt,
         used: false,
+        attempts: 0,
       },
     });
 
-    // Publish password reset requested event
+    await this.sendPasswordResetCode(user.id, user.email, code, expiresAt);
+
     await this.notificationPublisher.publish('auth.password.reset.requested', {
       userId: user.id,
       email: user.email,
-      token, // Send plain token; consumer includes in email link
       expiresAt: expiresAt.toISOString(),
       appUrl: process.env.APP_URL || 'http://localhost:3000',
     });
 
-    this.logger.log(`Password reset requested for: ${email}`);
+    await this.emitAuthAudit({
+      action: 'password_reset_requested',
+      userId: user.id,
+      resourceId: user.id,
+      success: true,
+      reason: 'code_issued',
+    });
+
+    this.logger.log(`Password reset code issued for: ${email}`);
     return true;
   }
 
-  async resetPassword(token: string, newPassword: string) {
-    // Find password reset token by deterministic hash. The column is already
-    // unique because tokens are single-use random values.
-    const tokenHash = this.tokenHashService.hashToken(token);
-    const matching = await this.prisma.passwordReset.findUnique({
-      where: { token: tokenHash },
-      include: { user: true },
+  /**
+   * Deliver the code, and say so in the audit trail if it could not be delivered.
+   *
+   * WHY A FAILURE IS NOT THROWN. The code is already STORED, so a delivery failure is not a
+   * dead end: the user may request another one (cooled down, then rate-limited). Throwing would
+   * instead turn an infrastructure problem into a 500, and — worse — into an oracle that tells
+   * an anonymous caller whether their address exists and whether this process can reach SMTP.
+   * It is recorded with `reason`, and `EmailService` already logs the message it could not send
+   * when no transport is configured, so a developer sees the code in the log exactly as before.
+   */
+  private async sendPasswordResetCode(
+    userId: string,
+    email: string,
+    code: string,
+    expiresAt: Date
+  ) {
+    const content = passwordResetCodeEmail({
+      code,
+      expiresInMinutes: PASSWORD_RESET_CODE_TTL_MINUTES,
+      appUrl: process.env.APP_URL || 'http://localhost:3000',
     });
 
-    if (!matching || matching.used) {
+    try {
+      await this.emailService.sendMail(email, content.subject, content.html, content.text);
+    } catch (err: unknown) {
+      await this.emitAuthAudit({
+        action: 'password_reset_failed',
+        userId,
+        resourceId: userId,
+        success: false,
+        reason: 'reset_email_dispatch_failed',
+      });
+      this.logger.error(
+        `Password reset email dispatch failed for user ${userId} (expires ${expiresAt.toISOString()}): ${
+          err instanceof Error ? err.message : String(err)
+        }`
+      );
+    }
+  }
+
+  /**
+   * Consume a password-reset CODE and set the new password.
+   *
+   * THE ORDER OF THE CHECKS IS THE SECURITY STORY:
+   *  1. the account is resolved; an unknown address is refused with the SAME sentence as a
+   *     wrong code, so this endpoint never confirms that an address exists;
+   *  2. the account's live row is loaded — the user id is the key, never the code, so two
+   *     accounts that received the same six digits cannot be confused;
+   *  3. an expired row is refused (reported distinctly to the operator, never to the caller);
+   *  4. a row at the attempt cap is refused: `attempts` is only incremented on WRONG codes
+   *     below, so reaching the cap means five misses, and the row was burned at that point;
+   *  5. the digest is compared against the stored one — a miss increments `attempts` and burns
+   *     the row on the fifth, then refuses;
+   *  6. only then: rehash (bcrypt, cost 12), mark the row used, revoke every refresh token and
+   *     bump `tokenVersion` — which is what makes a reset end every existing session, including
+   *     the one an attacker may be holding.
+   */
+  async resetPassword(email: string, code: string, newPassword: string) {
+    const user = await this.usersService.findByEmail(email);
+
+    if (!user) {
       await this.emitAuthAudit({
         action: 'password_reset_failed',
         userId: undefined,
         resourceId: 'password-reset',
         success: false,
-        reason: 'invalid_or_used_token',
+        reason: 'unknown_account',
       });
-      throw new BadRequestException('Invalid or used token');
+      throw new BadRequestException(PASSWORD_RESET_REFUSAL);
     }
-    if (matching.expiresAt < new Date()) {
+
+    const pending = await this.prisma.passwordReset.findFirst({
+      where: { userId: user.id, used: false },
+      orderBy: { createdAt: 'desc' },
+    });
+
+    if (!pending) {
       await this.emitAuthAudit({
         action: 'password_reset_failed',
-        userId: matching.userId,
-        resourceId: matching.userId,
+        userId: user.id,
+        resourceId: user.id,
         success: false,
-        reason: 'token_expired',
+        reason: 'no_live_code',
       });
-      throw new BadRequestException('Token expired');
+      throw new BadRequestException(PASSWORD_RESET_REFUSAL);
+    }
+
+    if (pending.expiresAt < new Date()) {
+      await this.emitAuthAudit({
+        action: 'password_reset_failed',
+        userId: user.id,
+        resourceId: user.id,
+        success: false,
+        reason: 'code_expired',
+      });
+      throw new BadRequestException(PASSWORD_RESET_REFUSAL);
+    }
+
+    if (pending.attempts >= MAX_PASSWORD_RESET_ATTEMPTS) {
+      await this.emitAuthAudit({
+        action: 'password_reset_failed',
+        userId: user.id,
+        resourceId: user.id,
+        success: false,
+        reason: 'code_attempt_cap_reached',
+      });
+      throw new BadRequestException(PASSWORD_RESET_REFUSAL);
+    }
+
+    const submitted = this.tokenHashService.hashPasswordResetCode(code, user.id);
+    if (submitted !== pending.codeHash) {
+      const attempts = pending.attempts + 1;
+      const burned = attempts >= MAX_PASSWORD_RESET_ATTEMPTS;
+
+      await this.prisma.passwordReset.update({
+        where: { id: pending.id },
+        data: { attempts, used: burned },
+      });
+
+      await this.emitAuthAudit({
+        action: 'password_reset_failed',
+        userId: user.id,
+        resourceId: user.id,
+        success: false,
+        reason: burned ? 'code_burned_after_attempt_cap' : 'invalid_code',
+      });
+      throw new BadRequestException(PASSWORD_RESET_REFUSAL);
     }
 
     const passwordHash = await bcrypt.hash(newPassword, 12);
     await this.prisma.user.update({
-      where: { id: matching.userId },
+      where: { id: user.id },
       data: { passwordHash },
     });
 
     await this.prisma.passwordReset.update({
-      where: { id: matching.id },
+      where: { id: pending.id },
       data: { used: true },
     });
 
     // Invalidate existing refresh tokens and active access tokens after a password reset
-    await this.refreshService.revokeAllForUser(matching.userId);
-    await this.incrementTokenVersion(matching.userId);
+    await this.refreshService.revokeAllForUser(user.id);
+    await this.incrementTokenVersion(user.id);
 
     await this.emitAuthAudit({
       action: 'password_reset_success',
-      userId: matching.userId,
-      resourceId: matching.userId,
+      userId: user.id,
+      resourceId: user.id,
       success: true,
       reason: 'password_reset_success',
     });
 
-    // Publish audit log or notification for security
-    this.logger.log(`Password reset for: ${matching.user.email}`);
+    this.logger.log(`Password reset for: ${user.email}`);
     return true;
   }
 
@@ -485,17 +691,42 @@ export class AuthService {
    /**
     * Increment user's tokenVersion to invalidate all active JWTs
     * Called when permissions change (role assignment, role removal, permission updates)
+    *
+    * TARGETED-REMEDIATION (P2, ADR-0006 §C1(2)): the increment is the REVOCATION act,
+    * and it now also emits `platform.revocation@v1` on `domain_events` so the
+    * verifier's deny-set hears about it within the TTL window instead of only at
+    * refresh. The publish carries the contract's exact vocabulary —
+    * `{userId, ver, tid, revokedAt}` plus the `contract` descriptor — and it is
+    * emitted AFTER the write commits, so the event can never name a version the
+    * database has not yet reached.
     */
    async incrementTokenVersion(userId: string): Promise<number> {
      const updated = await this.prisma.user.update({
        where: { id: userId },
        data: { tokenVersion: { increment: 1 } },
-       select: { tokenVersion: true },
+       select: { tokenVersion: true, tenantId: true },
      });
 
      this.logger.log(
        `Token version incremented for user ${userId}, new version: ${updated.tokenVersion}`,
      );
+
+     if (updated.tenantId === null) {
+       // `tid` is a required, non-empty contract field; a tenant-less user cannot be
+       // named by a valid `platform.revocation@v1` event. Skipping is reported, never
+       // silent — the TTL bound and the cold refresh path still cover the revocation.
+       this.logger.warn(
+         `No platform.revocation@v1 event emitted for ${userId}: the user row carries no tenantId`,
+       );
+     } else {
+       await this.notificationPublisher.publish(REVOCATION_ROUTING_KEY, {
+         contract: REVOCATION_EVENT_CONTRACT,
+         userId,
+         ver: updated.tokenVersion,
+         tid: updated.tenantId,
+         revokedAt: new Date().toISOString(),
+       });
+     }
 
      return updated.tokenVersion;
    }

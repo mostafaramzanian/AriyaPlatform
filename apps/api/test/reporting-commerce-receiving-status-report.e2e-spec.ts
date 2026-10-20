@@ -48,6 +48,8 @@ import {
 } from './reporting-export.fixtures';
 import { PrismaService as CorePrismaService } from '../src/database/prisma.service';
 import { CommercePrismaService } from '../src/modules/commerce/database/commerce-prisma.service';
+import { InventoryPrismaService } from '../src/modules/inventory/database/inventory-prisma.service';
+import { ensureCommerceProcurementTestProvisioning } from './fixtures/commerce-provisioning';
 
 type SupertestResponse = import('supertest').Response;
 
@@ -101,6 +103,10 @@ function getCoreDb(): CorePrismaService {
 
 function getCommerceDb(): CommercePrismaService {
   return getApp().get(CommercePrismaService);
+}
+
+function getInventoryDb(): InventoryPrismaService {
+  return getApp().get(InventoryPrismaService);
 }
 
 // Unwraps the standard `{ data }` envelope (or passes a bare body through).
@@ -235,7 +241,7 @@ async function createDocument(
   return {
     id: body.id,
     documentNumber: body.documentNumber,
-    lines: (body.lines ?? []).map((line) => ({
+    lines: (body.lines ?? []).map((line: { id: string; quantity: unknown }) => ({
       id: line.id,
       quantity: String(line.quantity),
     })),
@@ -289,6 +295,8 @@ describe('Reporting — Commerce Receiving Status Report (tenth vertical slice)'
   let untouchedLineId: string;
   let tenantBDocId: string;
   let tenantBLineId: string;
+  let warehouseAId: string;
+  let warehouseBId: string;
 
   const reportUrl = (suffix = '') => `${API_PREFIX}/reporting/commerce/receiving${suffix}`;
   /** The run's own population — every list assertion scopes through this one filter. */
@@ -302,6 +310,15 @@ describe('Reporting — Commerce Receiving Status Report (tenth vertical slice)'
     const tenantA = await coreDb.tenant.findUnique({ where: { id: 'tenant-test-1' } });
     if (!tenantA) throw new Error('[E2E] Seeded tenant tenant-test-1 not found');
     tenantAId = tenantA.id;
+
+    // Test-only provisioning, and it MUST run BEFORE any login: login resolves the
+    // caller's permission claim through the PermissionSource port (which caches its
+    // answer), so a grant written after the first token is minted leaves every later
+    // request carrying a permission-empty identity. The grant/enrolment migrations
+    // cannot supply these rows themselves — they only see what existed at migration
+    // time, while the roles and `tenant-test-1` are created afterwards by `db:seed`.
+    // Shapes mirrored, nothing else touched: fixtures/commerce-provisioning.ts.
+    await ensureCommerceProcurementTestProvisioning(coreDb, [tenantAId]);
 
     const seededAdminRow = await coreDb.user.findUnique({ where: { email: 'admin@localhost' } });
     if (!seededAdminRow) throw new Error('[E2E] Seeded admin user not found');
@@ -334,14 +351,56 @@ describe('Reporting — Commerce Receiving Status Report (tenth vertical slice)'
     [partialLineId, fullLineId, untouchedLineId] = docA.lines.map((line) => line.id);
     expect(new Set([partialLineId, fullLineId, untouchedLineId]).size).toBe(3);
 
+    // Phase W2-B contract: a receipt line on a STOCKED purchase line must name
+    // the destination warehouse — the posting the receipt plans into
+    // `InventoryPosting` resolves the line's `itemReference` against tenant A's
+    // real inventory items, so the run seeds a real warehouse + item per SKU
+    // (tenant-scoped, deleted in afterAll) instead of faking stock effects.
+    const inventoryDb = getInventoryDb();
+    warehouseAId = (
+      await inventoryDb.warehouse.create({
+        data: {
+          tenantId: tenantAId,
+          code: `WH-A-${RUN_ID}`.slice(0, 32),
+          name: `e2e warehouse A ${RUN_ID}`,
+          createdByUserId: admin.userId,
+        },
+      })
+    ).id;
+    warehouseBId = (
+      await inventoryDb.warehouse.create({
+        data: {
+          tenantId: tenantBAdmin.tenantId,
+          code: `WH-B-${RUN_ID}`.slice(0, 32),
+          name: `e2e warehouse B ${RUN_ID}`,
+          createdByUserId: tenantBAdmin.userId,
+        },
+      })
+    ).id;
+    for (const [tenantId, sku, actorId] of [
+      ...Array.from({ length: 3 }, (_, i) => [tenantAId, `RECV-${RUN_ID}-L${i}`, admin.userId] as const),
+      [tenantBAdmin.tenantId, `RECV-${RUN_ID}-L0`, tenantBAdmin.userId] as const,
+    ]) {
+      await inventoryDb.inventoryItem.create({
+        data: {
+          tenantId,
+          sku,
+          name: `e2e item ${sku}`,
+          itemType: 'STOCKED',
+          baseUnit: 'PCS',
+          createdByUserId: actorId,
+        },
+      });
+    }
+
     await appendReceipt(admin.token, docAId, {
       receivedAt: RECEIVED_DATES.partialLine,
-      lines: [{ purchaseLineId: partialLineId, quantity: 40 }],
+      lines: [{ purchaseLineId: partialLineId, quantity: 40, warehouseId: warehouseAId }],
     });
 
     const fullReceipt = await appendReceipt(admin.token, docAId, {
       receivedAt: RECEIVED_DATES.fullLine,
-      lines: [{ purchaseLineId: fullLineId, quantity: 100 }],
+      lines: [{ purchaseLineId: fullLineId, quantity: 100, warehouseId: warehouseAId }],
     });
     void fullReceipt;
     // The append response only carries the RECEIPT id (`receiptView`); the
@@ -387,7 +446,7 @@ describe('Reporting — Commerce Receiving Status Report (tenth vertical slice)'
     tenantBLineId = docB.lines[0].id;
     await appendReceipt(tenantBAdmin.token, tenantBDocId, {
       receivedAt: RECEIVED_DATES.tenantB,
-      lines: [{ purchaseLineId: tenantBLineId, quantity: 10 }],
+      lines: [{ purchaseLineId: tenantBLineId, quantity: 10, warehouseId: warehouseBId }],
     });
   }, 120_000);
 
@@ -404,6 +463,13 @@ describe('Reporting — Commerce Receiving Status Report (tenth vertical slice)'
       await coreDb.userRole.deleteMany({ where: { userId: tenantBAdmin.userId } });
       await coreDb.user.deleteMany({ where: { id: tenantBAdmin.userId } });
       await coreDb.tenant.delete({ where: { id: tenantBAdmin.tenantId } });
+      const inventoryDb = getInventoryDb();
+      await inventoryDb.inventoryItem.deleteMany({
+        where: { sku: { startsWith: `RECV-${RUN_ID}` } },
+      });
+      await inventoryDb.warehouse.deleteMany({
+        where: { code: { in: [`WH-A-${RUN_ID}`.slice(0, 32), `WH-B-${RUN_ID}`.slice(0, 32)] } },
+      });
     } catch {
       // best-effort
     }
@@ -485,14 +551,15 @@ describe('Reporting — Commerce Receiving Status Report (tenth vertical slice)'
     // the untouched one. The report must NOT collapse them into one document row
     // and must NOT render the five receipt events as five rows.
     expect(body.total).toBe(3);
-    const ids = body.items.map((item) => item.id);
+    const ids = body.items.map((item: { id: string }) => item.id);
     expect(new Set(ids).size).toBe(3);
     expect(ids).toEqual(
       expect.arrayContaining([partialLineId, fullLineId, untouchedLineId])
     );
 
-    const byId = new Map<string, Record<string, unknown>>(body.items.map((item) => [item.id, item]));
-    const partial = byId.get(partialLineId);
+    const byId = new Map<string, Record<string, unknown>>((body.items as Record<string, unknown> & { id: string }[]).map((item) => [item.id, item] as const));
+    const partial = byId.get(partialLineId)!;
+    if (!partial) throw new Error('partial line missing from register');
     expect(partial.receivingStatus).toBe('PARTIALLY_RECEIVED');
     expect(partial.receivedQuantity).toBe('40.0000');
     expect(partial.compensationCount).toBe(0);
@@ -500,7 +567,8 @@ describe('Reporting — Commerce Receiving Status Report (tenth vertical slice)'
 
     // 100 − 20 compensation = 80: still PARTIAL, and the compensation is where
     // the register's compensation count comes from.
-    const full = byId.get(fullLineId);
+    const full = byId.get(fullLineId)!;
+    if (!full) throw new Error('full line missing from register');
     expect(full.receivingStatus).toBe('PARTIALLY_RECEIVED');
     expect(full.receivedQuantity).toBe('80.0000');
     expect(full.compensationCount).toBe(1);
@@ -508,7 +576,8 @@ describe('Reporting — Commerce Receiving Status Report (tenth vertical slice)'
 
     // No events at all: NOT_RECEIVED (the Commerce screen's own rule), NULL
     // instant — the row the register must not drop.
-    const untouched = byId.get(untouchedLineId);
+    const untouched = byId.get(untouchedLineId)!;
+    if (!untouched) throw new Error('untouched line missing from register');
     expect(untouched.receivingStatus).toBe('NOT_RECEIVED');
     expect(untouched.receivedQuantity).toBe('0.0000');
     expect(untouched.compensationCount).toBe(0);
@@ -535,10 +604,10 @@ describe('Reporting — Commerce Receiving Status Report (tenth vertical slice)'
     const partialBody = envelope(partial.body);
     const notReceivedBody = envelope(notReceived.body);
     // Two lines carry arrivals (40 and netted 80), one line carries none.
-    expect(partialBody.items.map((item) => item.id).sort()).toEqual(
+    expect(partialBody.items.map((item: { id: string }) => item.id).sort()).toEqual(
       [partialLineId, fullLineId].sort()
     );
-    expect(notReceivedBody.items.map((item) => item.id)).toEqual([untouchedLineId]);
+    expect(notReceivedBody.items.map((item: { id: string }) => item.id)).toEqual([untouchedLineId]);
     for (const item of partialBody.items) expect(item.receivingStatus).toBe('PARTIALLY_RECEIVED');
     for (const item of notReceivedBody.items) expect(item.receivingStatus).toBe('NOT_RECEIVED');
     // The status filter is the summary's own dimension: PARTIAL rows = PARTIAL count.
@@ -561,7 +630,7 @@ describe('Reporting — Commerce Receiving Status Report (tenth vertical slice)'
       .get(scoped('&receivedFrom=2026-01-05T00:00:00.000Z&receivedTo=2026-01-06T00:00:00.000Z&pageSize=100'))
       .set('Authorization', `Bearer ${admin.token}`)
       .expect(200);
-    expect(envelope(window.body).items.map((item) => item.id)).toEqual([partialLineId]);
+    expect(envelope(window.body).items.map((item: { id: string }) => item.id)).toEqual([partialLineId]);
 
     // The compensating write's instant is the line's latest: day 2026-03-16
     // alone answers the netted line, and the untouched line is EXCLUDED because
@@ -570,7 +639,7 @@ describe('Reporting — Commerce Receiving Status Report (tenth vertical slice)'
       .get(scoped('&receivedFrom=2026-03-16T00:00:00.000Z&receivedTo=2026-03-17T00:00:00.000Z&pageSize=100'))
       .set('Authorization', `Bearer ${admin.token}`)
       .expect(200);
-    expect(envelope(netted.body).items.map((item) => item.id)).toEqual([fullLineId]);
+    expect(envelope(netted.body).items.map((item: { id: string }) => item.id)).toEqual([fullLineId]);
 
     // The EXCLUSIVE end: an instant exactly at `receivedTo` is OUT of the window.
     const edge: SupertestResponse = await api()
@@ -601,7 +670,7 @@ describe('Reporting — Commerce Receiving Status Report (tenth vertical slice)'
       .set('Authorization', `Bearer ${admin.token}`)
       .expect(200);
     const body = envelope(byNumber.body);
-    const ids = body.items.map((item) => item.id);
+    const ids = body.items.map((item: { id: string }) => item.id);
     expect(ids).toEqual(expect.arrayContaining([partialLineId, fullLineId, untouchedLineId]));
     for (const item of body.items) expect(item.purchaseDocumentNumber).toBe(docANumber);
   });
@@ -612,7 +681,7 @@ describe('Reporting — Commerce Receiving Status Report (tenth vertical slice)'
       .set('Authorization', `Bearer ${admin.token}`)
       .expect(200);
     const body = envelope(res.body);
-    expect(body.items.map((item) => item.id)).toEqual([partialLineId]);
+    expect(body.items.map((item: { id: string }) => item.id)).toEqual([partialLineId]);
     expect(body.total).toBe(1);
   });
 
@@ -656,7 +725,7 @@ describe('Reporting — Commerce Receiving Status Report (tenth vertical slice)'
       .get(`${reportUrl()}?pageSize=100`)
       .set('Authorization', `Bearer ${admin.token}`)
       .expect(200);
-    const ids = envelope(list.body).items.map((item) => item.id);
+    const ids = envelope(list.body).items.map((item: { id: string }) => item.id);
     expect(ids).not.toContain(tenantBLineId);
 
     // A foreign id behaves EXACTLY like a missing one: 404, not 403.
@@ -752,7 +821,7 @@ describe('Reporting — Commerce Receiving Status Report (tenth vertical slice)'
       .set('Authorization', `Bearer ${admin.token}`)
       .expect(200);
     const listed = envelope(list.body);
-    expect(listed.items.map((item) => item.id).sort()).toEqual(
+    expect(listed.items.map((item: { id: string }) => item.id).sort()).toEqual(
       [partialLineId, fullLineId, untouchedLineId].sort()
     );
 

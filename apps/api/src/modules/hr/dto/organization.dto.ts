@@ -1,4 +1,13 @@
-import { IsIn, IsOptional, IsString, IsUUID, Matches, MaxLength, MinLength } from 'class-validator';
+import {
+  IsIn,
+  IsNumberString,
+  IsOptional,
+  IsString,
+  IsUUID,
+  Matches,
+  MaxLength,
+  MinLength,
+} from 'class-validator';
 import { HR_RECORD_STATUSES, HrRecordStatus, HrPageQueryDto } from './hr-query.dto';
 
 /**
@@ -30,7 +39,44 @@ export const MAX_POSITION_TITLE_LENGTH = 200;
  */
 export const HR_CODE_PATTERN = /^[A-Z0-9][A-Z0-9._/-]{0,63}$/;
 
-export class CreateOrganizationUnitDto {
+/** The chart-profile kinds a unit may carry — عملیاتی / ستادی on screen. */
+export const ORGANIZATION_UNIT_KINDS = ['OPERATIONAL', 'STAFF'] as const;
+export type OrganizationUnitKind = (typeof ORGANIZATION_UNIT_KINDS)[number];
+
+/**
+ * The optional profile fields every unit write shares: the create accepts them at
+ * birth, the update accepts them — including an explicit `null` that CLEARS one —
+ * afterward. A field omitted from the body is left untouched, exactly like
+ * `name`; only `null` says "remove this label".
+ */
+class OrganizationUnitProfileFields {
+  @IsOptional()
+  @IsIn(ORGANIZATION_UNIT_KINDS)
+  kind?: OrganizationUnitKind;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(200)
+  managerName?: string | null;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(200)
+  location?: string | null;
+
+  /** Whole tomans as a digit string — DECIMAL(20,0) at rest, never a float. */
+  @IsOptional()
+  @IsNumberString()
+  @MaxLength(20)
+  monthlyBudget?: string | null;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(500)
+  responsibility?: string | null;
+}
+
+export class CreateOrganizationUnitDto extends OrganizationUnitProfileFields {
   @IsString()
   @MinLength(1)
   @MaxLength(MAX_UNIT_CODE_LENGTH)
@@ -51,7 +97,7 @@ export class CreateOrganizationUnitDto {
   parentId?: string;
 }
 
-export class UpdateOrganizationUnitDto {
+export class UpdateOrganizationUnitDto extends OrganizationUnitProfileFields {
   @IsOptional()
   @IsString()
   @MinLength(1)

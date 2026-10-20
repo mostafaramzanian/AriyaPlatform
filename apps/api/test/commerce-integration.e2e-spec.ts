@@ -110,11 +110,19 @@ import { PurchaseCompletionPolicyController } from '../src/modules/commerce/comp
 import { PurchaseCompletionPolicyRepository } from '../src/modules/commerce/completion/purchase-completion-policy.repository';
 import { PurchaseCompletionPolicyService } from '../src/modules/commerce/completion/purchase-completion-policy.service';
 import { PurchaseCompletionService } from '../src/modules/commerce/completion/purchase-completion.service';
+import { InventoryPostingRepository } from '../src/modules/commerce/integration/inventory-posting.repository';
+import { InventoryIntegrationService } from '../src/modules/commerce/integration/inventory-integration.service';
+import { INVENTORY_POSTING_PORT } from '../src/modules/commerce/integration/inventory-posting.port';
+import { createFakeInventoryPostingPort } from './fixtures/fake-inventory-posting-port';
 import { PurchaseService } from '../src/modules/commerce/purchase/purchase.service';
 import { PurchaseTimelineService } from '../src/modules/commerce/purchase/purchase-timeline.service';
+import { PurchaseHistoryService } from '../src/modules/commerce/purchase/purchase-history.service';
+import { PurchaseHistoryRepository } from '../src/modules/commerce/purchase/purchase-history.repository';
+import { PaymentPlanRepository } from '../src/modules/commerce/payment-plan/payment-plan.repository';
 import { PurchaseRepository } from '../src/modules/commerce/purchase/purchase.repository';
 import { PaymentHistoryController } from '../src/modules/commerce/payment/payment-history.controller';
-import { PaymentHistoryService } from '../src/modules/commerce/payment/payment-history.service';
+import { PAYMENT_AUDIT_ACTION, PaymentHistoryService } from '../src/modules/commerce/payment/payment-history.service';
+import { COMMERCE_AUDIT_RESOURCE } from '../src/modules/commerce/commerce.constants';
 import { PaymentHistoryRepository } from '../src/modules/commerce/payment/payment-history.repository';
 import { ReceivingHistoryController } from '../src/modules/commerce/receiving/receiving-history.controller';
 import { ReceivingHistoryService } from '../src/modules/commerce/receiving/receiving-history.service';
@@ -251,10 +259,12 @@ class ProbeHeaderStrategy {
       claims: null,
     });
   }
-  private success(): void {
+  private success(_arg?: unknown): void {
+      void _arg;
     throw new Error('passport replaces this method before authenticate() runs');
   }
-  private fail(): void {
+  private fail(_arg?: unknown): void {
+      void _arg;
     throw new Error('passport replaces this method before authenticate() runs');
   }
 }
@@ -558,11 +568,20 @@ describe('Commerce procurement integration e2e (Step W): the required domain tes
       // PHASE C7 (GAP-7): the timeline route on `PurchaseController` needs its service —
       // wired exactly as commerce.module.ts wires it (repository + audit gateway above).
       PurchaseTimelineService,
+      // PHASE W3.2: the aggregated-history route on `PurchaseController` — its
+      // service and read-only repository, plus the plan repository the completion
+      // service consults for outstanding installments.
+      PurchaseHistoryService,
+      PurchaseHistoryRepository,
+      PaymentPlanRepository,
       // PHASE C4-R (GAP-3): the completion slice — the policy row's owner, its
       // configuration surface, and the one service that may move a document to CLOSED.
       PurchaseCompletionPolicyRepository,
       PurchaseCompletionPolicyService,
       PurchaseCompletionService,
+      InventoryPostingRepository,
+      InventoryIntegrationService,
+      { provide: INVENTORY_POSTING_PORT, useValue: createFakeInventoryPostingPort() },
       PaymentHistoryRepository,
       PaymentHistoryService,
       ReceivingHistoryRepository,
@@ -622,10 +641,8 @@ describe('Commerce procurement integration e2e (Step W): the required domain tes
   // route for (routing configuration, and a step decision).
   // =========================================================================
 
-  let verSingle: string;
-  let verGateA: string;
-  let verGateB: string;
-  let gateADefId: string;
+  // (The four ids below are already declared with the describe's other state at the
+  // top — this duplicate block was a merge artifact and a TS2451 redeclaration error.)
   let verGateB1: string;
   let verGateA1: string;
 
@@ -1133,8 +1150,11 @@ describe('Commerce procurement integration e2e (Step W): the required domain tes
   // them moving the document's own status
   // =========================================================================
   it('W-S24: receipts, over-receipt, money movements and a return, all on the aggregate', async () => {
-    const lineOf = (collection: IntegrationReceivingLine[], lineId: string) =>
-      collection.find((row) => row.purchaseLineId === lineId);
+    const lineOf = (collection: IntegrationReceivingLine[], lineId: string) => {
+      const line = collection.find((row) => row.purchaseLineId === lineId);
+      if (!line) throw new Error(`receiving line ${lineId} missing from the read`);
+      return line;
+    };
 
     // (12) A PARTIAL receipt, of ONE line out of the three.
     const received = await http()
@@ -1261,13 +1281,36 @@ describe('Commerce procurement integration e2e (Step W): the required domain tes
     expect(document.requester.id).toBe(userA1);
     expect(document.requester.profile?.id).toBe(userA1);
 
+    // B2.3 durable audit outbox (the lifecycle suite's own helper): mutations write their
+    // audit event INSIDE the business transaction and reach `AUDIT_PORT` only through the
+    // relay's 10-second poll — a timer this harness deliberately does not run. Deliver
+    // every pending row to the SAME fake port these assertions read through, then delete
+    // it, so this test proves delivery rather than relay scheduling.
+    const pendingOutbox = await db.auditOutbox.findMany({ orderBy: { createdAt: 'asc' } });
+    for (const row of pendingOutbox) {
+      await fakeAuditPort.record(
+        row.payload as unknown as Parameters<typeof fakeAuditPort.record>[0]
+      );
+      await db.auditOutbox.delete({ where: { id: row.id } });
+    }
+
     // (23) Every move travelled through the audit port, and every notification names both the
     // document it is about and the tenant that owns it.
     expect(auditEvents.some((event) => event.resourceId === docA.id)).toBe(true);
     // Tenant B ran its own process, and its events carry tenant B's id -- never tenant A's.
     expect(auditEvents.some((event) => event.tenantId === tenantBId)).toBe(true);
     expect(auditEvents.some((event) => event.resourceId === retA)).toBe(true);
-    expect(auditEvents.some((event) => event.resourceId === payA)).toBe(true);
+    // The payment move is audited with the DOCUMENT as its resourceId (the row id does
+    // not exist until the insert, and the outbox payload is built BEFORE the write —
+    // payment-history.service's own recorded decision), so it is asserted by action.
+    expect(
+      auditEvents.some(
+        (event) =>
+          event.resourceId === docA.id &&
+          event.action === PAYMENT_AUDIT_ACTION.APPEND &&
+          event.resource === COMMERCE_AUDIT_RESOURCE.PAYMENT_RECORD
+      )
+    ).toBe(true);
     expect(notifications.some((note) => note.payload.documentId === docA.id)).toBe(true);
     for (const note of notifications) {
       expect([tenantAId, tenantBId]).toContain(note.payload.tenantId);
@@ -1303,6 +1346,10 @@ describe('Commerce procurement integration e2e (Step W): the required domain tes
     // keys ON the document row (both ON DELETE RESTRICT), so a submitted document keeps the
     // versions it pinned alive until the document itself is gone -- and the groups wait for
     // the versions that name them.
+    // PHASE W3: append-only status events RESTRICT their document — they go first.
+    deleted.purchaseStatusEvent = (
+      await db.purchaseStatusEvent.deleteMany({ where })
+    ).count;
     deleted.purchaseLine = (await db.purchaseLine.deleteMany({ where })).count;
     deleted.purchaseDocument = (await db.purchaseDocument.deleteMany({ where })).count;
     deleted.workflowLineRoutingVersion = (

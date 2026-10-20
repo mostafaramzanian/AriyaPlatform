@@ -1,4 +1,4 @@
-import { Injectable, Logger, Module, type OnModuleInit } from '@nestjs/common';
+import { Injectable, Logger, Module, type OnModuleDestroy, type OnModuleInit } from '@nestjs/common';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { JwtModule, JwtService } from '@nestjs/jwt';
 import { TokenIssuer } from './token-issuer';
@@ -11,6 +11,7 @@ import {
   TokenRevocationRegistry,
   UnwiredRevocationFeed,
 } from './token-revocation';
+import { RabbitMqRevocationFeed } from './token-revocation-feed';
 import { TokenVerifier } from './token-verifier';
 
 /**
@@ -78,6 +79,32 @@ export class TokenPostureLogger implements OnModuleInit {
   }
 }
 
+/**
+ * Starts the revocation feed on boot and stops it on shutdown.
+ *
+ * The feed is a long-lived subscription, not a request-time dependency, so nothing
+ * else calls its `start`/`stop` — this holder exists so module init is the one place
+ * the subscription's lifetime is bound to the process's.
+ */
+@Injectable()
+class RevocationFeedLifecycle implements OnModuleInit, OnModuleDestroy {
+  private readonly logger = new Logger('RevocationFeedLifecycle');
+
+  constructor(private readonly feed: RevocationFeed) {}
+
+  onModuleInit(): void {
+    void this.feed.start().catch((err: unknown) => {
+      // A feed that fails to start is a reported posture, not a boot failure (§C2/E9):
+      // the registry already reports ttl-bound-only, and the error belongs in the log.
+      this.logger.warn({ err }, 'Revocation feed failed to start; enforcement is ttl-bound-only');
+    });
+  }
+
+  async onModuleDestroy(): Promise<void> {
+    await this.feed.stop();
+  }
+}
+
 @Module({
   imports: [ConfigModule, JwtModule.register({})],
   providers: [
@@ -107,10 +134,18 @@ export class TokenPostureLogger implements OnModuleInit {
     {
       provide: RevocationFeed,
       // A transport, when one exists, must ALSO be started during module init and stopped
-      // on shutdown. The unwired feed needs neither: it has nothing to subscribe to.
-      useFactory: (registry: TokenRevocationRegistry) => new UnwiredRevocationFeed(registry),
+      // on shutdown — `RevocationFeedLifecycle` does both. Which feed is bound is a
+      // DEPLOYMENT fact: `RABBITMQ_URL` configured means the real transport (the same
+      // `domain_events` exchange the audit contract already rides); unset means the
+      // declared absence, so "no broker configured" is never indistinguishable from
+      // "the feed is fine and reporting nothing".
+      useFactory: (registry: TokenRevocationRegistry) =>
+        process.env.RABBITMQ_URL?.trim()
+          ? new RabbitMqRevocationFeed(registry)
+          : new UnwiredRevocationFeed(registry),
       inject: [TokenRevocationRegistry],
     },
+    RevocationFeedLifecycle,
     {
       provide: TokenVerifier,
       // A factory, not a class provider, because the verifier's constructor takes an

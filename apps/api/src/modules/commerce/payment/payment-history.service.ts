@@ -2,13 +2,18 @@ import { ConflictException, Injectable, NotFoundException } from '@nestjs/common
 import { CommerceActor } from '../commerce-actor';
 import { CommerceAuditGateway } from '../commerce-audit.gateway';
 import { COMMERCE_AUDIT_RESOURCE } from '../commerce.constants';
-import type { CommerceTransactionHandle } from '../database/commerce-transaction';
-import { resolveCommercePageWindow } from '../dto/commerce-query.dto';
-import { moneyFromNumber, negateMoney } from '../purchase/purchase-money';
 import {
-  PaymentCompensationTakenError,
-  PaymentHistoryRepository,
-} from './payment-history.repository';
+  CommerceUnitOfWork,
+  type CommerceTransactionHandle,
+} from '../database/commerce-transaction';
+import { resolveCommercePageWindow } from '../dto/commerce-query.dto';
+import {
+  compareMoney,
+  moneyFromNumber,
+  negateMoney,
+  sumMoney,
+} from '../purchase/purchase-money';
+import { PaymentHistoryRepository } from './payment-history.repository';
 import { CompensatePaymentDto, CreatePaymentDto, ListPaymentsQueryDto } from './payment.dto';
 import { projectPaymentStatus } from './payment-status';
 
@@ -61,7 +66,8 @@ type PaymentRecordRow = Awaited<ReturnType<PaymentHistoryRepository['append']>>;
 export class PaymentHistoryService {
   constructor(
     private readonly repository: PaymentHistoryRepository,
-    private readonly audit: CommerceAuditGateway
+    private readonly audit: CommerceAuditGateway,
+    private readonly unitOfWork: CommerceUnitOfWork
   ) {}
 
   /**
@@ -198,9 +204,43 @@ export class PaymentHistoryService {
     dto: CompensatePaymentDto,
     tx?: CommerceTransactionHandle
   ) {
-    const document = await this.repository.findDocumentForPayment(actor.tenantId, documentId, tx);
+    const run = (handle: CommerceTransactionHandle) =>
+      this.compensateIn(actor, documentId, paymentId, dto, handle);
+    // The cumulative cap lives under a row lock, so the read-check-write must
+    // be ONE transaction — a caller's handle is joined, a standalone call
+    // opens its own unit of work (the service deliberately opens none for
+    // reads or appends; compensation is the one multi-statement act).
+    return tx ? run(tx) : this.unitOfWork.run(run);
+  }
+
+  /**
+   * Phase W4-B (repeated partial refunds): the compensating append under the
+   * cumulative cap. The one-compensation-per-payment unique index is gone —
+   * `SELECT … FOR UPDATE` on the ORIGINAL payment row serializes every
+   * compensation of it, so two raced refunds cannot both see the same
+   * remaining capacity. The rule is exact: `Σ|compensations| + new <=
+   * target.amount`. An omitted amount means the WHOLE REMAINING capacity —
+   * the full-refund act of an untouched payment, the residual reversal of an
+   * already partially-refunded one.
+   */
+  private async compensateIn(
+    actor: CommerceActor,
+    documentId: string,
+    paymentId: string,
+    dto: CompensatePaymentDto,
+    tx: CommerceTransactionHandle
+  ) {
+    // THE MODULE-WIDE LOCK ORDER (W4-C): `PurchaseDocument` `FOR UPDATE`
+    // FIRST, then the payment row, then the aggregates and the INSERT — the
+    // same order the return path takes. A manual compensation that held the
+    // payment while its INSERT waited on the document's `FOR KEY SHARE`
+    // formed a deadlock cycle against the refund path; with the document
+    // locked first, every mutating path serializes identically.
+    const document = await this.repository.lockDocumentForPayment(actor.tenantId, documentId, tx);
     if (!document) throw new NotFoundException('Purchase document not found');
 
+    const locked = await this.repository.lockPaymentForCompensation(actor.tenantId, paymentId, tx);
+    if (!locked) throw new NotFoundException('Payment record not found');
     const target = await this.repository.findPaymentForCompensation(
       actor.tenantId,
       documentId,
@@ -209,9 +249,24 @@ export class PaymentHistoryService {
     );
     if (!target) throw new NotFoundException('Payment record not found');
 
-    const existing = await this.repository.findCompensation(actor.tenantId, target.id, tx);
-    if (existing) {
-      throw new ConflictException(`The payment already has a compensating row: ${existing.id}`);
+    const compensatedSoFar = await this.repository.sumCompensations(
+      actor.tenantId,
+      target.id,
+      tx
+    );
+    const remaining = sumMoney([String(target.amount), String(compensatedSoFar ?? '0')]);
+
+    const compensated =
+      dto.amount === undefined ? remaining : moneyFromNumber(dto.amount);
+    if (compareMoney(compensated, '0.0000') <= 0) {
+      throw new ConflictException(
+        `The payment is already fully compensated (${String(compensatedSoFar ?? '0')} of ${target.amount})`
+      );
+    }
+    if (compareMoney(compensated, remaining) > 0) {
+      throw new ConflictException(
+        `Compensation ${compensated} exceeds the payment's remaining refundable amount ${remaining} (of ${target.amount})`
+      );
     }
 
     // Phase B2.3: build the durable outbox payload BEFORE the write.
@@ -220,39 +275,28 @@ export class PaymentHistoryService {
       resource: COMMERCE_AUDIT_RESOURCE.PAYMENT_RECORD,
       resourceId: documentId,
       oldValue: { reversesPaymentId: target.id, amount: String(target.amount) },
-      newValue: { amount: negateMoney(String(target.amount)) },
+      newValue: { amount: negateMoney(compensated) },
       reason: dto.reason ?? null,
     });
 
-    let row: PaymentRecordRow;
-    try {
-      row = await this.repository.append(
-        actor.tenantId,
-        {
-          purchaseDocumentId: documentId,
-          amount: negateMoney(String(target.amount)),
-          currency: target.currency,
-          method: target.method,
-          ...(dto.paymentDate ? { paymentDate: new Date(dto.paymentDate) } : {}),
-          payerRef: null,
-          payeeRef: null,
-          invoiceRef: null,
-          externalReference: dto.externalReference ?? null,
-          reversesPaymentId: target.id,
-          recordedByUserId: actor.userId,
-        },
-        compensateOutbox,
-        tx,
-      );
-    } catch (error) {
-      if (!(error instanceof PaymentCompensationTakenError)) throw error;
-      const winner = await this.repository.findCompensation(actor.tenantId, target.id);
-      throw new ConflictException(
-        winner
-          ? `The payment already has a compensating row: ${winner.id}`
-          : 'The payment already has a compensating row'
-      );
-    }
+    const row = await this.repository.append(
+      actor.tenantId,
+      {
+        purchaseDocumentId: documentId,
+        amount: negateMoney(compensated),
+        currency: target.currency,
+        method: target.method,
+        ...(dto.paymentDate ? { paymentDate: new Date(dto.paymentDate) } : {}),
+        payerRef: null,
+        payeeRef: null,
+        invoiceRef: null,
+        externalReference: dto.externalReference ?? null,
+        reversesPaymentId: target.id,
+        recordedByUserId: actor.userId,
+      },
+      compensateOutbox,
+      tx,
+    );
 
     return PaymentHistoryService.view(row);
   }
