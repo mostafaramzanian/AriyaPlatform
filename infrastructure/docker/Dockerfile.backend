@@ -48,7 +48,9 @@ COPY package.json package-lock.json* tsconfig*.json ./
 COPY apps/api/package.json apps/api/tsconfig*.json ./apps/api/
 COPY packages ./packages
 
-# Install all dependencies including dev (for E2E tests)
+# Install all dependencies, dev included: this image is the target of the
+# repository's in-image migration orchestration (`npm run db:migrate` →
+# `prisma migrate deploy` for every owner), and the Prisma CLI is a devDependency.
 RUN npm ci --prefer-offline --no-audit --omit=optional
 
 # Copy Prisma projects needed by the combined runtime.
@@ -80,6 +82,12 @@ COPY --from=builder /app/apps/api/prisma/production ./apps/api/prisma/production
 # is no way to bring `finance_db` to the revision the running code expects
 # (`npm run prisma:migrate:financial` inside this layout).
 COPY --from=builder /app/apps/api/prisma/financial ./apps/api/prisma/financial
+# Phase W1 — WAREHOUSE / INVENTORY FOUNDATION: `inventory_db` is required by this image
+# (the combined runtime marks Inventory `required`), so it must carry the Inventory schema
+# and its migration history for the same reason Financial's is carried above: without
+# them there is no way to bring `inventory_db` to the revision the running code expects
+# (`npm run prisma:migrate:inventory` inside this layout).
+COPY --from=builder /app/apps/api/prisma/inventory ./apps/api/prisma/inventory
 COPY --from=builder /app/apps/api/prisma/migrations ./apps/api/prisma/migrations
 COPY --from=builder /app/node_modules/.prisma /app/node_modules/.prisma
 
@@ -88,8 +96,15 @@ COPY --from=builder /app/apps/api/dist ./apps/api/dist
 # Phase ARCH-1.3: wholesale copy of the pruned src/generated tree. The boundary is the
 # derived prune above, not this COPY statement.
 COPY --from=builder /app/apps/api/src ./apps/api/src
-COPY --from=builder /app/apps/api/test ./apps/api/test
-COPY --from=builder /app/apps/api/jest-e2e.json ./apps/api/jest-e2e.json
+# Stage 2.22 / POST-SMOKE build-guard fix: the E2E assets are deliberately NOT
+# copied into this image. `.dockerignore` keeps `apps/api/test` and
+# `apps/api/jest-e2e.json` out of the build context ("test/E2E assets out of the
+# context even if the Dockerfile COPY list changes"), so they never reach the
+# builder stage either — the two COPY lines that used to be here could not
+# resolve their source and failed the build with
+#   failed to compute cache key: "/apps/api/test": not found
+# E2E runs from the repository checkout against the deployed stack
+# (docs/DEPLOYMENT.md → "E2E bootstrap"), not from inside this image.
 
 # Phase 49G-5: NO env file is baked into this image.
 #

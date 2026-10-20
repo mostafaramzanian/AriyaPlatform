@@ -70,6 +70,13 @@ COPY --from=builder /app/apps/api/prisma/hr ./apps/api/prisma/hr
 COPY --from=builder /app/apps/api/prisma/commerce ./apps/api/prisma/commerce
 COPY --from=builder /app/apps/api/prisma/production ./apps/api/prisma/production
 COPY --from=builder /app/apps/api/prisma/financial ./apps/api/prisma/financial
+# Phase W1 — WAREHOUSE / INVENTORY FOUNDATION: `inventory_db` is required by the combined
+# runtime, so this image must carry the Inventory schema and migration history too —
+# without them `npm run prisma:migrate:inventory` cannot run inside the container and
+# there is no way to bring `inventory_db` to the revision the running code expects.
+# (Dockerfile.backend already carries this line; the two release lineages are kept in
+# step deliberately, and `docker-artifact-guard.spec.ts` derives the expected set.)
+COPY --from=builder /app/apps/api/prisma/inventory ./apps/api/prisma/inventory
 COPY --from=builder /app/apps/api/prisma/migrations ./apps/api/prisma/migrations
 
 # Generated Prisma clients (pruned) from the builder, not from the runner install.
