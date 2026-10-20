@@ -1084,14 +1084,41 @@ describe('Procurement — Purchase → Inventory → Finance over the REAL provi
       .expect(200);
     expect(itemsOf<BalanceRowView>(aBalances.body)).toHaveLength(0);
 
-    // The bridge agrees with the HTTP refusal: A's number resolves for A, never for B.
+    // The bridge agrees with the HTTP refusal — but the reference has to be one the
+    // NUMBERING strategy can answer. `PurchaseDocumentCounter` is unique on
+    // `(tenantId, kind, jalaliYear)` and starts at 1, so each tenant's FIRST request of a
+    // kind and year is `PR-1405-00001` in ITS OWN series: this run's B minted exactly that
+    // number above, and `findOrderReference` is tenant-FIRST, so B naming that string
+    // resolves B's OWN row. "A's number never resolves for B" is false by design whenever
+    // the two series overlap — what the port must never do is CROSS tenants, and that is
+    // what this asserts: on A's row id, and on an A number B's series cannot hold.
     const bridge = getApp().get<unknown>(
       PURCHASE_ORDER_REFERENCE_PORT
     ) as PurchaseOrderReferencePort;
-    expect(await bridge.resolve(tenantBAdmin.tenantId, docA.documentNumber)).toBeNull();
-    expect(await bridge.resolve(admin.tenantId, docA.documentNumber)).toMatchObject({
-      orderReference: docA.documentNumber,
+
+    // B's own number resolves to B's own document — the shared number is legal, not a leak.
+    expect(await bridge.resolve(tenantBAdmin.tenantId, docB.documentNumber)).toMatchObject({
+      orderReference: docB.documentNumber,
+      displayName: docB.documentNumber,
+    });
+
+    // A's row id is invisible to B (the id branch is tenant-scoped like every read here)...
+    expect(await bridge.resolve(tenantBAdmin.tenantId, docA.id)).toBeNull();
+    // ...and so is an A number B never issued: A's SECOND request of this kind and year,
+    // which cannot be B's first — `docA` already took number 1 of A's series in this run.
+    const docA2 = await createStockedDocument(admin, skuA);
+    expect(docA2.documentNumber).not.toBe(docB.documentNumber);
+    expect(await bridge.resolve(tenantBAdmin.tenantId, docA2.documentNumber)).toBeNull();
+
+    // A resolves its own two references — by id and by number — and the issued number is
+    // what `displayName` renders (the id branch echoes the id back as `orderReference`).
+    expect(await bridge.resolve(admin.tenantId, docA.id)).toMatchObject({
+      orderReference: docA.id,
       displayName: docA.documentNumber,
+    });
+    expect(await bridge.resolve(admin.tenantId, docA2.documentNumber)).toMatchObject({
+      orderReference: docA2.documentNumber,
+      displayName: docA2.documentNumber,
     });
   });
 });

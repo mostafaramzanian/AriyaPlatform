@@ -4481,3 +4481,142 @@ Every command below was run from `E:\Ariya-Dev` or `E:\Ariya-Dev\apps\api` in th
 **What the hosted gate says.** Six pushes, six runs, every step conclusion read from the public API rather than from a log (`/logs` is 403 for an anonymous reader). `api-checks` failed on the first three for three pre-existing reasons only the runner could see — a dead import (run #8), a gate script the repository's own contract spec rejects (run #9), a packaging list its own artifact guard rejects (run #10) — and each was named by reproducing the job's own command, fixed, and committed (B, C, D). On `b8f072f` (run #11) `api-checks` passed all thirteen steps, `web-checks` passed, and `e2e-checks` ran for the first time on this branch: every environment step passed — containers, the nine owned databases, the cluster attestation, `db:migrate` for every owner, the seed, MinIO — and the suite step failed in the class §R-3 named (app boot: `Can't reach database server`), not on an assertion in anything this section adds.
 
 **What is therefore not claimed.** That the hosted E2E job is green — and that is now measured twice rather than once: its first execution (run #11) failed at the suite step after 77 s, its second (run #12, the first amendment above) failed at the same step after 120 s, and every environment step of that job was green in both. Nor is the unit gate's LAST result claimed as a property of this work: runs #11 and #12 passed it, run #13 — whose tree differs from #12's by this file alone — failed it, so the hosted unit gate is not deterministic across runs of one source, and its final verdict is recorded as that rather than as a defect. The hosted E2E assertion therefore remains open on two attempts, the attempt after them never reached the e2e job, and the fourth — the run of the commit that carries this amendment — is the one verdict this file cannot contain (§R-10.8).
+### R-11 — Stage 2, the hosted red named: the per-tenant numbering counter, the amendment to K, and the attribution §R-10 got wrong — 2026-10-20 (session 11)
+
+`e2e-checks` failed on three consecutive hosted runs of this work — `b8f072f` (run #11), `a2dfa62` (#12) and `6718dc0` (#14) — and §R-10 read the first two of them without their job logs, which is why it attributed both to the environment class of §R-3. This section opens the logs. It names the failing assertion (one assertion, the same one, in all three runs), shows why the assertion's PREMISE was false rather than the environment red, states the amendment to test K that removes the false premise without weakening the property the test exists to hold, and records the local reproduction that matches the hosted failure line-for-line — same file, same line, same column, same received value, same counts. It then corrects §R-10 in place: §R-9's append-only rule forbids rewriting it, so a reader of §R-10.6 or §R-10.8 must read §R-11.2 with it.
+
+#### R-11.1 What §R-10 could not read, and what it inferred instead
+
+§R-10.6 states, correctly, that an anonymous reader cannot open a job's log (`.../actions/jobs/<id>/logs` answers 403 even though the repository is public). The consequence drawn from that is where this section departs from it: with the assertion unreadable, §R-10 attributed the `e2e-checks` failure of runs #11 and #12 to §R-3's transport boundary — §R-10.9's words are "the suite step failed in the class §R-3 named (app boot: `Can't reach database server`), not on an assertion in anything this section adds", and §R-10.8 repeats the class for #12, "the first having died in the environment class §R-3 names" — and it read the job's two step windows, 77 s and 120 s, as consistent with that reading: long enough for the chain's first spec to boot and fail, too short for four in-band spec processes to have run.
+
+The logs are not unreadable to THIS machine; they are unreadable to an anonymous reader. This machine holds a credential for `github.com` in its git credential store, and `git credential fill` returns it without printing it (the script is in §R-11.5; the value is never written to disk, logged or quoted here). With that credential the log URL answers 302 to a signed URL, the archive is a single ~882 KB text file per job, and all three runs' logs were read this session. What they contain makes §R-10's inference falsifiable — and false, for #11 and #12 alike, and again for #14, which §R-10 could not contain at all.
+
+#### R-11.2 The red, named: one assertion, three runs, no transport
+
+Every fact below is read from the job log of the run it is attributed to. The suite in question is the last of four the step runs in band (`seed-conformance`, `financial-check-issuance`, `inventory-entitlement`, `procurement-real-posting`), so the three earlier results are the run's own control: if the job were dying in the environment, they would not be green.
+
+| Run | SHA | Step 12 `Run E2E suite` | The three specs BEFORE the suite | The suite | Test K |
+| --- | --- | --- | --- | --- | --- |
+| `39452965468` (#11) | `b8f072f` | 16:03:27Z → 16:04:44Z (77 s) | 7/7 at 16:03:59Z, 28/28 at 16:04:15Z, 6/6 at 16:04:29Z | `FAIL test/procurement-real-posting.e2e-spec.ts (5.684 s)` | `✕ K. … (128 ms)`, `Tests: 1 failed, 10 passed, 11 total` |
+| `39455758350` (#12) | `a2dfa62` | 16:21:16Z → 16:23:16Z (120 s) | 7/7 at 16:22:04Z, 28/28 at 16:22:30Z, 6/6 at 16:22:52Z | `FAIL test/procurement-real-posting.e2e-spec.ts (9.647 s)` | `✕ K. … (201 ms)`, `Tests: 1 failed, 10 passed, 11 total` |
+| `39459633730` (#14) | `6718dc0` | 16:48:06Z → 16:49:21Z (75 s) | 7/7 at 16:48:35Z, 28/28 at 16:48:53Z, 6/6 at 16:49:06Z | `FAIL test/procurement-real-posting.e2e-spec.ts (5.553 s)` | `✕ K. … (126 ms)`, `Tests: 1 failed, 10 passed, 11 total` |
+
+Run #14's log, verbatim and untrimmed (the `>` marker and the ANSI colours are Jest's):
+
+```
+2026-10-20T16:49:21.0395282Z     ✕ K. tenant B runs the same flow into ITS OWN rows, and cannot reach tenant A’s (126 ms)
+2026-10-20T16:49:21.0396220Z   ● Procurement — Purchase → Inventory → Finance over the REAL providers (Phase R-10) › K. tenant B runs the same flow into ITS OWN rows, and cannot reach tenant A’s
+2026-10-20T16:49:21.0396864Z     expect(received).toBeNull()
+2026-10-20T16:49:21.0397345Z     Received: {"displayName": "PR-1405-00001", "orderReference": "PR-1405-00001", "projectReference": null}
+2026-10-20T16:49:21.0399513Z > 1091 |     expect(await bridge.resolve(tenantBAdmin.tenantId, docA.documentNumber)).toBeNull();
+2026-10-20T16:49:21.0403853Z       at Object.<anonymous> (test/procurement-real-posting.e2e-spec.ts:1091:78)
+2026-10-20T16:49:21.0407987Z Tests:       1 failed, 10 passed, 11 total
+```
+
+The same two lines and the same column appear in run #11's log at 16:04:44Z and in run #12's at 16:23:16Z — `at Object.<anonymous> (test/procurement-real-posting.e2e-spec.ts:1091:78)` — with `Received: {"displayName": "PR-1405-00001", …}` in both.
+
+What that rules out, in §R-10's own terms:
+
+* **Not app boot.** The suite ran to completion and printed per-test verdicts: `Tests: 1 failed, 10 passed, 11 total` from a process that lived 5.5 s to 9.6 s. §R-10.8's sentence — "the first having died in the environment class §R-3 names" — cannot be true of a process that printed eleven verdicts. Test D, the very test whose single local failure §R-10.2 attributed to the transport class, was GREEN in all three hosted runs (`✓ D. one partial receipt → ONE posting, ONE attempt, ONE movement, ONE balance cell (95 ms)`, run #14, 16:49:21Z), and the chain's three earlier specs were green in all three runs (7/7, 28/28, 6/6 — timestamps in the table). A job whose nine environment steps, three preceding spec processes and ten of eleven suite tests all passed is not a job that failed to boot.
+* **Not the 77 s / 120 s reading either.** §R-10.6 used those two windows as evidence FOR the boot reading ("long enough for the chain's first spec to boot and fail and too short for four in-band spec processes to have run"). The logs say the opposite: all four spec processes DID run in band, within 77 s and within 120 s both — run #11's first spec reported at 16:03:59Z, 32 s into its 77 s window, its third at 16:04:29Z, its fourth at 16:04:44Z. The windows are evidence of a green environment, and §R-10 read them backwards.
+* **Not an assertion this section adds.** The failing line is §R-10's own, in the suite §R-10 authored, asserting §R-10's premise about the numbering strategy. The hosted red was about that premise from the first run, and three runs agree on it to the column (`:1091:78`) and to the value (`PR-1405-00001`) — which is what determinism looks like when the input is a freshly migrated database rather than a workspace with history in it.
+
+#### R-11.3 Why the premise was false: the counter's key is per tenant, so two tenants may mint one string
+
+```
+apps/api/prisma/commerce/schema.prisma:577-647
+  /// ... ONE shared counter keyed `(tenantId, kind, jalaliYear)`, from which every
+  /// `PurchaseDocument.documentNumber` ...
+  model PurchaseDocumentCounter {
+    tenantId   String               @map("tenant_id") @db.Text
+    kind       PurchaseDocumentKind
+    jalaliYear Int                  @map("jalali_year")
+    counter    Int                  @default(0)
+    @@unique([tenantId, kind, jalaliYear], map: "PurchaseDocumentCounter_tenantId_kind_jalaliYear_key")
+  }
+  // :615 — the allocation the counter exists for:
+  // INSERT ... ON CONFLICT ("tenant_id","kind","jalali_year") DO UPDATE SET "counter" = ...
+
+apps/api/src/modules/commerce/purchase/purchase-number.ts
+  export const PURCHASE_DOCUMENT_NUMBER_PREFIX = { PURCHASE_REQUEST: 'PR' } as const;
+  export const PURCHASE_DOCUMENT_NUMBER_WIDTH = 5;
+  return `${prefix}-${jalaliYear}-${String(sequence).padStart(PURCHASE_DOCUMENT_NUMBER_WIDTH, '0')}`;
+  // → PR-1405-00001 for the first document of that kind in that Jalali year
+
+apps/api/src/modules/commerce/purchase/purchase.repository.ts:357-368
+  async findOrderReference(tenantId: string, reference: string) {
+    return this.prisma.purchaseDocument.findFirst({
+      where: { tenantId, ...(isUuid ? { id: trimmed } : { documentNumber: trimmed }) },
+```
+
+The uniqueness key is `(tenantId, kind, jalaliYear)` and `counter` starts at 0 and is incremented by the allocation statement, so the FIRST document of a kind and year is `PR-<jy>-00001` **in every tenant's own series**. What is unique per tenant is the pair — `PurchaseDocument` is unique on `(tenantId, documentNumber)`, which is what `purchase-number.ts`'s own header says — not the string. Two tenants minting the same string is therefore legal by construction, and the resolver is tenant-FIRST (`where: { tenantId, … }`), so tenant B naming that string is answered with tenant B's own row: a correct answer to "resolve this reference for B", and never a leak.
+
+Test K's premise, as §R-10 wrote it, was that `PR-1405-00001` is "A's number" and therefore cannot resolve for B. On the CI database — containers created minutes earlier, `db:migrate` for every owner, then seed, against empty tables — A and B are BOTH at counter 0, so A's first request and B's first request are the same string, and B naming it resolves B's own row, which is exactly the `Received:` value in all three hosted runs. The invariant §R-10 intended ("A's number never resolves for B") is not an invariant of this numbering strategy; the invariant that IS one — no reference crosses tenants — was asserted twice in the same test (on A's row id, and, after the amendment below, on a number A holds and B cannot) and passed in all three runs.
+
+Why the same assertion passed locally and failed hosted is therefore not a mystery about the code, and not a change in the code: this session's `commerce_db` had A's series long past `00001` before the suite ran — the residue of §R-10's own runs — so A's number could not shadow B's first; the hosted database is migrated and seeded from empty for the run, so it can. The divergence was the DATA. No schema change was considered for it, and none was made.
+
+#### R-11.4 The amendment to K — the same property, on a number the strategy guarantees
+
+```
+BEFORE — the line all three hosted runs failed on, apps/api/test/procurement-real-posting.e2e-spec.ts:1091
+  expect(await bridge.resolve(tenantBAdmin.tenantId, docA.documentNumber)).toBeNull();
+  // A's FIRST number of that kind and year — which, on a freshly migrated database, is also B's.
+
+AFTER — apps/api/test/procurement-real-posting.e2e-spec.ts:1105-1111
+  // A's row id is invisible to B (the id branch is tenant-scoped like every read here)...
+  expect(await bridge.resolve(tenantBAdmin.tenantId, docA.id)).toBeNull();
+  // ...and so is an A number B never issued: A's SECOND request of this kind and year,
+  // which cannot be B's first — `docA` already took number 1 of A's series in this run.
+  const docA2 = await createStockedDocument(admin, skuA);
+  expect(docA2.documentNumber).not.toBe(docB.documentNumber);
+  expect(await bridge.resolve(tenantBAdmin.tenantId, docA2.documentNumber)).toBeNull();
+```
+
+One line became five here — the amendment's full size, measured with `git diff --numstat` rather than counted by hand, is `31 insertions, 4 deletions` in one file, all inside test K's bridge block between `:1087` and `:1122`: the comment that claimed the old premise, the `toBeNull()` above, and the two lines of A's by-number resolution of `docA` (re-stated below on `docA.id` and `docA2`) are the four removals. And the replacement is not a weakening for a reason that belongs to the numbering strategy rather than to a preference about tests. B's series holds exactly ONE number, because this test has B issue exactly one document (`docB`, minted at `:1011`). A's second document of the same kind and year carries a different number from A's first by construction — `counter` starts at 1 and never repeats within a key — and the amendment asserts its own premise before relying on it: `expect(docA2.documentNumber).not.toBe(docB.documentNumber)`, so a future state in which the two series DO overlap on that string fails on the guard, loudly, instead of silently turning the tenant-scoping assertion into a tautology. Given that guard, the line after it can only pass if the resolver honours `tenantId`: a resolver matching on `documentNumber` alone would find A's row for A's number and return a non-null body — precisely the `Received:` value the hosted runs reported for the OLD line. The claim "no reference crosses tenants" is therefore asserted as strongly as before, and it is now the only claim that line makes. What the amendment does not do is drop the legal-overlap case: the test still asserts that B's own shared string resolves to B's own document (`:1100-1103`), and it still resolves A's own two references, by id and by number (`:1113-1122`), so a shared number across tenants is documented as legal rather than avoided.
+
+#### R-11.5 Reproducing this section
+
+Every command below was run from `E:\Ariya-Dev` or `E:\Ariya-Dev\apps\api` in this session; the two files this work changes are stated in §R-11.6.
+
+| Purpose | Command | What it produced |
+| --- | --- | --- |
+| The hosted job logs, on a host without `gh` and without printing the credential | `powershell -File <tmp>\aria-r11\fetch-joblog.ps1 -JobId <job id> -OutDir <tmp>\aria-r11\run<NN>-<sha>` — the script takes `password=` from `git credential fill` (`protocol=https`, `host=github.com`), sends it as `Authorization: token …` to `https://api.github.com/repos/mostafaramzanian/AriyaPlatform/actions/jobs/<id>/logs`, follows the 302 once, expands the archive | three ~882 KB text logs (`run11-b8f072f`, `run12-a2dfa62`, `run14-6718dc0`): the assertion, column, received value and counts quoted in §R-11.2, and the per-spec timestamps in the table |
+| The three runs' shape, without a CLI | `https://api.github.com/repos/mostafaramzanian/AriyaPlatform/actions/runs?branch=ui-redesign`, then `.../actions/runs/<id>/jobs` | the run ids and SHAs above; run #14's `e2e-checks` job id `118758172320`, head branch `ui-redesign`, created 16:41:18Z, steps 2–11 green, step 12 failed 16:48:06Z → 16:49:21Z |
+| The suite, locally, exactly as the step runs it | `cd apps/api && npm.cmd run test:e2e:procurement` (= `node --experimental-vm-modules ../../node_modules/jest/bin/jest.js --config ./jest-e2e.json --runInBand test/procurement-real-posting.e2e-spec.ts`) | five measured attempts: 1, 3 and 4 died at boot (§R-11.6), 2 failed test D on `P1001` at `stock.repository.ts:72:33`, 5 gave `Tests: 11 passed, 11 total` |
+| The pre-fix assertion, reproduced — the check that makes the hosted failure a fact about this code rather than about GitHub's machines | the same command with the pre-fix spec restored, i.e. `:1091` as quoted in §R-11.4 | `Tests: 1 failed, 10 passed, 11 total` — K `✕ … (524 ms)` with `expect(received).toBeNull()`, `Received: {"displayName": "PR-1405-00001", "orderReference": "PR-1405-00001", "projectReference": null}`, `at Object.<anonymous> (test/procurement-real-posting.e2e-spec.ts:1091:78)` — and `✓ D. … (293 ms)` green in the same run, the local proof that the hosted red was K alone |
+| The retargeting that made the local runs possible, with no file edited to get it | `$env:*_DATABASE_URL = '…@localhost:5546/…_db'; $env:E2E_PG_EXPECTED_SYSTEM_ID = '7698802747575025714'; $env:E2E_PG_FORBIDDEN_SYSTEM_IDS = '7680696431275933734,7696399482676613158'; $env:E2E_SEED_ALLOWED_HOSTS = 'localhost'` | `ConfigModule.forRoot` declares no `override`, so the shell's `process.env` outranks `.env.e2e`/`.env.local`; the harness then attested the retargeted cluster (`[E2E] Cluster identity matches the expected test cluster`) |
+| The transport failures, and whether the server had moved | `docker inspect aria-r11-pg --format 'RestartCount={{.RestartCount}} StartedAt={{.State.StartedAt}} Status={{.State.Status}}'`; `docker exec aria-r11-pg psql -U aria_user -d commerce_db -tA -c 'select 1'`; the socket list; a 30-minute `docker events` window | `RestartCount=0 StartedAt=2026-10-20T17:26:38.189852679Z Status=running`, `select 1` → `1`, no docker events in 30 minutes, no port pile-up (21 sockets, 18 of them `TIME_WAIT`) — the server was up throughout, which is why §R-11.6 attributes the boot failures to the transport rather than reporting "the database was down" |
+| The failing tests' own code, read rather than run | `apps/api/prisma/commerce/schema.prisma:577-647`, `apps/api/src/modules/commerce/purchase/purchase-number.ts`, `purchase.repository.ts:357-368`, `apps/api/test/procurement-real-posting.e2e-spec.ts:1003-1123` | §R-11.3 and §R-11.4 |
+
+**The report's own health check, held to §R-9's rule.** Before this append the file was measured at **386,916 bytes across 4,483 lines**, `SHA-256 AE1CB2D466F052F7C24D177A9C12D6542559340AC54DF3D322E294D5BA326A7C` — against the 348,475 bytes and 4,322 lines §R-10.7 recorded before its own append, an increase consistent with an append that neither rewrote nor deleted anything. As in §R-10.7, this section cannot report the size of the file that CONTAINS it (§R-8's self-reference, restated rather than evaded); what is measurable, and was measured, is that the append is byte-prefix-preserving — after appending, the first 386,916 bytes of the file hash to the value above, so §R-1 … §R-10 are untouched, including the byte-level details §R-9 quotes about itself — and this section's own contribution is described by its SHAPE: seven subsections (`R-11.1` … `R-11.7`) and four fenced blocks, so the fence count rises by eight. Measured on the appended file, §R-9's encoding rule also holds: the BOM (`EF BB BF`) is intact, strict-UTF-8 decoding is clean, and the file — this section included — contains zero U+FFFD and zero double-encoded sequences.
+
+**What the push carries, under §R-10.5's discipline.** The `git status` of this workspace lists 531 changed entries and exactly two of them are this work: `apps/api/test/procurement-real-posting.e2e-spec.ts` and this file. The other 529 — the `apps/web` edits, the four root `PHASE_A_*` deletions, and the rest — are neither staged nor claimed, because §R-10.5's finding was precisely that a commit and a working tree are different objects, and that a red commit can come from a green checkout.
+
+#### R-11.6 What this section does NOT claim
+
+* **The transport failures are still not explained.** Local attempts 1, 3 and 4 died at boot, with no test verdicts at all:
+
+```
+FAIL test/procurement-real-posting.e2e-spec.ts (76.302 s)
+PrismaClientInitializationError: Can't reach database server at `localhost:5546`
+  at Object.<anonymous> (test/setup.ts:121:18)      // inside NestApplication.listen
+```
+
+  While those attempts were dying, the server measured `RestartCount=0`, running since 17:26:38Z, with no docker events in a 30-minute window, no port pile-up and a working `select 1` — the failure is in REACHING the server, not in the server. That is §R-3's class, attributed by the error text and by the workflow's own documentation, and it stays unexplained here as §R-3 left it. What this section does not do with it is what §R-10 did: use it to explain the hosted red. The hosted red was not in that class, and §R-11.2 is the refutation.
+* **The hosted `e2e-checks` job is not claimed green.** The commit that carries this section is a later SHA than `6718dc0`, whose chain (7/7, 28/28, 6/6) and whose test K are quoted above; whether the amended spec passes on the runner is the verdict of a run this file cannot contain (§R-10.8's property, restated rather than worked around: if it passes, the pass belongs to a run this section cannot cite; if it fails, the failure is about something this section has not seen). What is claimed is narrower and fully measured — the pre-fix assertion failed identically here and there, on the same column with the same received value (§R-11.2, §R-11.5), and the amended suite is green in this workspace's fifth measured attempt.
+* **Run #13's unit-gate failure is not revisited.** §R-10.6 and §R-10.8 record it as non-determinism (identical `apps/api` sources, this report the only difference, the step passing on two of three commits). This section adds nothing to that reading, and does not claim the unit gate's next verdict either.
+* **Test D is not a defect and is not fixed.** It passes in all three hosted runs (95 ms in #14) and passes in the pre-fix local reproduction (293 ms); its one local failure — attempt 2 — is `P1001` at `stock.repository.ts:72:33`, on the paginated `stockMovement.findMany` read path, and it is recorded as an instance of the same transport class as attempts 1, 3 and 4 rather than repaired. §R-10.2 attributed D's local failure to the transport for run #4; that attribution is kept for the local run, and explicitly NOT extended to the hosted runs, where D was green.
+* **No schema, migration, counter or numbering change is part of this fix.** `PurchaseDocumentCounter`'s key, its `INSERT … ON CONFLICT` allocation, `formatPurchaseDocumentNumber` and the tenant-first resolver are unchanged before this session and unchanged after it. What changed is one test's premise about them. A reader tempted to "fix" the numbering instead should read §R-11.3 first: the shared string is the strategy working as designed, and `PurchaseDocument`'s per-tenant uniqueness is what keeps it sound.
+* **§R-10's text is not rewritten.** §R-9's append-only rule stands, so §R-10.6's and §R-10.8's attribution of runs #11 and #12 to the environment remains on the page, corrected here rather than edited there. This is the third time this report has had to correct a section in a later one (see §R-10.7's amendment paragraph), and the pattern is worth naming: a section that must report an unread assertion leaves a correction to whichever later section can read it.
+
+#### R-11.7 The verdict
+
+`Stage 2: CLOSED — the hosted red is NAMED, its false premise is removed, and the amended suite is green in the fifth measured local run; the fix's own hosted verdict is the one a later section has to carry.`
+
+**What is now closed.** §R-10.9 left the hosted assertion "open on two attempts" and attributed both to §R-3's environment. Both are named here — one assertion, one column (`:1091:78`), one received value (`PR-1405-00001`), one pair of counts (`1 failed, 10 passed, 11 total`) — and run #14, a third run §R-10 could not contain, is the same failure again. The mechanism was not the environment: test K asserted a property the numbering strategy does not have (§R-11.3), passed locally only because this workspace's counter had history in it, and failed hosted only because the runner's database does not.
+
+**What the fix is.** One region of one file — three hunks between `:1087` and `:1122`, `31 insertions, 4 deletions` (`git diff --numstat`) — in which A's FIRST number is replaced by A's SECOND, guarded by an explicit inequality so the premise is asserted rather than assumed (§R-11.4), and the comment above it now says why (§R-11.3). No product code, no schema, no migration, no workflow change — and the property the test exists to hold (no reference crosses tenants) is asserted at least as strongly as before.
+
+**What is still open, and said plainly.** The transport class §R-3 named, which three of five local attempts died in and which §R-11.6 records without an explanation; and the greenness of the next hosted run, which is the one verdict this file cannot contain.
+
+**What a reader should carry away.** Three hosted runs failed on an assertion this report wrote; the failure was attributed to the environment because the assertion was unreadable; and the assertion was false because it assumed a database state — a fresh per-tenant counter — that neither the local workspace nor §R-10's own runs had. Naming it took the job logs §R-10 could not open: not a change to the environment, and not a change to the numbering. That is §R-7's lesson at a smaller scale — the reading that could see the failure was the one that read the artifact — with one difference worth stating: this time the artifact was on GitHub's machines, and the commit that carries the fix is the object §R-10.5 warned is not the working tree.
