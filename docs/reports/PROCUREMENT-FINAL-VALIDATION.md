@@ -4620,3 +4620,30 @@ PrismaClientInitializationError: Can't reach database server at `localhost:5546`
 **What is still open, and said plainly.** The transport class §R-3 named, which three of five local attempts died in and which §R-11.6 records without an explanation; and the greenness of the next hosted run, which is the one verdict this file cannot contain.
 
 **What a reader should carry away.** Three hosted runs failed on an assertion this report wrote; the failure was attributed to the environment because the assertion was unreadable; and the assertion was false because it assumed a database state — a fresh per-tenant counter — that neither the local workspace nor §R-10's own runs had. Naming it took the job logs §R-10 could not open: not a change to the environment, and not a change to the numbering. That is §R-7's lesson at a smaller scale — the reading that could see the failure was the one that read the artifact — with one difference worth stating: this time the artifact was on GitHub's machines, and the commit that carries the fix is the object §R-10.5 warned is not the working tree.
+
+#### R-11.8 Amendment — the verdict §R-11 could not contain: run #15 is green
+
+The push that carried §R-11 (`be7d2e5`, run #15, `39471737909`) executed `e2e-checks` for the fourth time on this branch, and this time the suite step passed. The lines below are job `118799159876`'s own, fetched the way §R-11.2's were — the same credential, the same endpoint, read from the downloaded log rather than from a browser:
+
+```
+2026-10-20T18:10:44.2713962Z > node --experimental-vm-modules ../../node_modules/jest/bin/jest.js --config ./jest-e2e.json --runInBand test/seed-conformance.e2e-spec.ts && node --experimental-vm-modules ../../node_modules/jest/bin/jest.js --config ./jest-e2e.json --runInBand test/financial-check-issuance.e2e-spec.ts && node --experimental-vm-modules ../../node_modules/jest/bin/jest.js --config ./jest-e2e.json --runInBand test/inventory-entitlement.e2e-spec.ts && node --experimental-vm-modules ../../node_modules/jest/bin/jest.js --config ./jest-e2e.json --runInBand test/procurement-real-posting.e2e-spec.ts
+2026-10-20T18:11:18.3302519Z PASS test/seed-conformance.e2e-spec.ts (23.525 s)
+2026-10-20T18:11:18.3326846Z Tests:       7 passed, 7 total
+2026-10-20T18:11:35.6863067Z PASS test/financial-check-issuance.e2e-spec.ts (6.929 s)
+2026-10-20T18:11:35.6887674Z Tests:       28 passed, 28 total
+2026-10-20T18:11:49.9157017Z PASS test/inventory-entitlement.e2e-spec.ts
+2026-10-20T18:11:49.9176760Z Tests:       6 passed, 6 total
+2026-10-20T18:12:05.7927139Z PASS test/procurement-real-posting.e2e-spec.ts (6.05 s)
+2026-10-20T18:12:05.7931767Z     ✓ D. one partial receipt → ONE posting, ONE attempt, ONE movement, ONE balance cell (109 ms)
+2026-10-20T18:12:05.7935276Z     ✓ K. tenant B runs the same flow into ITS OWN rows, and cannot reach tenant A’s (176 ms)
+2026-10-20T18:12:05.7948726Z Tests:       11 passed, 11 total
+2026-10-20T18:12:05.7949188Z Time:        6.083 s
+```
+
+Step 12 ran 18:10:44Z → 18:12:05Z (81 s); the log contains zero `##[error]` lines and zero `Process completed with exit code` lines, the four spec processes each printed `Test Suites: 1 passed, 1 total`, and the harness's cluster attestation ran in all four (`[E2E] Cluster identity matches the expected test cluster`). The run's three jobs all concluded `success`: `api-checks` (16 steps, 0 failed, 18:05:39Z → 18:09:28Z), `web-checks` (11 steps, 0 failed, 18:05:39Z → 18:08:30Z) and `e2e-checks` (16 steps, 0 failed, 18:09:30Z → 18:12:09Z).
+
+**What this carries, and what it leaves alone.** §R-11.6's second bullet said the hosted job was "not claimed green" and §R-11.7's verdict said the fix's own hosted verdict "is the one a later section has to carry"; this is that later section, and it reports the verdict rather than a prediction of it. Nothing in §R-11 was edited to make the green look foreseen — the file is append-only, and §R-1 … §R-11 are byte-identical to what the previous push carried: before this amendment the file was **411,541 bytes across 4,622 lines**, `SHA-256 87774CB5E056B93D6BC58F9F793914FB536D293869FE13B2AE6A290D80DF704C`, and after appending, the first 411,541 bytes of the file still hash to that value (BOM intact, strict-UTF-8 clean, zero U+FFFD, uniform CRLF; §R-11's seven subsections and four fenced blocks read as eight and five in this file, so the fence count rises by two). The window is worth setting beside §R-10.6's reading of its two failing windows: the four in-band spec processes that §R-10.6 inferred could not fit inside 77 s or 120 s finished inside this 81 s window, printing 7/7, 28/28, 6/6 and 11/11 — §R-11.2 refuted that inference from the failing logs' own timestamps, and a green run now measures the same thing.
+
+**What this does not establish.** Not that the next run is green. §R-10.6's row 6 is the record of a report-only push going red on a step that had just passed twice with identical `apps/api` sources, and the run that this amendment's own push triggers is again one this file cannot contain (§R-10.8's property, third application). What HAS changed is the failing class: the `e2e-checks` job has now executed four times on this branch, its environment steps have passed every time, and it has failed exactly once on an assertion — the one removed here. A future red at step 12 is evidence about the environment (§R-3) or about a different assertion, and never again evidence about test K's premise.
+
+**Push discipline, obeyed and restated because it was obeyed.** One file, report only — `docs/reports/PROCUREMENT-FINAL-VALIDATION.md`. No spec change, no product code, no workflow, and none of the other 530 entries this workspace's `git status` lists (the `apps/web` edits, the four root `PHASE_A_*` deletions, and the rest) is staged or claimed. §R-10.5's distinction is why this paragraph exists at all: the commit is the artifact, and the run is about the commit.
