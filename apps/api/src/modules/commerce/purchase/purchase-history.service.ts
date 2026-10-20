@@ -1,9 +1,4 @@
-import {
-  Injectable,
-  Logger,
-  NotFoundException,
-  ServiceUnavailableException,
-} from '@nestjs/common';
+import { Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { CommerceActor } from '../commerce-actor';
 import { CommerceAuditGateway } from '../commerce-audit.gateway';
 import { COMMERCE_AUDIT_RESOURCE } from '../commerce.constants';
