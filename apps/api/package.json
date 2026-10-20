@@ -26,7 +26,7 @@
     "test:e2e:inventory": "node --experimental-vm-modules ../../node_modules/jest/bin/jest.js --config ./jest-e2e.json --runInBand test/inventory-entitlement.e2e-spec.ts",
     "test:e2e:procurement": "node --experimental-vm-modules ../../node_modules/jest/bin/jest.js --config ./jest-e2e.json --runInBand test/procurement-real-posting.e2e-spec.ts",
     "test:e2e:seed-conformance": "node --experimental-vm-modules ../../node_modules/jest/bin/jest.js --config ./jest-e2e.json --runInBand test/seed-conformance.e2e-spec.ts",
-    "test:e2e:ci": "npm run test:e2e:seed-conformance && npm run test:e2e:financial-check && npm run test:e2e:inventory && npm run test:e2e:procurement",
+    "test:e2e:ci": "node --experimental-vm-modules ../../node_modules/jest/bin/jest.js --config ./jest-e2e.json --runInBand test/seed-conformance.e2e-spec.ts && node --experimental-vm-modules ../../node_modules/jest/bin/jest.js --config ./jest-e2e.json --runInBand test/financial-check-issuance.e2e-spec.ts && node --experimental-vm-modules ../../node_modules/jest/bin/jest.js --config ./jest-e2e.json --runInBand test/inventory-entitlement.e2e-spec.ts && node --experimental-vm-modules ../../node_modules/jest/bin/jest.js --config ./jest-e2e.json --runInBand test/procurement-real-posting.e2e-spec.ts",
     "test:architecture": "jest --runInBand src/architecture-boundaries.spec.ts",
     "test:policy": "jest --runInBand src/runtime-policy.spec.ts",
     "arch:policy": "ts-node scripts/emit-runtime-policy.ts",
